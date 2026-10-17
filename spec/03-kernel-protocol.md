@@ -5,7 +5,10 @@ Protocolo entre o core e extensões para serviços do kernel. Ferramentas, resou
 ## Transporte
 
 - JSON-RPC 2.0, uma mensagem JSON UTF-8 por linha.
-- Unix socket por instância. Caminho em `FICTOR_KERNEL_SOCKET`, token em `FICTOR_KERNEL_TOKEN`.
+- Endereço em `FICTOR_KERNEL_URL`, token em `FICTOR_KERNEL_TOKEN`.
+  - macOS: `unix://<caminho absoluto>`, o Unix socket da instância.
+  - Linux: `tcp://127.0.0.1:3129`. `__sandbox-init` escuta nesse endereço, dentro do namespace de rede isolado da instância, e repassa para o Unix socket da instância. Assim a carga de trabalho não precisa de sockets Unix por caminho, e a Fase 3 pode bloqueá-los com seccomp ([05-security.md](05-security.md#linux-bubblewrap)).
+  - O SDK DEVE aceitar os dois esquemas.
 - Tamanho máximo de mensagem: 16 MiB.
 - A primeira requisição DEVE ser `kernel.hello`. Antes dela, qualquer outra requisição recebe `UNAUTHENTICATED` e a conexão é fechada.
 - Só existe canal se o manifest declarar pelo menos um escopo em `kernel`.
@@ -16,14 +19,14 @@ O manifest declara os escopos em `kernel: [...]`. O core recusa com `SCOPE_DENIE
 
 | Escopo | Métodos | Observação |
 |---|---|---|
-| `events.read` | `events.get`, `events.path`, `events.query` | Instância de sessão: só a linhagem da própria sessão. Instância global: todas as sessões. |
+| `events.read` | `events.get`, `events.path`, `events.query` | Instância de sessão: só a linhagem da própria sessão. Instância global: todas as sessões, e as flags dos eventos lidos entram na marca d'água da extensão (Fase 1). |
 | `events.write` | `events.append` | Kinds `x.<ext_id>.*`. O harness também pode `assistant.*` e `harness.*`. |
-| `sessions` | `sessions.get`, `sessions.fork`, `sessions.delegate` (Fase 2), `sessions.complete` (Fase 2) | |
+| `sessions` | `sessions.get`, `sessions.fork`, `sessions.delegate` (Fase 2), `sessions.complete` (Fase 2) | Só instâncias de sessão. |
 | `sessions.input` | `sessions.input` | Injeta entrada e dispara um turno do agente. |
 | `blobs` | `blobs.put`, `blobs.get` | Conhecer o hash é a capacidade de leitura. |
-| `kv` | `kv.get`, `kv.set`, `kv.delete`, `kv.list` | Namespace = `ext_id`. |
-| `tools` | `tools.list`, `tools.call` | |
-| `hooks` | `hooks.invoke` | |
+| `kv` | `kv.get`, `kv.set`, `kv.delete`, `kv.list` | Namespace `ext_id` (global) ou `ext_id@session_id` (instância de sessão). |
+| `tools` | `tools.list`, `tools.call` | Só instâncias de sessão. |
+| `hooks` | `hooks.invoke` | Só instâncias de sessão. |
 | `catalog` | `catalog.list` | |
 | `ui` | `ui.emit`, `ui.mount` (Fase 1) | |
 | `timers` | `timers.set`, `timers.cancel`, `timers.list` | |
@@ -160,13 +163,14 @@ result: {}
 ### Blobs e KV
 
 ```ts
-// blobs.put — escopo blobs. Máx. 32 MiB por chamada.
-params: { text?: string; base64?: string; mime?: string }
-result: { hash: BlobRef }
+// blobs.put — escopo blobs. Máx. 32 MiB por chamada. Exatamente um de text ou base64.
+// Blobs são só bytes; o MIME acompanha a referência (ex.: Part.mime), não o blob.
+params: { text?: string; base64?: string }
+result: { hash: BlobRef; size: number }
 
 // blobs.get — escopo blobs
 params: { hash: BlobRef }
-result: { base64: string; mime: string; size: number }
+result: { base64: string; size: number }
 
 // kv.* — escopo kv. Valor JSON até 1 MiB.
 kv.get    params: { key: string }                     result: { value: unknown | null }
@@ -213,6 +217,8 @@ result: {
   results: { ext_id: string; payload?: unknown; signals?: object; error?: string }[];
 }
 ```
+
+Antes de retornar, o core acende na sessão as flags de cada hook que respondeu ([05-security.md](05-security.md#fluxo-entre-sessões)). O harness não precisa declarar nada.
 
 O contrato da tool de hook do lado da extensão:
 
@@ -353,7 +359,7 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `user.message` | user | `{content: Part[], command?: {ext_id, name, args}}` |
 | `ui.event` | `user` ou `ext:<id>@ui` | `{surface_id?, type, payload}` |
 | `ext.input` | `ext:<id>` | `{text}` |
-| `model.call` | core | `{provider, path, status, duration_ms, req_blob, resp_blob, bytes_in, bytes_out}` |
+| `model.call` | core | `{provider, method, path, outcome, error?, status, req_blob, req_bytes, resp_blob, resp_bytes, resp_complete, duration_ms, ttfb_ms}` — `outcome` ∈ `complete`, `client_cancelled`, `upstream_error`, `capture_failed`, `capture_limit`, `rejected`; `error` é o código do corpo de erro (`fictor_*`) ou de transporte (`connect_timeout`, `idle_timeout`, `connection_reset`); `status` é o do provider, ou o devolvido pelo proxy em `rejected`, ou `null` se não houve resposta. Ver [02-core.md](02-core.md#model-proxy). |
 | `tool.call` | core | `{call_id, name, arguments, origin: "harness" \| "ui"}` |
 | `tool.result` | core | `{call_id, content, structured?, is_error, duration_ms}` |
 | `tool.denied` | core | `{call_id, name, reason: "policy" \| "user", message?}` |
@@ -363,6 +369,10 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `net.denied` | core | `{ext_id, host, count}` |
 | `ext.started`, `ext.stopped`, `ext.crashed`, `ext.tools_changed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
 | `ext.proposed`, `ext.promoted`, `ext.rejected`, `ext.rolled_back` | core ou user | `{proposal_id?, ext_id, key}` — sessão `sys` |
+| `workspace.flagged` | core | `{workspace, flag: "U", session_id, source_event_id}` — sessão `sys` |
+| `workspace.cleared` | user | `{workspace}` — sessão `sys` |
+| `ext.flags_changed` | core | `{ext_id, flags: {U, P}, session_id?, reason}` — marca d'água de extensão global (Fase 1), sessão `sys` |
+| `ext.state_reset` | user | `{ext_id}` — kv, `${ext_data}` e marca d'água apagados (Fase 1), sessão `sys` |
 
 ### Gravados pelo harness
 
@@ -385,8 +395,8 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 |---|---|---|
 | `user.message`, `session.*`, `approval.decided` | trusted | public |
 | `tool.result` | ver [05-security.md](05-security.md#proveniência) | classificação da tool |
-| `ui.event` de surface, `ext.input` | `output_trust` default da extensão (`tools.default`), senão untrusted | public |
+| `ui.event` de surface, `ext.input` | `output_trust` default da extensão (`tools.default`), senão untrusted; combinado com a marca d'água se a extensão for global | `tools.default`, senão private; combinado com a marca d'água |
 | `events.append` por extensão | trusted | public |
 | demais eventos do core | trusted | public |
 
-Eventos gravados por extensões não acendem flags. As flags da sessão continuam cumulativas, então conteúdo derivado em sessão contaminada continua sob U.
+Eventos gravados por extensões via `events.append` não acendem flags. Isso é seguro porque toda entrada de dados nesses processos já passou por um canal mediado que acendeu as flags da sessão ([05-security.md](05-security.md#fluxo-entre-sessões)), e as flags são cumulativas.

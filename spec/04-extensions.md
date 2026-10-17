@@ -129,9 +129,9 @@ Flags do Deno derivadas das permissões (o sandbox do SO continua sendo a fronte
 
 | Permissão | Flag |
 |---|---|
-| `fs.read` | `--allow-read=<bundle>,<caminhos expandidos>,<socket do kernel>` |
-| `fs.write` | `--allow-write=<caminhos expandidos>,<socket do kernel>,${tmp}` |
-| `net.allow` ou `models` não vazios | `--allow-net=<hosts>` (inclui `models.fictor.internal` se `models` não vazio) |
+| `fs.read` | `--allow-read=<bundle>,<caminhos expandidos>` (+ socket do kernel no macOS) |
+| `fs.write` | `--allow-write=<caminhos expandidos>,${tmp}` (+ socket do kernel no macOS) |
+| `net.allow` ou `models` não vazios, ou escopos de kernel no Linux | `--allow-net=<hosts>` (inclui `models.fictor.internal` se `models` não vazio e `127.0.0.1:3129` se houver kernel no Linux) |
 | `spawn: true` | `--allow-run` |
 | env | `--allow-env` (o ambiente já é construído pelo core) |
 | sempre | sem `--allow-ffi`, sem `--allow-sys` |
@@ -145,14 +145,18 @@ O binário de cada runtime vem de `[runtimes]` no config ou do PATH, e seu diret
 | Template | Valor | Disponível em |
 |---|---|---|
 | `${workspace}` | workspace da sessão | só `scope: session` |
-| `${ext_data}` | `$FICTOR_HOME/extensions/data/<id>` | todas |
+| `${ext_data}` | global: `$FICTOR_HOME/extensions/data/<id>`; instância de sessão: `$FICTOR_HOME/extensions/data/<id>/sessions/<session_id>` | todas |
 | `${ext_root}` | raiz do bundle no store (sempre legível, nunca gravável) | todas |
 | `${store}` | `$FICTOR_HOME/extensions/store` (somente leitura) | só `role: harness` |
 | `${tmp}` | tmpfs/diretório temporário da instância | todas |
 
 Também são aceitos caminhos absolutos e `~/...`. Qualquer caminho fora dos templates impede promoção automática.
 
-`${workspace}` em extensão `scope: global` é erro de validação.
+Regras de validação por escopo (bloqueantes no pipeline):
+
+- `${workspace}` em extensão `scope: global` é erro.
+- Os escopos de kernel `tools`, `hooks` e `sessions` exigem `scope: session` ou `role: harness`.
+- Extensões com `role: harness` ou com o escopo `tools` alimentam o modelo, então não acessam dados por fora do core: `fs.read` e `fs.write` só com `${store}`, `${ext_root}`, `${ext_data}` e `${tmp}`; `net.allow` e `secrets` vazios; `models` é permitido. Workspace, web e qualquer outro dado chegam a elas apenas por `tools.call` (invariante I11).
 
 ## Permissões
 
@@ -164,7 +168,41 @@ Também são aceitos caminhos absolutos e `~/...`. Qualquer caminho fora dos tem
 | `models` | ids de provider ou `*` | Acesso ao model proxy. |
 | `spawn` | bool | Pode criar subprocessos (dentro do mesmo sandbox). |
 | `secrets` | `{name, env}[]` | Segredo injetado como variável de ambiente. Ver [05-security.md](05-security.md#segredos). |
-| `env` | mapa | Variáveis estáticas. Nomes com prefixo `FICTOR_` são reservados. |
+| `env` | mapa | Variáveis estáticas. Não podem usar nomes reservados. |
+
+### Variáveis de ambiente reservadas
+
+O supervisor define o ambiente; o manifest não pode sobrescrevê-lo nem injetar variáveis que mudam o carregamento de código ou o roteamento de rede. Um nome reservado em `permissions.env` ou em `permissions.secrets[].env` é erro bloqueante na validação (etapa 2 do pipeline). O mesmo nome em `env` e em `secrets` também é erro.
+
+| Tipo | Nomes |
+|---|---|
+| Prefixos | `FICTOR_`, `LC_`, `LD_`, `DYLD_`, `DENO_`, `BASH_FUNC_` |
+| Ambiente base | `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LANGUAGE`, `USER`, `LOGNAME`, `SHELL`, `PWD` |
+| Rede e proxy | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY` |
+| Certificados | `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_NO_VERIFY` |
+| Carregamento de código | `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PERL5OPT`, `RUBYOPT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` |
+| Agentes e sessão gráfica | `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`, `GNUPGHOME`, `DOCKER_HOST`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`, `WAYLAND_DISPLAY` |
+
+Variáveis em minúsculas não podem ser declaradas (o schema só aceita `^[A-Z][A-Z0-9_]*$`). O schema rejeita os nomes desta tabela; o supervisor confere de novo no spawn.
+
+### Sintaxe de `net.allow`
+
+| Forma | Exemplo | Casa |
+|---|---|---|
+| `*` | `*` | Qualquer nome DNS na porta 443, se todos os endereços resolvidos forem públicos. |
+| Domínio | `api.github.com` | Exatamente esse nome, porta 443. |
+| Subdomínios | `*.github.com` | Subdomínios, sem o domínio raiz, porta 443. |
+| Domínio com porta | `registry.local.test:8443` | Esse nome nessa porta. |
+| IPv4 com porta | `127.0.0.1:11434` | Esse IP nessa porta. A porta é obrigatória para IP literal. |
+| IPv6 com porta | `[::1]:11434`, `[2001:db8::10]:8080` | Esse IP nessa porta. Colchetes e porta obrigatórios. |
+
+Regras semânticas (etapa 2 do pipeline):
+
+- IPv6 é normalizado na forma da RFC 5952 antes de gravar no lock.
+- Zonas (`[fe80::1%eth0]:80`) não são aceitas.
+- IPv4 mapeado em IPv6 (`[::ffff:127.0.0.1]:80`) não é aceito; escreva a forma IPv4.
+- `*:porta`, curingas no meio do nome e faixas de IP (CIDR) não são aceitos.
+- Destinos não públicos e `localhost` só casam por regra exata com porta ([02-core.md](02-core.md#connect-https)).
 
 ## Classificação de tools
 
@@ -262,7 +300,7 @@ export default defineExtension({
 Responsabilidades do SDK:
 
 - Subir o servidor MCP no stdio e registrar tools, hooks (`hook_*`) e resources.
-- Conectar ao Kernel Protocol se `FICTOR_KERNEL_SOCKET` existir e expor `ctx.kv`, `ctx.events`, `ctx.ui`, `ctx.timers`, `ctx.tools` conforme os escopos.
+- Conectar ao Kernel Protocol se `FICTOR_KERNEL_URL` existir (esquemas `tcp:` e `unix:`) e expor `ctx.kv`, `ctx.events`, `ctx.ui`, `ctx.timers`, `ctx.tools` conforme os escopos.
 - `ctx.exec`: subprocesso com timeout e truncamento de saída.
 - Validar que hooks implementados batem com `hooks` do manifest na inicialização.
 

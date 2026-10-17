@@ -100,7 +100,7 @@ Ação no shell sobre uma sessão:
 2. `fixture` = snapshot do workspace no início da sessão (exige a extensão `checkpoints`) ou um diretório indicado pelo usuário.
 3. Checagens: o usuário escolhe entre as sugeridas (testes do projeto, arquivos alterados) e uma rubrica que o modelo rascunha e o usuário edita.
 
-## Armazenamento (migração 0002)
+## Armazenamento (migração 0003)
 
 ```sql
 CREATE TABLE eval_runs (

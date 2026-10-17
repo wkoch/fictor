@@ -52,7 +52,18 @@ struct SandboxProfile {
 Regras comuns:
 
 - Caminhos são canonicalizados antes de montar. Symlinks que apontem para fora dos caminhos permitidos são recusados.
-- Nunca montados: `FICTOR_HOME` (exceto o bundle, `data/<id>` e os sockets da instância), o HOME real (exceto `sandbox.home_ro_files` em instâncias de sessão), `/var/run/docker.sock`, sockets de agente SSH e GPG.
+- `FICTOR_HOME` nunca é montado, exceto o bundle, o `${ext_data}` da instância e os sockets da instância. O HOME real nunca é montado inteiro (só `sandbox.home_ro_files`, em instâncias de sessão).
+- Arquivos montados um a um (`fs.read` apontando para arquivo, `home_ro_files`) que sejam sockets são recusados.
+- Caminhos sensíveis: o supervisor recusa o spawn se um caminho do perfil for igual a um caminho sensível, o contiver ou estiver contido nele. Lista:
+  - credenciais: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.local/share/keyrings`, `~/Library/Keychains`;
+  - diretórios de runtime com sockets: `$XDG_RUNTIME_DIR` (ou `/run/user/<uid>`), `/run`, `/var/run`, `/tmp/.X11-unix`;
+  - endpoints descobertos na inicialização do core (e de novo em `fictor doctor`):
+    - `SSH_AUTH_SOCK` do ambiente do core;
+    - saída de `gpgconf --list-dirs` (`homedir`, `socketdir`, `agent-socket`, `agent-ssh-socket`, `agent-extra-socket`, `agent-browser-socket`, `dirmngr-socket`, `keyboxd-socket`), com timeout de 2 s. Esse comando não inicia o agente. Se `gpgconf` não existir ou falhar, usar `~/.gnupg` e `$XDG_RUNTIME_DIR/gnupg`, seguir e avisar no `doctor`;
+    - `DOCKER_HOST` e `DBUS_SESSION_BUS_ADDRESS` quando apontam para Unix socket; `/run/docker.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, `/run/podman/podman.sock`, `/run/dbus/system_bus_socket`.
+- Sockets Unix que não estão na lista, criados dentro de um diretório montado (por exemplo, no workspace):
+  - no macOS, não são alcançáveis: o perfil Seatbelt só permite `network-outbound` para o socket do kernel;
+  - no Linux, montagem somente leitura não impede `connect()` em socket. Ficam alcançáveis até a Fase 3, quando o seccomp nega `socket(AF_UNIX, …)` à carga de trabalho. Risco residual documentado no fim deste arquivo.
 - Não existe rede direta. Só o proxy.
 - O ambiente é construído do zero ([02-core.md](02-core.md#spawn)).
 
@@ -87,8 +98,9 @@ Caminhos do host são montados no mesmo caminho dentro do sandbox, exceto `${tmp
 `fictor __sandbox-init` roda como PID 1 dentro do sandbox:
 
 1. Escuta em `127.0.0.1:3128` e repassa cada conexão para `/fx/proxy.sock`.
-2. (Fase 3) Aplica Landlock (somente os caminhos do perfil) e um filtro seccomp (bloqueia `ptrace`, `mount`, `bpf`, `keyctl`, `unshare`, criação de sockets fora de AF_UNIX/AF_INET para loopback; bloqueia `execve` se `spawn: false` após o primeiro exec).
-3. Inicia o comando, repassa sinais, recolhe zumbis e sai com o código do filho.
+2. Se houver kernel, escuta em `127.0.0.1:3129` e repassa cada conexão para `/fx/kernel.sock`. Os dois listeners sobem antes do comando, então a carga de trabalho não consegue ocupar essas portas.
+3. (Fase 3) No processo filho, antes do `execve`, aplica Landlock (somente os caminhos do perfil) e um filtro seccomp que nega: `ptrace`, `mount`, `umount2`, `pivot_root`, `bpf`, `keyctl`, `add_key`, `request_key`, `unshare`, `setns`, `perf_event_open`; `socket()` com domínio diferente de `AF_INET`/`AF_INET6` (inclui `AF_UNIX`, `AF_NETLINK`, `AF_PACKET`), mantendo `socketpair(AF_UNIX)`; e `execve`/`execveat` depois do primeiro, se `spawn: false`. O próprio init não recebe o filtro. Validar com Deno, Node e Python; ajustes exigem ADR.
+4. Inicia o comando, repassa sinais, recolhe zumbis e sai com o código do filho.
 
 Até a Fase 3, `spawn: false` só é aplicado pelo Deno (`--allow-run` ausente). Para `node` e `python` é apenas declarativo. Isso DEVE aparecer na UI de aprovação.
 
@@ -130,9 +142,11 @@ O core calcula `trust` e `sensitivity` de cada `tool.result`.
 
 1. `output_trust` efetivo da tool é `untrusted`;
 2. `output_trust` é `workspace` e a sessão tem `workspace_trust = untrusted`;
-3. a extensão tem `net.allow` com algum padrão fora de `policy.trusted_domains`. Nesse caso o `output_trust` efetivo de todas as suas tools é `untrusted`, independentemente do manifest.
+3. `output_trust` é `workspace` e o workspace da sessão está com a flag U ([Flag de workspace](#flag-de-workspace));
+4. a extensão tem `net.allow` com algum padrão fora de `policy.trusted_domains`. Nesse caso o `output_trust` efetivo de todas as suas tools é `untrusted`, independentemente do manifest;
+5. a extensão é global e sua marca d'água tem U ([Marca d'água](#marca-dágua-de-extensões-globais-fase-1)).
 
-Caso contrário, `trust = trusted`. `sensitivity` vem da classificação da tool.
+Caso contrário, `trust = trusted`. `sensitivity` vem da classificação da tool; vira `private` se a marca d'água da extensão tiver P.
 
 Além disso, instâncias de sessão que conectam via proxy a domínio fora de `policy.trusted_domains` acendem U diretamente ([02-core.md](02-core.md#proveniência-de-rede)).
 
@@ -143,6 +157,46 @@ Além disso, instâncias de sessão que conectam via proxy a domínio fora de `p
 
 As flags só acendem e nunca apagam dentro de uma sessão. Para "limpar", o usuário faz fork de um evento anterior à contaminação. Cada vez que uma flag acende, o core grava `session.tainted` com o motivo e o evento de origem.
 
+## Fluxo entre sessões
+
+Invariante I11. O harness, e portanto o modelo, só recebe dados por canais mediados pelo core, e os canais que atravessam sessões também propagam flags. Nada aqui depende de algo que a extensão informe em runtime; a classificação vem do manifest revisado e fixado no lock.
+
+### Canais de entrada do harness
+
+| Canal | Regra |
+|---|---|
+| `tools.call` | `tool.result` com [proveniência](#proveniência). É o único caminho do workspace, da web e de serviços externos até o harness. |
+| `hooks.invoke` | Cada hook que responde acende na sessão as flags da sua classificação (`tools.hook_<point>` do manifest, senão `tools.default`, senão o default restritivo), combinadas com a marca d'água se a extensão for global. |
+| Rede via proxy | Domínio fora de `trusted_domains` acende U ([02-core.md](02-core.md#proveniência-de-rede)). |
+| Model proxy | Respostas de providers configurados não contaminam. |
+| `events.*` | Só a linhagem da própria sessão, cujas flags já estão no head. |
+| `kv`, `${ext_data}` | Por sessão (`ext_id@session_id`, `data/<id>/sessions/<session_id>`). Não formam canal entre sessões. |
+| `blobs.get` | Ler exige conhecer o hash, que só chega por um dos canais acima. |
+| `config.get` | Escrita pelo usuário: trusted, public. |
+| Arquivos | Só `${store}`, `${ext_root}`, `${ext_data}` e `${tmp}` ([04-extensions.md](04-extensions.md#escopo-e-templates-de-caminho)). Bundles no store foram aprovados: trusted, public. |
+
+Extensões de sessão com `${workspace}` (como `fs-tools`) leem o workspace diretamente, mas só entregam dados ao harness como `tool.result`, classificado pelo manifest.
+
+### Flag de workspace
+
+Fecha o caminho "sessão contaminada escreve no workspace, outra sessão lê".
+
+- Tabela `workspace_flags` ([schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql)), chave = caminho canônico.
+- Quando uma sessão com U tem admitida uma chamada com `effect` diferente de `read` a uma tool de extensão que tem `${workspace}` em `fs.write`, o core acende U no workspace antes de executar e grava `workspace.flagged`.
+- Enquanto a flag estiver acesa, tools com `output_trust: workspace` devolvem `untrusted` em qualquer sessão desse workspace. Workspaces sobrepostos (um contém o outro) compartilham a flag.
+- Só o usuário apaga a flag: na UI confiável, depois de revisar as mudanças, ou com `fictor workspace clear <caminho>`. Grava `workspace.cleared`.
+- P não é propagado ao workspace: tools que leem o workspace já são `sensitivity: private`.
+
+### Marca d'água de extensões globais (Fase 1)
+
+Fecha o caminho "sessão contaminada envia dados a uma extensão global com estado, outra sessão lê".
+
+- Tabela `ext_flags` ([schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql)).
+- O core acende na marca d'água as flags da sessão que chama uma tool da extensão, invoca um hook dela ou tem eventos lidos por ela via `events.*`. Grava `ext.flags_changed` quando a marca muda.
+- Resultados de tools, respostas de hooks, `ui.event` e `ext.input` da extensão saem combinados com a marca: U → `untrusted`, P → `private`.
+- A marca só apaga com "limpar estado" (UI confiável ou `fictor ext reset <id>`). Isso apaga o kv da extensão, o `${ext_data}` global e a marca, reinicia as instâncias e grava `ext.state_reset`.
+- Consequência intencional: uma extensão global de memória chamada por sessão contaminada passa a contaminar quem a lê.
+
 ## Decisão
 
 Toda chamada a `tools.call`, vinda do harness ou de uma surface, passa por esta função. A ordem é normativa:
@@ -152,7 +206,7 @@ decide(tool T, sessão S, origem O):
   1. T inexistente ou extensão desativada                         → deny
   2. regra de config com decision=deny casa T.name                → deny
   3. S.mode == plan e T.effect != read                            → deny  ("modo plan")
-  4. T.effect == external e S.U e (S.P ou T.sensitivity == private)
+  4. T.effect == external e S.U e (S.P ou sensitivity efetiva de T == private)
                                                                   → ask   (Rule of Two; escopo só "once")
   5. existe grant (sessão S ou permanente) para T.name            → allow
   6. regra de config com decision=ask casa T.name                 → ask
@@ -184,7 +238,7 @@ Adaptação consciente: escrita local (`write_local`) não conta como C. Ela é 
 
 ## Segredos
 
-- Chaves de provider ficam só no model proxy (invariante I4).
+- Chaves de provider ficam só no model proxy (invariante I4). Armazenamento e backends em [02-core.md](02-core.md#segredos).
 - **Exceção:** `permissions.secrets` injeta um segredo como variável de ambiente, para servidores MCP de terceiros que só aceitam token assim. Condições:
   - nunca é promovido automaticamente;
   - `net.allow` DEVE ser não vazio e sem `*`;
@@ -242,8 +296,10 @@ Senão, o resultado é `untrusted`. Valores fechados não carregam instruções;
 
 | Risco | Mitigação | Fase |
 |---|---|---|
-| Escrita local sob injection planta código que o usuário executa depois fora do sandbox | Checkpoints e diff; aviso quando sessão com U edita scripts, hooks de git ou CI | 2 |
-| Extensão global mistura dados de sessões diferentes | Extensões que tocam dados privados DEVERIAM ser `scope: session`; revisão no pipeline | — |
+| Escrita local sob injection planta código que o usuário executa depois fora do sandbox | Flag de workspace; checkpoints e diff; aviso quando sessão com U edita scripts, hooks de git ou CI | 0 / 2 |
+| Programas fora do Fictor (ex.: `git pull`) trazem conteúdo de terceiros para um workspace `trusted` sem acender flag | `workspace_trust` é escolha do usuário por sessão; o shell mostra o valor ao criar a sessão | — |
+| Marca d'água superestima a contaminação de extensões globais | "Limpar estado"; preferir `scope: session` para extensões com estado | 1 |
+| Linux: sockets Unix fora da lista de caminhos sensíveis, dentro de diretórios montados, ficam alcançáveis | Lista de caminhos sensíveis e descoberta; seccomp nega `socket(AF_UNIX)` | 3 |
 | Segredo via env visível para a extensão | Allowlist de rede obrigatória; injeção no proxy | 3 |
 | `spawn: false` não aplicado para node/python no Linux | Documentado na aprovação; seccomp | 3 |
 | Seatbelt depreciado | Tier `vm` | 4 |

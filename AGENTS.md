@@ -8,7 +8,7 @@ Fictor é um runtime pessoal de agentes de IA. O core (Rust) é um kernel de con
 
 ## Leitura obrigatória antes de qualquer tarefa
 
-1. [spec/README.md](spec/README.md): requisitos, **invariantes I1–I10**, glossário.
+1. [spec/README.md](spec/README.md): requisitos, **invariantes I1–I11**, glossário.
 2. [spec/01-architecture.md](spec/01-architecture.md): camadas, processos, layout.
 3. [spec/10-roadmap.md](spec/10-roadmap.md): fase atual, marcos e critérios de aceitação.
 4. O arquivo do spec do componente em que você vai mexer.
@@ -18,8 +18,8 @@ Fictor é um runtime pessoal de agentes de IA. O core (Rust) é um kernel de con
 1. **Uma fase por vez.** Implemente os marcos na ordem do roadmap. Não implemente itens marcados com fase posterior.
 2. **Invariantes não se negociam.** Se uma tarefa parecer exigir quebrar uma invariante, pare e pergunte ao usuário.
 3. **Nunca afrouxe segurança para fazer algo funcionar.** Isso inclui: desligar o sandbox, ampliar montagens, liberar rede direta, relaxar CSP, pular checagem de `Host`/`Origin`/CSRF, passar segredos para extensões, permitir UPDATE/DELETE em `events`. Um teste que falha por causa de uma dessas proteções indica bug na implementação ou no teste.
-4. **Divergências do spec** exigem um ADR novo em [spec/11-decisions.md](spec/11-decisions.md) e a atualização dos arquivos afetados do spec, no mesmo commit.
-5. **Ambiguidade.** Em segurança, formato de dados persistidos ou protocolo: pergunte ao usuário. Em detalhe interno: decida pela opção mais simples, siga e registre a decisão num comentário curto ou ADR.
+4. **O spec é do arquiteto.** Não edite `spec/` nem `AGENTS.md`. Divergência, lacuna ou ambiguidade em segurança, formato de dados persistidos ou protocolo vira uma pendência `ARQ-NNN` em `docs/architect-pending.md` (referência, dúvida, o que é necessário, impacto). Não implemente a parte afetada até o arquiteto responder com um ADR em [spec/11-decisions.md](spec/11-decisions.md); depois, marque a pendência como resolvida citando o ADR.
+5. **Detalhe interno.** Decida pela opção mais simples, siga e registre a decisão em `docs/implementation.md` ou num comentário curto.
 6. **Critérios de aceitação viram testes automatizados** sempre que possível.
 7. **Dependências.** Prefira as listadas em [spec/01-architecture.md](spec/01-architecture.md#stack). Dependência nova precisa de motivo claro.
 8. **Fora do escopo, sempre:** Tauri/Electron, JS ou WASM embutido no core, Docker como requisito, bancos especializados no core.

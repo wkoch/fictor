@@ -39,7 +39,13 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 ### 2. Normalização
 
 - Se não houver `fictor.yaml` (origens externas), gerar o manifest pela tabela de [04-extensions.md](04-extensions.md#importação-de-formatos-externos-fase-3), com classificação restritiva.
-- Validar o manifest contra [schemas/extension.schema.json](schemas/extension.schema.json) e as regras semânticas: templates válidos para o escopo, `role: harness` com `scope: session` e sem `hooks`, `hooks_api` presente quando há hooks, nomes de commands e surfaces únicos.
+- Validar o manifest contra [schemas/extension.schema.json](schemas/extension.schema.json) e as regras semânticas, todas bloqueantes:
+  - templates válidos para o escopo e regras de escopo de kernel e de acesso a dados ([04-extensions.md](04-extensions.md#escopo-e-templates-de-caminho));
+  - `role: harness` com `scope: session` e sem `hooks`; `hooks_api` presente quando há hooks;
+  - nenhum nome reservado em `permissions.env` ou `permissions.secrets[].env`, e nenhum nome repetido entre os dois ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas));
+  - `net.allow` válido semanticamente, com IPv6 normalizado ([04-extensions.md](04-extensions.md#sintaxe-de-netallow));
+  - `secrets` não vazio exige `net.allow` não vazio e sem `*` ([05-security.md](05-security.md#segredos));
+  - nomes de commands e surfaces únicos.
 - Se já existe versão ativa com o mesmo `id`, a proposta é uma atualização (`update_of` = chave ativa).
 
 ### 3. Dependências

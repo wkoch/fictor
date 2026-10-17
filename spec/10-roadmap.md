@@ -2,6 +2,26 @@
 
 Cada fase termina com todos os critérios de aceitação passando, de preferência como testes automatizados. Não implementar itens de fases posteriores antes da hora. Segurança entra no dia 0: proveniência e flags no schema não podem ser adicionadas depois.
 
+## Releases
+
+| Release | Conteúdo obrigatório | Pode ficar para depois |
+|---|---|---|
+| v0.1 | Fase 0 completa | — |
+| v0.2 | Fase 1 completa | — |
+| v0.3 | Fase 2 completa | — |
+| **v1.0** | Fases 0–2 e o núcleo da Fase 3: origens `git`, `mcp`, `skill`, `claude-plugin`; normalização; MCP remoto; checagens OSV, de segredos e de capacidades inferidas; extensão `auditor`; watcher de atualizações com auditoria do diff; Landlock e seccomp no Linux | — |
+| v1.x | — | Tier `container`, injeção de segredos no proxy com terminação TLS, `qreader`, execução comportamental com honeytokens, modo sombra, itens da Fase 4 |
+
+### Gate de cada release
+
+1. Todos os critérios de aceitação das fases incluídas passam em duas máquinas reais: Fedora Atomic (COSMIC, x86_64) e macOS (Apple Silicon). Execução registrada em `docs/` com data, versão do SO e commit.
+2. CI verde em Ubuntu 22.04 e macOS 15. A CI é necessária, mas não substitui o item 1: Ubuntu não reproduz o Fedora Atomic.
+3. Cada invariante I1–I11 tem pelo menos um teste automatizado que falharia se ela fosse quebrada. Lista de testes por invariante em `docs/`.
+4. A tabela de riscos residuais de [05-security.md](05-security.md#riscos-residuais) foi revisada: cada linha tem fase de mitigação igual ou posterior à release, ou foi removida.
+5. Windows/WSL2 não bloqueia release.
+
+Critérios da Fase 3 que são do núcleo v1.0: 1 a 5. Itens de v1.x ganham critérios próprios quando forem planejados.
+
 ## Fase 0 — Esqueleto funcional
 
 Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando com sandbox, proxy, política e aprovações.
@@ -35,6 +55,13 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 11. Fork a partir de um evento antigo cria uma sessão nova com o histórico até ali; a sessão original não muda; flags herdadas são as do evento de fork.
 12. `UPDATE events` ou `DELETE FROM events` direto no SQLite falha.
 13. Mudar a descrição de uma tool no servidor de uma extensão instalada (sem nova proposta) desativa a extensão e gera `ext.tools_changed`.
+14. Um harness de teste que tenta ler um arquivo do workspace pelo sistema de arquivos falha. Ler `AGENTS.md` via `fs-tools__read_file` gera `tool.result` e acende P na sessão.
+15. Flag de workspace: a sessão A (com U) edita um arquivo; a sessão B, no mesmo workspace, lê esse arquivo e recebe `trust = untrusted`. Depois de `workspace.clear_flag`, uma nova leitura em B volta a `trusted`.
+16. Uma extensão `scope: session` grava em `kv` e em `${ext_data}` na sessão A; na sessão B, não enxerga nenhum dos dois.
+17. Model proxy com o provider falso: (a) cancelar o cliente no meio do stream gera `model.call` com `outcome = client_cancelled`, `resp_complete = false` e blob parcial; (b) o provider derrubar a conexão gera `upstream_error`; (c) com limite diário 2, a terceira requisição recebe 429, inclusive depois de reiniciar o core; (d) `base_url = "http://localhost:<porta>"` impede o core de subir.
+18. Manifest com `permissions.env` contendo `PATH`, `NODE_OPTIONS` ou `LD_PRELOAD` é recusado na validação.
+19. Linux: com `SSH_AUTH_SOCK` apontando para um socket dentro de um diretório pedido em `fs.read`, o spawn é recusado.
+20. `secrets.backend = "keyring"` com o keyring indisponível: `fictor secrets set` falha sem criar `secrets.toml`, e o model proxy responde 503 `fictor_secret_unavailable`.
 
 Fora da Fase 0: propostas da IA, surfaces, hooks, web, compactação, evals, terceiros.
 
@@ -51,6 +78,7 @@ Entregas:
 - Host de MCP Apps, `ui.mount`, design system `fx-*` e `CATALOG.md`.
 - Compactação no harness.
 - Extensões `web`, `search`, `authoring`.
+- Marca d'água de extensões globais, propagação de flags por hooks, "limpar estado".
 
 Critérios de aceitação:
 
@@ -62,6 +90,8 @@ Critérios de aceitação:
 6. Uma surface que chama uma tool de outra extensão recebe erro.
 7. Um hook `tool.after` que trava é pulado após o timeout, gera `hook.failed` e o turno continua.
 8. Uma conversa longa passa do limite de contexto e continua após `harness.compaction`.
+9. Uma extensão global de teste com estado, chamada por uma sessão com U, devolve resultados `untrusted` a outra sessão; depois de "limpar estado", volta a `trusted`.
+10. Um hook `context.assemble` de extensão com `output_trust: untrusted` acende U na sessão que o invoca.
 
 ## Fase 2 — Histórico e qualidade
 

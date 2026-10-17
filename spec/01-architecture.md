@@ -50,7 +50,7 @@ Regras:
 | Navegador ↔ core | HTTP + WebSocket em `127.0.0.1` | UI confiável, eventos, aprovações. Ver [08-shell.md](08-shell.md). |
 | Navegador ↔ surfaces | iframe em `localhost` (host diferente), postMessage | UI de extensões (MCP Apps). |
 | Core ↔ extensão (MCP) | stdio, JSON-RPC delimitado por linha (transporte stdio do MCP) | tools, resources, hooks. O core é o cliente MCP. |
-| Core ↔ extensão (Kernel Protocol) | Unix socket por instância, JSON-RPC delimitado por linha | serviços do kernel. Ver [03-kernel-protocol.md](03-kernel-protocol.md). |
+| Core ↔ extensão (Kernel Protocol) | Unix socket por instância no host. No Linux, `__sandbox-init` o expõe dentro do sandbox como TCP em `127.0.0.1:3129`; no macOS a extensão conecta ao socket. JSON-RPC delimitado por linha. | serviços do kernel. Ver [03-kernel-protocol.md](03-kernel-protocol.md#transporte). |
 | Extensão → internet | HTTP(S) via egress proxy do core | allowlist por domínio, log, contaminação. |
 | Extensão → modelo | HTTP via proxy para o host interno `models.fictor.internal` | o core injeta a chave e repassa via TLS. |
 | CLI ↔ core | Unix socket `run/admin.sock` (0600) | comandos administrativos. |
@@ -112,14 +112,15 @@ $FICTOR_HOME/
 ├── config.toml
 ├── AGENTS.md                 instruções globais do usuário (opcional)
 ├── fictor.db                 SQLite (WAL)
-├── secrets.toml              só se não houver keyring (0600)
+├── secrets.toml              só com [secrets] backend = "file" (0600)
 ├── blobs/<2 hex>/<62 hex>    conteúdo endereçado por sha256
 ├── evals/<case_id>/          casos criados pelo usuário (Fase 2)
 ├── extensions/
 │   ├── lock.json
 │   ├── store/<id>/<version>-<hash12>/    somente leitura após promoção
 │   ├── quarantine/<proposal_id>/
-│   └── data/<id>/                         gravável pela extensão (${ext_data})
+│   └── data/<id>/                         ${ext_data} de extensões globais
+│       └── sessions/<session_id>/         ${ext_data} de instâncias de sessão
 ├── run/                      sockets e pids (diretório 0700)
 │   ├── admin.sock
 │   ├── proxy.sock            (Linux)
@@ -127,7 +128,7 @@ $FICTOR_HOME/
 └── logs/
 ```
 
-Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da própria extensão (`store/...`, leitura), `data/<id>` (escrita) e os sockets da própria instância. O harness também lê `store/` inteiro.
+Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da própria extensão (`store/...`, leitura), o `${ext_data}` da instância (escrita) e os sockets da própria instância. O harness também lê `store/` inteiro.
 
 ## Stack
 

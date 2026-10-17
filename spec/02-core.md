@@ -17,8 +17,8 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 
 1. Resolver o bundle ativo no lock (`store/<id>/<key>/`).
 2. Resolver as permissões do manifest em um `SandboxProfile` ([05-security.md](05-security.md#perfil-de-sandbox)), expandindo templates de caminho.
-3. Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel.
-4. Montar o ambiente do zero (nada herdado do usuário):
+3. Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel. No Linux, `__sandbox-init` expõe esse socket dentro do sandbox como TCP em `127.0.0.1:3129` ([05-security.md](05-security.md#linux-bubblewrap)).
+4. Montar o ambiente do zero (nada herdado do usuário). Recusar o spawn se `permissions.env` ou `permissions.secrets[].env` usar nome reservado ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)); a validação principal ocorre no pipeline, esta é a segunda barreira.
 
 | Variável | Valor |
 |---|---|
@@ -31,7 +31,7 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 | `NODE_USE_ENV_PROXY` | `1` |
 | `FICTOR_EXT_ID`, `FICTOR_INSTANCE_ID` | identidade |
 | `FICTOR_SESSION_ID`, `FICTOR_WORKSPACE` | só para instâncias de sessão |
-| `FICTOR_KERNEL_SOCKET`, `FICTOR_KERNEL_TOKEN` | só se houver escopos de kernel; o caminho é o visto dentro do sandbox (`/fx/kernel.sock` no Linux) |
+| `FICTOR_KERNEL_URL`, `FICTOR_KERNEL_TOKEN` | só se houver escopos de kernel. Linux: `tcp://127.0.0.1:3129`. macOS: `unix://<caminho absoluto do socket>` |
 | `FICTOR_MODELS_URL` | `http://models.fictor.internal/p` se `permissions.models` não for vazio |
 | variáveis de `permissions.env` | valores estáticos do manifest |
 | variáveis de `permissions.secrets` | ver [05-security.md](05-security.md#segredos) |
@@ -88,18 +88,19 @@ Campos e tipos estão na migração. Regras:
 - O caminho de uma sessão (raiz → head) atravessa as sessões ancestrais seguindo `parent_id`.
 - A sessão reservada `sys` (`kind = system`) guarda eventos globais (ciclo de vida de extensões, rede, timers). É criada por `fictor init`.
 - `kind` distingue sessões normais, delegadas (subagentes, Fase 2) e de eval (Fase 2). `ext_overrides` (JSON `{ext_id: chave do lock}`) faz o supervisor e o gateway usarem outra versão de uma extensão só naquela sessão; é usado apenas por evals.
-- Ao criar sessão, o core valida `workspace`: diretório existente, caminho absoluto canônico, fora de `FICTOR_HOME`, diferente de `/`. Usar o `$HOME` inteiro exige confirmação explícita no shell.
+- Ao criar sessão, o core valida `workspace`: diretório existente, caminho absoluto canônico, diferente de `/`, fora de `FICTOR_HOME` e sem conter `FICTOR_HOME`. Usar o `$HOME` inteiro exige confirmação explícita no shell.
 
 ### Blobs
 
 - Endereço: `sha256:<hex>`. Arquivo em `blobs/<hex[0..2]>/<hex[2..]>`.
 - Escrita: arquivo temporário no mesmo diretório, fsync, rename. Se já existir, não reescreve.
 - Limite por blob: 256 MiB.
+- Blobs guardam só bytes. MIME não é propriedade do blob: vem da referência (`Part.mime` nos eventos) ou, na entrega HTTP, da detecção por assinatura ([08-shell.md](08-shell.md#endpoints-http-do-shell)). O mesmo conteúdo enviado com MIMEs diferentes é um único blob, sem conflito.
 - Coleta de lixo: `fictor gc` (Fase 2) remove blobs não referenciados por eventos, kv, propostas ou lock.
 
 ### KV
 
-- Namespace = `ext_id` da extensão chamadora. O core usa o namespace `core`.
+- Namespace: `ext_id` para instâncias globais; `ext_id@session_id` para instâncias de sessão, inclusive o harness. O core usa o namespace `core`. Estado compartilhado entre sessões só existe em extensões globais ([05-security.md](05-security.md#fluxo-entre-sessões)).
 - Valor JSON até 1 MiB.
 
 ## Gateway MCP
@@ -161,8 +162,10 @@ Um único proxy HTTP no core.
 
 ### CONNECT (HTTPS)
 
-- O destino `host:porta` é comparado com `permissions.net.allow` da extensão. Padrões: `exemplo.com` (exato), `*.exemplo.com` (subdomínios, sem o domínio raiz), `*` (qualquer). Sem porta no padrão, só 443.
-- Destinos IP literais, `localhost` e redes privadas (RFC 1918, link-local, loopback) só são aceitos se listados explicitamente com porta.
+- O destino `host:porta` é comparado com `permissions.net.allow` da extensão, na sintaxe de [04-extensions.md](04-extensions.md#sintaxe-de-netallow). Sem porta no padrão, só 443.
+- Normalização antes da comparação: host em minúsculas e sem ponto final; IPv6 na forma canônica da RFC 5952; IPv4 mapeado (`::ffff:a.b.c.d`) e NAT64 (`64:ff9b::/96`) avaliados como o IPv4 embutido; destino com zona (`%iface`) é negado.
+- `*` casa qualquer nome DNS na porta 443 cujos endereços resolvidos sejam todos públicos. Nunca casa IP literal, `localhost` nem destino não público.
+- Destinos não públicos (loopback, não especificado, RFC 1918, CGNAT `100.64.0.0/10`, link-local, ULA `fc00::/7`, multicast, faixas de documentação), IP literais e `localhost` só são aceitos por regra com host exato e porta explícita. Vale também para um nome DNS que resolva para endereço não público.
 - Negado: 403 e evento `net.denied` (agregado: um evento por par instância+domínio por minuto).
 - Permitido: túnel TCP. O proxy não faz MITM na Fase 0.
 - A resolução DNS é feita pelo core. No Linux o sandbox não tem DNS.
@@ -181,20 +184,71 @@ Um único proxy HTTP no core.
 
 Rota: `http://models.fictor.internal/p/<provider_id>/<resto>` → `<base_url>/<resto>`.
 
-1. Exigir que `provider_id` esteja em `permissions.models` da extensão (ou `*`). Senão, 403.
-2. Remover cabeçalhos hop-by-hop e qualquer cabeçalho de credencial: `authorization`, `x-api-key`, `api-key`, `proxy-authorization` e o `auth_header` do provider.
-3. Adicionar `<auth_header>: <auth_prefix><segredo>` e os `extra_headers` do provider.
-4. Repassar via TLS (rustls, raízes do sistema). Responses em streaming (SSE) são repassadas sem buffer.
-5. Gravar em paralelo o corpo da requisição e da resposta em blobs. Cabeçalhos não são gravados.
-6. Gravar `model.call {provider, path, status, duration_ms, req_blob, resp_blob, bytes_in, bytes_out}` na sessão da instância (ou em `sys` para extensões globais).
-7. Orçamento: contar requisições por dia e por sessão. Ao exceder `budget.*`, responder 429 com corpo JSON `{"error": "fictor_budget_exceeded"}`.
-
 O core não interpreta o corpo. Uso de tokens e custo são reportados pelo harness em `assistant.message`.
+
+### Validação dos providers
+
+Feita ao carregar a configuração. Erro impede o core de subir.
+
+- `base_url` DEVE usar `https://`. Única exceção: `http://` com host IP de loopback literal (`127.0.0.1` ou `[::1]`), para Ollama, LiteLLM local e o provider falso dos testes.
+- `http://` com `localhost`, IP de rede privada ou qualquer outro host é erro. Para um provider na rede local, usar HTTPS ou um túnel local.
+- Nunca há downgrade de `https` para `http`. Certificado inválido falha; não existe opção para ignorá-lo.
+
+### Admissão
+
+Em ordem; a primeira falha encerra a requisição:
+
+1. `provider_id` em `permissions.models` da extensão (ou `*`). Senão: 403 `{"error": "fictor_provider_not_allowed"}`.
+2. Segredo do provider disponível (se houver `secret`). Senão: 503 `{"error": "fictor_secret_unavailable"}`.
+3. Corpo da requisição lido até 64 MiB. Acima: 413 `{"error": "fictor_request_too_large"}`.
+4. Reserva de orçamento ([Orçamento](#orçamento)). Excedido: 429.
+5. Corpo da requisição gravado em blob. Falha: 503 `{"error": "fictor_capture_failed"}`. Nenhuma chamada sai para o provider sem a requisição gravada.
+6. Remover cabeçalhos hop-by-hop e qualquer cabeçalho de credencial (`authorization`, `x-api-key`, `api-key`, `proxy-authorization` e o `auth_header` do provider); adicionar `<auth_header>: <auth_prefix><segredo>` e os `extra_headers`; repassar (rustls, raízes do sistema). Timeout de conexão: 30 s.
+
+### Streaming e captura
+
+- A resposta passa ao cliente em streaming, sem esperar o fim. Cada pedaço é escrito na captura **antes** de ser enviado ao cliente. Invariante: todo byte entregue à extensão está na captura.
+- Limite de captura: 256 MiB. Ao atingir, o core encerra o stream do cliente e a conexão com o provider (`capture_limit`).
+- Falha de escrita na captura: encerra os dois lados (`capture_failed`).
+- Cliente desconecta: encerra a conexão com o provider (`client_cancelled`).
+- Falha do provider (conexão, reset, 600 s sem bytes): encerra o stream do cliente (`upstream_error`).
+- O provider termina a resposta normalmente, com qualquer status HTTP: `complete`.
+- A captura vira blob com o hash do que foi capturado, inclusive quando parcial.
+
+### Evento `model.call`
+
+Gravado uma única vez, ao final, para toda requisição autenticada que chegou ao model proxy. Campos em [03-kernel-protocol.md](03-kernel-protocol.md#gravados-pelo-core). Vai para a sessão da instância, ou para `sys` em extensões globais.
+
+- `resp_complete = true` só com `outcome = complete`.
+- Requisições recusadas antes do passo 5 têm `req_blob = null`.
+- Falha ao gravar o evento fecha o model proxy até o reinício do core, como no egress.
+- Se o core cair no meio de um stream, não há evento. As extensões morrem junto (`--die-with-parent`), então nenhum conteúdo não registrado é usado. Capturas temporárias órfãs são apagadas no boot.
+
+### Orçamento
+
+- **Unidade:** requisição admitida, isto é, que passou pela reserva do passo 4. Contam todas, inclusive as que depois falham, são canceladas ou são retries. Recusas nos passos 1–3 não contam.
+- **Escopos:** dia (global, todas as extensões) e sessão (vida inteira da sessão). Instâncias globais só consomem o limite do dia.
+- **Dia:** data civil local, no fuso do sistema no momento da admissão (`YYYY-MM-DD`). Zera à meia-noite local.
+- **Fonte de verdade:** tabela `budget_usage` ([schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql)). A reserva é um incremento condicional na task única de escrita: se o dia e a sessão estão abaixo dos limites, incrementa os dois na mesma transação e admite. Sobrevive a reinício. Não há devolução.
+- **Excedido:** 429 com `{"error": "fictor_budget_exceeded", "scope": "day" | "session", "limit": <n>}`.
 
 ## Segredos
 
-- Armazenamento: crate `keyring` (Secret Service no Linux, Keychain no macOS), serviço `fictor`, conta = nome do segredo.
-- Sem backend de keyring: `$FICTOR_HOME/secrets.toml` com modo 0600. `fictor doctor` avisa.
+- **Backend explícito:** `[secrets] backend = "keyring"` (default) ou `"file"`. Nunca há fallback automático entre backends nem cópia de segredos do keyring para disco.
+- **`keyring`:** crate `keyring` (Secret Service no Linux, Keychain no macOS), serviço `fictor`, conta = nome do segredo.
+  - Backend ausente (por exemplo, sem Secret Service): `fictor doctor` e `fictor secrets` falham com mensagem que sugere `backend = "file"`.
+  - Backend presente mas bloqueado, ou com erro transitório: a operação falha e pode ser repetida depois. O model proxy responde 503 `fictor_secret_unavailable`. O arquivo nunca é usado como alternativa.
+- **`file`:** `$FICTOR_HOME/secrets.toml`, do próprio usuário, modo 0600. O core recusa ler se o dono for outro ou o modo for mais aberto. Formato:
+
+  ```toml
+  schema = 1
+
+  [secrets]
+  anthropic_api_key = "..."
+  ```
+
+  Nomes seguem `^[a-z0-9_]+$`; valores são strings não vazias. Escrita atômica: temporário 0600 no mesmo diretório, fsync, rename. Lido na inicialização e após `fictor secrets set|rm`. O conteúdo fica em texto puro (risco equivalente ao de `~/.aws/credentials`); `fictor doctor` avisa.
+- **Troca de backend:** o usuário roda `fictor secrets set` no backend novo e `rm` no antigo. Sem migração automática.
 - Entrada só pela CLI: `fictor secrets set <nome>` lê do TTY sem eco. Nunca pelo chat.
 - Leitores: model proxy e supervisor (para segredos declarados em `permissions.secrets`).
 - Logs: o layer de tracing DEVE substituir valores de segredos carregados por `***`.
@@ -208,7 +262,10 @@ O core não interpreta o corpo. Uso de tokens e custo são reportados pelo harne
 
 ## Configuração
 
-Arquivo `$FICTOR_HOME/config.toml`, criado por `fictor init`:
+Arquivo `$FICTOR_HOME/config.toml`. `fictor init` grava exatamente o conteúdo abaixo; linhas comentadas ficam comentadas.
+
+- O core lê o arquivo na inicialização. Mudanças nas seções do core exigem reinício.
+- Seções `[ext.<id>]` são relidas do arquivo a cada `config.get`, para que extensões vejam mudanças sem reiniciar o core.
 
 ```toml
 [server]
@@ -249,9 +306,12 @@ base_url = "http://127.0.0.1:11434"   # sem secret
 default_mode = "default"         # plan | default | auto
 trusted_domains = []             # domínios cujo conteúdo não acende U
 
-[[policy.rules]]                 # opcional; ordem não importa (deny > ask > allow)
-tool = "fs-tools__bash"
-decision = "allow"
+# [[policy.rules]]               # opcional; ver 05-security.md#decisão
+# tool = "fs-tools__*"
+# decision = "allow"
+
+[secrets]
+backend = "keyring"              # keyring | file
 
 [budget]
 max_model_requests_per_day = 2000
@@ -269,11 +329,19 @@ registries = ["jsr.io", "registry.npmjs.org", "deno.land", "pypi.org", "files.py
 trusted_packages = ["jsr:@std/*", "npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
 
 [evals]                          # Fase 2
-judge_model = "sonnet"           # chave de [ext.harness.models]
+judge_model = "main"             # chave de [ext.harness.models]
 max_call_ratio = 1.25
 
 [ext.harness]                    # seção opaca: só a extensão "harness" lê via config.get
-default_model = "anthropic/claude-sonnet"
+default_model = "main"           # chave de [ext.harness.models]
+
+# Preencha antes da primeira conversa. Ver 07-harness.md#configuração.
+# [ext.harness.models.main]
+# provider = "anthropic"         # id em [providers]
+# api = "anthropic"              # anthropic | openai-chat
+# model = "<nome exato do modelo no provider>"
+# context_window = 200000
+# max_output_tokens = 16000
 ```
 
 Seções `[ext.<id>]` são opacas para o core e só legíveis pela extensão `<id>`.

@@ -34,6 +34,7 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | I8 | Aprovações são exibidas e decididas só pela UI confiável do core ou pela CLI. Extensões e modelo não conseguem forjar nem responder uma aprovação. |
 | I9 | O core não conhece formatos de API de modelo nem conceitos como "chat", "agente" ou "canvas". Hook points são strings opacas para o core. |
 | I10 | O core só muda por: novo backend de sandbox ou isolamento, nova primitiva de segurança, bug ou performance. |
+| I11 | Todo dado que entra em processo vinculado a uma sessão chega por um canal mediado pelo core que propaga as flags U/P. Nenhuma garantia de contaminação depende de declaração voluntária de uma extensão ([05-security.md](05-security.md#fluxo-entre-sessões)). |
 
 ## Mapa do spec
 
@@ -52,6 +53,7 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | [11-decisions.md](11-decisions.md) | Registro de decisões (ADRs). |
 | [schemas/extension.schema.json](schemas/extension.schema.json) | JSON Schema do manifest `fictor.yaml`. |
 | [schemas/0001_init.sql](schemas/0001_init.sql) | Migração inicial do SQLite. |
+| [schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql) | Migração 0002: orçamento do model proxy e flags de workspace e de extensão. |
 
 Ordem de leitura para implementar: README → 01 → 10 → o arquivo da fase/componente em andamento.
 

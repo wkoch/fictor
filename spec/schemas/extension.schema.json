@@ -128,7 +128,7 @@
               "uniqueItems": true,
               "items": {
                 "type": "string",
-                "pattern": "^(\\*|(\\*\\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?)$"
+                "pattern": "^(\\*|(\\*\\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?|\\[[0-9A-Fa-f:.]+\\]:[0-9]{1,5})$"
               }
             }
           }
@@ -147,13 +147,13 @@
             "required": ["name", "env"],
             "properties": {
               "name": { "type": "string", "pattern": "^[a-z0-9_]+$" },
-              "env": { "type": "string", "pattern": "^(?!FICTOR_)[A-Z][A-Z0-9_]*$" }
+              "env": { "$ref": "#/$defs/envName" }
             }
           }
         },
         "env": {
           "type": "object",
-          "propertyNames": { "pattern": "^(?!FICTOR_)[A-Z][A-Z0-9_]*$" },
+          "propertyNames": { "$ref": "#/$defs/envName" },
           "additionalProperties": { "type": "string" }
         }
       }
@@ -184,6 +184,23 @@
     }
   ],
   "$defs": {
+    "envName": {
+      "description": "Nomes reservados: spec/04-extensions.md#variáveis-de-ambiente-reservadas.",
+      "type": "string",
+      "pattern": "^(?!(FICTOR_|LC_|LD_|DYLD_|DENO_|BASH_FUNC_))[A-Z][A-Z0-9_]*$",
+      "not": {
+        "enum": [
+          "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE", "USER", "LOGNAME", "SHELL", "PWD",
+          "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY",
+          "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
+          "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_NO_VERIFY",
+          "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+          "BASH_ENV", "ENV", "PROMPT_COMMAND", "PERL5OPT", "RUBYOPT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+          "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "GNUPGHOME", "DOCKER_HOST", "XDG_RUNTIME_DIR",
+          "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY"
+        ]
+      }
+    },
     "relPath": {
       "type": "string",
       "minLength": 1,

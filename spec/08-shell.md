@@ -24,8 +24,8 @@ Regras normativas em [05-security.md](05-security.md#endurecimento-web). Resumo:
 | `GET /login?t=<token>` | Troca o token de uso único pelo cookie e redireciona para `/`. |
 | `GET /`, `GET /assets/*` | Assets embutidos. |
 | `GET /ws` | Upgrade para WebSocket. |
-| `POST /api/blobs` | Upload de anexo (até 50 MiB). Retorna `{hash}`. |
-| `GET /api/blobs/<hash>` | Download. `X-Content-Type-Options: nosniff`. Só PNG, JPEG, GIF e WebP inline; o resto (inclusive SVG) com `Content-Disposition: attachment`. |
+| `POST /api/blobs` | Upload de anexo (até 50 MiB). Retorna `{hash, size}`. O `Content-Type` enviado pelo navegador é ignorado; o shell põe o MIME e o nome do arquivo no `Part` da mensagem. |
+| `GET /api/blobs/<hash>[?name=<nome>]` | Download com `X-Content-Type-Options: nosniff`. O tipo vem só da assinatura dos bytes: PNG, JPEG, GIF e WebP são servidos inline com o tipo detectado; todo o resto, inclusive SVG e HTML, como `application/octet-stream` com `Content-Disposition: attachment`. `name` (sanitizado: sem `/`, `\`, controles e aspas; até 200 caracteres) só define o nome do download. |
 
 ### Endpoints do host de surfaces
 
@@ -63,6 +63,8 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `proposal.decide` | `{proposal_id, nonce, decision: "approve" \| "reject", overrides?}` | Decide proposta. |
 | `ext.rollback` | `{ext_id, to?}` | Rollback. |
 | `ext.set_enabled` | `{ext_id, enabled}` | Liga ou desliga. |
+| `ext.reset_state` | `{ext_id}` | Limpa kv, `${ext_data}` global e marca d'água (Fase 1). Exige confirmação no modal. |
+| `workspace.clear_flag` | `{workspace}` | Apaga a flag U do workspace. Exige confirmação no modal, que mostra a sessão de origem. |
 
 ### Servidor → cliente
 
@@ -90,6 +92,7 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 
 - Colunas laterais recolhíveis. Em telas estreitas, só o chat, com as laterais em gavetas.
 - Flags U e P aparecem como badges com tooltip listando os motivos (eventos `session.tainted`).
+- Workspace com flag U: badge "workspace contaminado" na barra, com a sessão e o evento de origem e a ação "Revisei, marcar como confiável" (`workspace.clear_flag`).
 - Paleta de comandos (Ctrl/Cmd+K): sessões, comandos de extensões, páginas.
 - Atalhos: Ctrl/Cmd+Enter envia; Esc no composer cancela o turno em andamento.
 
@@ -130,7 +133,7 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 
 Página `#/extensions`, parte da UI confiável.
 
-- **Instaladas**: id, nome, versão ativa, origem, aprovada por, liga/desliga, resumo de permissões (rede, segredos, escrita fora do workspace, hooks, escopos de kernel), badge "segredo exposto", estado (ativa, desativada, crash loop, tools alteradas). Ações: rollback, desativar, ver versões.
+- **Instaladas**: id, nome, versão ativa, origem, aprovada por, liga/desliga, resumo de permissões (rede, segredos, escrita fora do workspace, hooks, escopos de kernel), badge "segredo exposto", badge com a marca d'água U/P de extensões globais (Fase 1), estado (ativa, desativada, crash loop, tools alteradas). Ações: rollback, desativar, ver versões, limpar estado (Fase 1).
 - **Propostas**: um card por proposta com:
   - origem (IA com link para a sessão e badge "sessão contaminada", local, git, mcp);
   - estado e checagens (passou/falhou, com detalhes);
