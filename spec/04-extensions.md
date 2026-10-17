@@ -16,7 +16,7 @@ Uma extensão é um bundle (diretório) com um manifest `fictor.yaml` na raiz. E
 └── evals/               casos de eval (Fase 2)
 ```
 
-Restrições: sem symlinks, sem arquivos especiais, sem `..` em caminhos. Tamanho total máximo de 200 MiB (incluindo dependências vendorizadas).
+Restrições: sem symlinks, sem arquivos especiais, sem `..` em caminhos, nomes em UTF-8 válido e sem colisão entre caminhos que diferem só em maiúsculas/minúsculas ou normalização Unicode. Limites de entradas, bytes, profundidade e tempo em [06-lifecycle.md](06-lifecycle.md#limites).
 
 ## Manifest
 
@@ -201,6 +201,7 @@ Regras semânticas (etapa 2 do pipeline):
 - IPv6 é normalizado na forma da RFC 5952 antes de gravar no lock.
 - Zonas (`[fe80::1%eth0]:80`) não são aceitas.
 - IPv4 mapeado em IPv6 (`[::ffff:127.0.0.1]:80`) não é aceito; escreva a forma IPv4.
+- IPv6 dentro de `64:ff9b::/96` ou de um prefixo de `[egress] nat64_prefixes` não é aceito; escreva o IPv4 embutido ([02-core.md](02-core.md#nat64)).
 - `*:porta`, curingas no meio do nome e faixas de IP (CIDR) não são aceitos.
 - Destinos não públicos e `localhost` só casam por regra exata com porta ([02-core.md](02-core.md#connect-https)).
 

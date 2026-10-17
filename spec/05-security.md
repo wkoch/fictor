@@ -300,6 +300,7 @@ Senão, o resultado é `untrusted`. Valores fechados não carregam instruções;
 | Programas fora do Fictor (ex.: `git pull`) trazem conteúdo de terceiros para um workspace `trusted` sem acender flag | `workspace_trust` é escolha do usuário por sessão; o shell mostra o valor ao criar a sessão | — |
 | Marca d'água superestima a contaminação de extensões globais | "Limpar estado"; preferir `scope: session` para extensões com estado | 1 |
 | Linux: sockets Unix fora da lista de caminhos sensíveis, dentro de diretórios montados, ficam alcançáveis | Lista de caminhos sensíveis e descoberta; seccomp nega `socket(AF_UNIX)` | 3 |
+| Rede com prefixo NAT64 específico não configurado: o IPv4 embutido não é avaliado e pode alcançar um destino privado via gateway | `fictor doctor` detecta e sugere `[egress] nat64_prefixes`; o prefixo bem conhecido e o de uso local já são cobertos | — |
 | Segredo via env visível para a extensão | Allowlist de rede obrigatória; injeção no proxy | 3 |
 | `spawn: false` não aplicado para node/python no Linux | Documentado na aprovação; seccomp | 3 |
 | Seatbelt depreciado | Tier `vm` | 4 |

@@ -153,7 +153,7 @@ Tools executadas dentro do harness. Regra: elas só gravam no event log ou chama
 |---|---|---|---|
 | `load_skill` | 0 | `{name}` | Lê o `SKILL.md` (caminho de `catalog.list`) e devolve o corpo. |
 | `todo_write` | 0 | `{items: {text, status}[]}` | Substitui a lista de tarefas. O shell mostra a última. |
-| `propose_extension` | 1 | `{dir, note?}` | Lê o diretório (relativo ao workspace; ignora `.git`, `node_modules`, `vendor`, `.deno`), chama `ext.propose` e acompanha `ext.proposal_status` por até 120 s. Devolve o estado final ou "aguardando aprovação", com os motivos de falha das checagens para o modelo corrigir. |
+| `propose_extension` | 1 | `{dir, note?}` | Lê o diretório (relativo ao workspace; ignora os mesmos diretórios do recebimento, ver [06-lifecycle.md](06-lifecycle.md#1-recebimento)), chama `ext.propose` e acompanha `ext.proposal_status` por até 120 s. Devolve o estado final ou "aguardando aprovação", com os motivos de falha das checagens para o modelo corrigir. |
 | `delegate` | 2 | `{prompt, title?, model?}` | Chama `sessions.delegate` e devolve o texto final do subagente. |
 
 ### Compactação (Fase 1)

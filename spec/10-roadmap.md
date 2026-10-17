@@ -62,6 +62,8 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 18. Manifest com `permissions.env` contendo `PATH`, `NODE_OPTIONS` ou `LD_PRELOAD` é recusado na validação.
 19. Linux: com `SSH_AUTH_SOCK` apontando para um socket dentro de um diretório pedido em `fs.read`, o spawn é recusado.
 20. `secrets.backend = "keyring"` com o keyring indisponível: `fictor secrets set` falha sem criar `secrets.toml`, e o model proxy responde 503 `fictor_secret_unavailable`.
+21. NAT64: com `nat64_prefixes` contendo um prefixo /96 e um /64 (globais de teste, fora das faixas não públicas), um nome que resolve para um endereço desses prefixos com IPv4 embutido `192.168.1.1` é negado sem regra exata para `192.168.1.1:<porta>`. Um destino em `64:ff9b:1::/48` é negado sem regra exata. Um prefixo com bits de host impede o core de subir.
+22. `fictor ext install` de um diretório com 5 001 arquivos vazios falha com `limit:entries` sem ultrapassar o tempo limite. Um diretório com `node_modules/` na raiz instala, e `node_modules/` aparece na lista de ignorados. Um diretório com `A.txt` e `a.txt` falha.
 
 Fora da Fase 0: propostas da IA, surfaces, hooks, web, compactação, evals, terceiros.
 

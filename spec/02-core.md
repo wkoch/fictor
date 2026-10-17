@@ -163,12 +163,28 @@ Um único proxy HTTP no core.
 ### CONNECT (HTTPS)
 
 - O destino `host:porta` é comparado com `permissions.net.allow` da extensão, na sintaxe de [04-extensions.md](04-extensions.md#sintaxe-de-netallow). Sem porta no padrão, só 443.
-- Normalização antes da comparação: host em minúsculas e sem ponto final; IPv6 na forma canônica da RFC 5952; IPv4 mapeado (`::ffff:a.b.c.d`) e NAT64 (`64:ff9b::/96`) avaliados como o IPv4 embutido; destino com zona (`%iface`) é negado.
+- Normalização antes da comparação: host em minúsculas e sem ponto final; IPv6 na forma canônica da RFC 5952; IPv4 mapeado (`::ffff:a.b.c.d`) avaliado como o IPv4 embutido; endereços NAT64 tratados conforme [NAT64](#nat64); destino com zona (`%iface`) é negado.
 - `*` casa qualquer nome DNS na porta 443 cujos endereços resolvidos sejam todos públicos. Nunca casa IP literal, `localhost` nem destino não público.
 - Destinos não públicos (loopback, não especificado, RFC 1918, CGNAT `100.64.0.0/10`, link-local, ULA `fc00::/7`, multicast, faixas de documentação), IP literais e `localhost` só são aceitos por regra com host exato e porta explícita. Vale também para um nome DNS que resolva para endereço não público.
 - Negado: 403 e evento `net.denied` (agregado: um evento por par instância+domínio por minuto).
 - Permitido: túnel TCP. O proxy não faz MITM na Fase 0.
 - A resolução DNS é feita pelo core. No Linux o sandbox não tem DNS.
+
+### NAT64
+
+Um endereço NAT64 carrega um IPv4 que o gateway da rede vai acessar. Sempre que dá para identificar esse IPv4, o proxy avalia o IPv4, não o IPv6.
+
+| Prefixo | Tratamento |
+|---|---|
+| `64:ff9b::/96` (bem conhecido, RFC 6052) | IPv4 extraído dos últimos 32 bits e avaliado como destino. |
+| `64:ff9b:1::/48` (uso local, RFC 8215) | Destino não público como um todo: só por regra exata com porta. O IPv4 não é extraído, porque sua posição depende do prefixo que a rede escolheu. |
+| Prefixos específicos da rede em `[egress] nat64_prefixes` | IPv4 extraído conforme a RFC 6052, seção 2.2, para o comprimento declarado (32, 40, 48, 56, 64 ou 96; o octeto `u`, bits 64–71, é ignorado) e avaliado como destino. Com prefixos sobrepostos, vale o mais longo. |
+| Qualquer outro IPv6 | Classificado como IPv6. |
+
+- `nat64_prefixes` só vem do config. O core não descobre prefixos sozinho: a descoberta (RFC 7050 via DNS, RFC 8781 via router advertisement) usa dados da rede que um atacante local pode forjar.
+- Validação ao carregar o config: prefixo malformado, com bits de host diferentes de zero ou com comprimento fora da lista impede o core de subir.
+- `fictor doctor` consulta o AAAA de `ipv4only.arpa` (RFC 7050, timeout de 2 s). Se a resposta embutir `192.0.0.170` ou `192.0.0.171` num prefixo que não é o bem conhecido nem está configurado, mostra o prefixo e a linha de config sugerida. Nunca aplica sozinho.
+- Numa rede com prefixo específico não configurado, o IPv4 embutido não é avaliado. Risco residual em [05-security.md](05-security.md#riscos-residuais).
 
 ### HTTP simples
 
@@ -312,6 +328,9 @@ trusted_domains = []             # domínios cujo conteúdo não acende U
 
 [secrets]
 backend = "keyring"              # keyring | file
+
+[egress]
+nat64_prefixes = []              # prefixos NAT64 específicos da rede, ex.: "2001:db8:64::/96"
 
 [budget]
 max_model_requests_per_day = 2000

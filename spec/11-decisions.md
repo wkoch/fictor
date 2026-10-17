@@ -143,3 +143,24 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 - **Contexto.** Providers locais (Ollama, provider falso dos testes) usam HTTP. Liberar HTTP para outros hosts exporia chave e conteúdo em texto claro.
 - **Decisão.** `base_url` com `http://` só para `127.0.0.1` ou `[::1]`. `localhost`, rede privada e outros hosts com HTTP são erro de configuração, e o core não sobe. Sem downgrade de HTTPS e sem opção de ignorar certificado.
 - **Consequências.** Provider na rede local exige HTTPS ou túnel. O teste com provider falso continua possível.
+
+## ADR-023 — Prefixos NAT64 (resolve ARQ-012; complementa o ADR-021)
+
+- **Contexto.** O ADR-021 só tratava o prefixo bem conhecido `64:ff9b::/96`. Redes podem usar o prefixo de uso local `64:ff9b:1::/48` ou prefixos específicos com outros comprimentos. Nesses casos, o IPv4 embutido não pode ser identificado só pelo endereço.
+- **Decisão.**
+  - `64:ff9b::/96`: avaliar o IPv4 embutido (sem mudança).
+  - `64:ff9b:1::/48`: tratado como destino não público inteiro.
+  - Prefixos específicos: só por configuração explícita em `[egress] nat64_prefixes`, com extração conforme a RFC 6052. Nenhuma descoberta automática na aplicação da política; `fictor doctor` detecta via `ipv4only.arpa` e só sugere.
+  - Detalhes em [02-core.md](02-core.md#nat64).
+- **Consequências.** Cobertura determinística e testável. Numa rede com prefixo específico que o usuário não configurou, o IPv4 embutido não é avaliado; isso é risco residual documentado. Descoberta por DNS ou RA não decide política, porque esses dados podem ser forjados na rede local.
+
+## ADR-024 — Limites de recebimento e de bundle (resolve ARQ-013)
+
+- **Contexto.** Só a origem `ai` tinha teto de quantidade. Uma árvore local com muitos arquivos ou diretórios vazios podia esgotar memória ou tempo sem passar do teto em bytes.
+- **Decisão.**
+  - Limites constantes de entradas, bytes, tamanho por arquivo, profundidade, tamanho de caminho e tempo, para três momentos: recebimento da origem `ai`, recebimento das demais origens e bundle após dependências.
+  - O percurso é iterativo, conta enquanto avança e para no primeiro limite. A ordenação só ocorre depois.
+  - Diretórios de dependências e de VCS são ignorados sem serem percorridos. Diretórios vazios são descartados.
+  - Nomes inválidos e colisões por maiúsculas/minúsculas ou NFC são recusados.
+  - Tabela em [06-lifecycle.md](06-lifecycle.md#limites).
+- **Consequências.** Memória e tempo limitados em todas as origens. O hash e o store ficam iguais em Linux e macOS. Uma pasta local de desenvolvimento com `node_modules/` instala sem custo extra. A verificação de colisão por NFC exige normalização Unicode no core.

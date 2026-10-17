@@ -32,7 +32,11 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 
 ### 1. Recebimento
 
-- Criar `quarantine/<proposal_id>/` e gravar os arquivos. Rejeitar symlinks, caminhos absolutos, `..`, arquivos especiais e limites excedidos (IA: 500 arquivos e 5 MiB antes das dependências; total do bundle: 200 MiB).
+- Percorrer a origem de forma iterativa e copiar para `quarantine/<proposal_id>/`.
+- **Ignorados**: não são percorridos, não contam nos limites e aparecem na lista de ignorados da proposta. São eles `.git/` em qualquer nível, `__pycache__/` em qualquer nível e, na raiz do bundle, `node_modules/`, `vendor/`, `.deno/`, `.pydeps/` e `.venv/`. Dependências sempre vêm da etapa 3.
+- **Recusados** (proposta `failed`): symlinks; arquivos especiais; caminhos absolutos ou com `..`; nomes que não sejam UTF-8 válido ou que contenham caracteres de controle ou `\`; dois caminhos que colidem depois de normalização NFC e conversão para minúsculas. Este último garante o mesmo store em Linux e macOS.
+- Diretórios vazios não entram no bundle.
+- O percurso conta entradas e bytes enquanto avança e para no primeiro limite excedido ([Limites](#limites)). A ordenação para o hash só acontece depois, com o percurso já dentro dos limites; assim, memória e tempo ficam limitados pelos tetos.
 - Origens remotas (Fase 3): o core resolve a referência para um SHA de commit (`git ls-remote`) ou versão exata de pacote e baixa nessa versão. O download roda num sandbox com rede só para o host de origem.
 - Registrar a proposta (`proposals`), com `tainted = 1` se veio de sessão com U.
 
@@ -58,7 +62,21 @@ Roda num sandbox com escrita na quarentena e rede só para os registros em `[ins
 | `node` | `npm ci --ignore-scripts` | `package-lock.json` obrigatório |
 | `python` | `uv pip install --target .pydeps -r requirements.lock` | lockfile com hashes (`uv export --format requirements-txt`) |
 
-Scripts de instalação de pacotes nunca rodam. Ao final, gerar a lista de pacotes resolvidos `(ecossistema, nome, versão)`.
+Scripts de instalação de pacotes nunca rodam. Ao final, percorrer de novo o bundle com os limites de "bundle após dependências" e gerar a lista de pacotes resolvidos `(ecossistema, nome, versão)`.
+
+### Limites
+
+Constantes do core, não configuráveis. Mudar exige ADR.
+
+| Momento | Entradas (arquivos + diretórios) | Bytes totais | Por arquivo | Profundidade | Caminho | Tempo |
+|---|---|---|---|---|---|---|
+| Recebimento, origem `ai` | 500 | 5 MiB | 5 MiB | 16 | 512 bytes | 30 s |
+| Recebimento, demais origens | 5 000 | 50 MiB | 50 MiB | 32 | 1 024 bytes | 60 s |
+| Bundle após dependências | 50 000 | 200 MiB | 100 MiB | 64 | 1 024 bytes | 600 s para resolver e percorrer |
+
+- Profundidade = número de componentes do caminho relativo. Caminho = tamanho em bytes UTF-8 do caminho relativo.
+- Excedido: proposta `failed` com motivo `limit:entries`, `limit:bytes`, `limit:file_size`, `limit:depth`, `limit:path_length` ou `limit:time`.
+- Valem também para `ext.propose` (origem `ai`), antes de gravar qualquer arquivo.
 
 ### 4. Hash
 

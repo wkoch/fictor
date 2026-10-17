@@ -269,7 +269,7 @@ Exatamente um de `cron` ou `at_ms`.
 ### Propostas (Fase 1)
 
 ```ts
-// ext.propose — escopo ext.propose. Máx. 500 arquivos e 5 MiB no total.
+// ext.propose — escopo ext.propose. Limites da origem ai: 06-lifecycle.md#limites.
 params: {
   session_id?: string;
   ext_id: string;
