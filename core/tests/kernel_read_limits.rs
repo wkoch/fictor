@@ -371,19 +371,16 @@ fn config_sources_refuse_special_files_without_stalling_kernel_shutdown() {
 }
 
 #[tokio::test]
-async fn config_regular_file_symlinks_reload_only_the_authenticated_table() {
+async fn config_regular_controls_reload_only_the_authenticated_table_and_refuse_links() {
     let fixture = Fixture::new().await;
-    let instructions = fixture._root.path().join("user-instructions.md");
-    let config = fixture._root.path().join("user-config.toml");
+    let instructions = fixture.home.join("AGENTS.md");
+    let config = fixture.home.join("config.toml");
     std::fs::write(&instructions, "Instruções do usuário: ação.\n").unwrap();
     std::fs::write(
         &config,
         "[ext.client]\nvalue = 'first'\n[ext.other]\nsecret = 'private-marker'\n",
     )
     .unwrap();
-    std::os::unix::fs::symlink(&instructions, fixture.home.join("AGENTS.md")).unwrap();
-    std::fs::remove_file(fixture.home.join("config.toml")).unwrap();
-    std::os::unix::fs::symlink(&config, fixture.home.join("config.toml")).unwrap();
     let (mut server, mut client) = fixture.client(&["config"]).await;
     assert_eq!(
         call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
@@ -414,6 +411,96 @@ async fn config_regular_file_symlinks_reload_only_the_authenticated_table() {
     assert_eq!(
         call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
         json!({"instructions":null})
+    );
+    for (section, path, name) in [
+        ("instructions", &instructions, "AGENTS.md"),
+        ("ext", &config, "config.toml"),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let target = fixture._root.path().join(format!("external-{name}"));
+        std::fs::write(&target, "extension-writable-private-marker").unwrap();
+        for destination in [target.as_path(), std::path::Path::new("missing")] {
+            std::os::unix::fs::symlink(destination, path).unwrap();
+            let response = call(&mut client, "config.get", json!({"section":section})).await;
+            assert_eq!(
+                response["error"],
+                json!({"code":-32603,"message":"INTERNAL_ERROR","data":{"reason":"control_file:unsafe","file":name}})
+            );
+            assert!(response.get("result").is_none());
+            assert!(!response.to_string().contains("private-marker"));
+            assert!(!response.to_string().contains(target.to_str().unwrap()));
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::hard_link(&target, path).unwrap();
+        assert_eq!(
+            call(&mut client, "config.get", json!({"section":section})).await["error"]["data"]["reason"],
+            "control_file:unsafe"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"ext"})).await["error"]["data"],
+        json!({"reason":"control_file:unreadable","file":"config.toml"})
+    );
+    for (section, name) in [("instructions", "AGENTS.md"), ("ext", "config.toml")] {
+        std::fs::write(fixture.home.join(name), [0xff]).unwrap();
+        assert_eq!(
+            call(&mut client, "config.get", json!({"section":section})).await["error"]["data"],
+            json!({"reason":"control_file:invalid","file":name})
+        );
+    }
+    std::fs::write(&config, "[not valid TOML").unwrap();
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"ext"})).await["error"]["data"]["reason"],
+        "control_file:invalid"
+    );
+    // Providers remain the boot snapshot even after control files become invalid.
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"providers"})).await["result"],
+        json!({"providers":[]})
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_reloads_keep_the_initial_home_identity_after_alias_retargeting() {
+    let mut fixture = Fixture::new().await;
+    let initial = fixture.home.clone();
+    let alias = fixture._root.path().join("alias");
+    std::os::unix::fs::symlink(&initial, &alias).unwrap();
+    fixture.home = alias.clone();
+    let (mut server, mut client) = fixture.client(&["config"]).await;
+    let other = fixture._root.path().join("other");
+    fictor::home::prepare(&other).unwrap();
+    fictor::config::Config::create_if_missing(&other).unwrap();
+    std::fs::write(other.join("AGENTS.md"), "other home instructions").unwrap();
+    std::fs::write(other.join("config.toml"), "[ext.client]\nvalue='other'\n").unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other, &alias).unwrap();
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
+        json!({"instructions":null})
+    );
+    std::fs::write(initial.join("AGENTS.md"), "initial home instructions").unwrap();
+    std::fs::write(
+        initial.join("config.toml"),
+        "[ext.client]\nvalue='initial'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
+        json!({"instructions":"initial home instructions"})
+    );
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"ext"})).await["result"],
+        json!({"ext":{"value":"initial"}})
+    );
+    std::fs::write(initial.join("AGENTS.md"), "").unwrap();
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
+        json!({"instructions":""})
     );
     server.shutdown().await.unwrap();
 }

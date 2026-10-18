@@ -52,6 +52,7 @@ impl KernelServer {
             store.session(session.clone()).await?;
         }
         let home = home.canonicalize()?;
+        let controls = Arc::new(crate::control_files::ControlFiles::open(&home)?);
         let run = home.join("run");
         let parent = run.join("k");
         // Check every core-owned component; an existing symlink is never adopted.
@@ -76,6 +77,7 @@ impl KernelServer {
             token,
             revoked: AtomicBool::new(false),
             home,
+            controls,
             store,
             provider_ids,
             log,
@@ -346,10 +348,7 @@ async fn read_line(reader: &mut BufReader<UnixStream>) -> Result<Option<Vec<u8>>
             return if result.is_empty() {
                 Ok(None)
             } else {
-                Err(RpcError {
-                    code: -32600,
-                    message: "INVALID_REQUEST",
-                })
+                Err(RpcError::new(-32600, "INVALID_REQUEST"))
             };
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
@@ -420,14 +419,10 @@ fn encode(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
     Ok(out.0)
 }
 fn parse(bytes: &[u8]) -> Result<Request, RpcError> {
-    let StrictValue(value) = serde_json::from_slice(bytes).map_err(|_| RpcError {
-        code: -32700,
-        message: "PARSE_ERROR",
-    })?;
-    let request: Request = serde_json::from_value(value).map_err(|_| RpcError {
-        code: -32600,
-        message: "INVALID_REQUEST",
-    })?;
+    let StrictValue(value) =
+        serde_json::from_slice(bytes).map_err(|_| RpcError::new(-32700, "PARSE_ERROR"))?;
+    let request: Request =
+        serde_json::from_value(value).map_err(|_| RpcError::new(-32600, "INVALID_REQUEST"))?;
     if request.jsonrpc != "2.0"
         || request.method.is_empty()
         || !request.params.is_object()
@@ -436,10 +431,7 @@ fn parse(bytes: &[u8]) -> Result<Request, RpcError> {
             .as_ref()
             .is_some_and(|id| !matches!(id, Value::Null | Value::String(_) | Value::Number(_)))
     {
-        return Err(RpcError {
-            code: -32600,
-            message: "INVALID_REQUEST",
-        });
+        return Err(RpcError::new(-32600, "INVALID_REQUEST"));
     }
     Ok(request)
 }

@@ -178,6 +178,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
 
     fn fixture(home: &Path, classes: Value, tools: Vec<Value>) -> Lock {
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
         crate::home::prepare(home).unwrap();
         let hash = format!("sha256:{}", "a".repeat(64));
         let key = format!("1.0.0-{}", "a".repeat(12));

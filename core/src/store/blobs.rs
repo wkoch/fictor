@@ -322,7 +322,9 @@ mod capture_tests {
 
     #[tokio::test]
     async fn reopening_store_preserves_live_captures_and_releases_the_cleanup_lease() {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
         crate::home::prepare(home.path()).unwrap();
         let first = super::super::Store::open(home.path()).await.unwrap();
         let blobs = BlobStore::new(home.path().join("blobs"));

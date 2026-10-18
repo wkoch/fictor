@@ -690,7 +690,9 @@ mod nat64_tests {
     use super::*;
     #[tokio::test]
     async fn configured_bind_applies_nat64_policy_when_registering_instances() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::initialize(root.path()).await.unwrap();
         let store = Arc::new(Store::open(root.path()).await.unwrap());
         let prefixes = Nat64Prefixes::new(&["2001:4860:64::/96".into()]).unwrap();

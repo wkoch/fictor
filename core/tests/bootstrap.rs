@@ -339,7 +339,7 @@ fn cli_init_and_unsupported_install_are_honest() {
 fn doctor_reports_development_runtime_status_without_modifying_config() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("data");
-    fs::create_dir(&home).unwrap();
+    home::prepare(&home).unwrap();
     Config::create_if_missing(&home).unwrap();
     let original = fs::read(home.join("config.toml")).unwrap();
     let report = fictor::doctor::inspect_local(&home);
@@ -414,6 +414,10 @@ async fn init_refuses_symlinked_private_directories() {
     let home = root.path().join("data");
     let elsewhere = root.path().join("elsewhere");
     fs::create_dir(&home).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::create_dir(&elsewhere).unwrap();
     symlink(&elsewhere, home.join("extensions")).unwrap();
     assert!(fictor::initialize(&home).await.is_err());
@@ -424,6 +428,10 @@ async fn init_refuses_symlinked_private_directories() {
 #[test]
 fn extension_config_reload_is_bound_to_the_authenticated_extension_table() {
     let dir = tempfile::tempdir().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,

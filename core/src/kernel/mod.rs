@@ -89,6 +89,8 @@ fn valid_ulid(id: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
+    #[error(transparent)]
+    Control(#[from] crate::control_files::ControlError),
     #[error("invalid kernel instance identity or path")]
     Invalid,
     #[error("kernel socket unavailable")]
@@ -107,6 +109,7 @@ struct State {
     token: String, // Deliberately no Debug/Serialize implementation on State or KernelServer.
     revoked: AtomicBool,
     home: PathBuf,
+    controls: Arc<crate::control_files::ControlFiles>,
     store: Arc<Store>,
     provider_ids: Vec<String>,
     log: Option<Arc<dyn LogSink>>,
@@ -116,38 +119,42 @@ struct State {
 struct RpcError {
     code: i32,
     message: &'static str,
+    control: Option<crate::control_files::ControlError>,
 }
 impl RpcError {
-    const INVALID: Self = Self {
-        code: -32602,
-        message: "INVALID_PARAMS",
-    };
-    const AUTH: Self = Self {
-        code: -32001,
-        message: "UNAUTHENTICATED",
-    };
-    const SCOPE: Self = Self {
-        code: -32002,
-        message: "SCOPE_DENIED",
-    };
-    const NOT_FOUND: Self = Self {
-        code: -32006,
-        message: "NOT_FOUND",
-    };
-    const TOO_LARGE: Self = Self {
-        code: -32010,
-        message: "TOO_LARGE",
-    };
-    const METHOD: Self = Self {
-        code: -32601,
-        message: "METHOD_NOT_FOUND",
-    };
-    const INTERNAL: Self = Self {
-        code: -32603,
-        message: "INTERNAL_ERROR",
-    };
+    const INVALID: Self = Self::new(-32602, "INVALID_PARAMS");
+    const AUTH: Self = Self::new(-32001, "UNAUTHENTICATED");
+    const SCOPE: Self = Self::new(-32002, "SCOPE_DENIED");
+    const NOT_FOUND: Self = Self::new(-32006, "NOT_FOUND");
+    const TOO_LARGE: Self = Self::new(-32010, "TOO_LARGE");
+    const METHOD: Self = Self::new(-32601, "METHOD_NOT_FOUND");
+    const INTERNAL: Self = Self::new(-32603, "INTERNAL_ERROR");
+    const fn new(code: i32, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            control: None,
+        }
+    }
     fn value(self) -> Value {
-        json!({"code":self.code,"message":self.message})
+        let mut value = json!({"code":self.code,"message":self.message});
+        if let Some(control) = self.control {
+            // ADR-042 requires a logical filename alongside its normative
+            // reason. Never include a filesystem path, target or raw content.
+            value["data"] = json!({"reason":control.reason(),"file":control.name()});
+        }
+        value
+    }
+}
+impl From<crate::control_files::ControlError> for RpcError {
+    fn from(error: crate::control_files::ControlError) -> Self {
+        if error.failure() == crate::control_files::Failure::TooLarge {
+            return Self::TOO_LARGE;
+        }
+        Self {
+            control: Some(error),
+            ..Self::INTERNAL
+        }
     }
 }
 impl From<StoreError> for RpcError {
@@ -158,10 +165,7 @@ impl From<StoreError> for RpcError {
             StoreError::Blob(BlobError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 Self::NOT_FOUND
             }
-            StoreError::HeadMoved => Self {
-                code: -32005,
-                message: "HEAD_MOVED",
-            },
+            StoreError::HeadMoved => Self::new(-32005, "HEAD_MOVED"),
             StoreError::Invalid(_) | StoreError::Blob(BlobError::InvalidHash) => Self::INVALID,
             StoreError::TooLarge | StoreError::Blob(BlobError::TooLarge) => Self::TOO_LARGE,
             _ => Self::INTERNAL,

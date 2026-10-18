@@ -2,6 +2,7 @@
 compile_error!("Fictor supports only Linux x86-64 (Fedora COSMIC Atomic); see ADR-030.");
 
 pub mod config;
+pub mod control_files;
 pub mod doctor;
 pub mod gateway;
 pub mod home;

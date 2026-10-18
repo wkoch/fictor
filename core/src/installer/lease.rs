@@ -96,10 +96,12 @@ fn private_directory(file: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn lease_is_exclusive_until_its_last_owner_is_dropped() {
         let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::home::prepare(home.path()).unwrap();
         let lease = std::sync::Arc::new(InstallerLease::acquire(home.path()).unwrap());
         let worker = lease.clone();
@@ -114,6 +116,7 @@ mod tests {
     #[test]
     fn receipt_rename_never_overwrites_an_existing_destination() {
         let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::home::prepare(home.path()).unwrap();
         let lease = InstallerLease::acquire(home.path()).unwrap();
         let id = ulid::Ulid::generate().to_string();

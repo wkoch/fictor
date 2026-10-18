@@ -1,4 +1,4 @@
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::{env, fs, io, path::Path, path::PathBuf};
 
 pub fn resolve() -> io::Result<PathBuf> {
@@ -36,15 +36,29 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
     builder.mode(0o700);
     builder.create(path)?;
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other("diretório de dados não pode ser symlink"));
+    // Existing core directories are validated, never repaired as a side effect
+    // of init/diagnosis or a runtime read (ADR-038/ADR-042).
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        // SAFETY: geteuid has no arguments or memory-safety preconditions.
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::other("diretório de dados inseguro"));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 pub fn prepare(home: &Path) -> io::Result<()> {
-    private_dir(home)?;
+    match fs::symlink_metadata(home) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => private_dir(home)?,
+        Err(error) => return Err(error),
+    }
+    // Resolve only the initial home alias. Descendants remain direct private
+    // directories; neither a dangling alias nor an unsafe home is repaired.
+    let controls = crate::control_files::ControlFiles::open(home).map_err(io::Error::other)?;
+    let home = controls.home();
     for relative in [
         "blobs",
         "extensions",

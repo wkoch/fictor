@@ -165,10 +165,7 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
             if suffix.is_none_or(|s| {
                 s.is_empty() || s.split('.').any(str::is_empty) || s.chars().any(char::is_control)
             }) {
-                return Err(RpcError {
-                    code: -32009,
-                    message: "INVALID_KIND",
-                });
+                return Err(RpcError::new(-32009, "INVALID_KIND"));
             }
             let actor = format!("ext:{}", state.identity.ext_id);
             let event = state
@@ -360,22 +357,28 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
             let p: Section = params(value)?;
             match p.section.as_str() {
                 "ext" => {
-                    let home = state.home.clone();
+                    let controls = state.controls.clone();
                     let ext = state.identity.ext_id.clone();
-                    let table = tokio::task::spawn_blocking(move || Config::extension(&home, &ext))
-                        .await
-                        .map_err(|_| RpcError::INTERNAL)?
-                        .map_err(|_| RpcError::INTERNAL)?;
+                    let table = tokio::task::spawn_blocking(move || {
+                        Config::extension_from(&controls, &ext)
+                    })
+                    .await
+                    .map_err(|_| RpcError::INTERNAL)?
+                    .map_err(|error| match error {
+                        crate::config::ConfigError::Control(error) => RpcError::from(error),
+                        _ => RpcError::INTERNAL,
+                    })?;
                     Ok(json!({"ext":table}))
                 }
                 "providers" => Ok(
                     json!({"providers":state.provider_ids.iter().map(|id|json!({"id":id,"url":format!("http://models.fictor.internal/p/{id}")})).collect::<Vec<_>>()}),
                 ),
                 "instructions" => {
-                    let path = state.home.join("AGENTS.md");
-                    let text = tokio::task::spawn_blocking(move || read_instructions(&path))
+                    let controls = state.controls.clone();
+                    let text = tokio::task::spawn_blocking(move || controls.instructions())
                         .await
-                        .map_err(|_| RpcError::INTERNAL)??;
+                        .map_err(|_| RpcError::INTERNAL)?
+                        .map_err(RpcError::from)?;
                     Ok(json!({"instructions":text}))
                 }
                 _ => Err(RpcError::INVALID),
@@ -385,27 +388,6 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
         // exist. Scope checks above happen before this response.
         _ => Err(RpcError::METHOD),
     }
-}
-fn read_instructions(path: &std::path::Path) -> Result<Option<String>, RpcError> {
-    use std::io::Read;
-    let file = match crate::config::open_regular_config_file(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(RpcError::INTERNAL),
-    };
-    if file.metadata().map_err(|_| RpcError::INTERNAL)?.len() > MAX_MESSAGE_BYTES as u64 {
-        return Err(RpcError::TOO_LARGE);
-    }
-    // Even if the file grows after metadata, never load an unbounded local file
-    // on behalf of an extension. The transport also limits escaped JSON bytes.
-    let mut text = String::new();
-    file.take(MAX_MESSAGE_BYTES as u64 + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| RpcError::INTERNAL)?;
-    if text.len() > MAX_MESSAGE_BYTES {
-        return Err(RpcError::TOO_LARGE);
-    }
-    Ok(Some(text))
 }
 
 fn serialize(value: impl serde::Serialize) -> Result<Value, RpcError> {

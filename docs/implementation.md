@@ -451,7 +451,7 @@ definidos. Critérios 47–50 aguardam implementação e testes do produto.
 ARQ-026 resolvida pelo ADR-042: origem protegida dos arquivos de controle,
 validação por descritor e recusa de aliases que exponham a árvore privada.
 Erros de `config.get`, ausência e tratamento do legado estão definidos; critérios
-51–56 aguardam implementação e testes. Nenhum reparo de dados do usuário é automático.
+51–56 têm implementação parcial abaixo. Nenhum reparo de dados do usuário é automático.
 
 ## Base durável dos ADRs 036/039
 
@@ -493,3 +493,27 @@ destinos com portas distintas. Esse detalhe interno cumpre o diagnóstico exigid
 pelo ADR sem registrar URL, query, userinfo ou cabeçalhos. Dependencies (19),
 local checker (14) e proxy (10) passaram no Toolbx Fedora 44 sobre Bazzite;
 logs locais `adr040-dependencies-local-final.log` e `m05-contracts-store-tests.log`.
+
+## Origem dos controles — base do ADR-042
+
+Boot e releituras de `config.toml`/`AGENTS.md` usam `ControlFiles`: home canônico
+ancorado em descritor próprio, UID efetivo e modo 0700. `openat2` exige resolução
+beneath, sem symlinks nem travessia de mounts; ausência dessas garantias recusa
+a operação. O core inspeciona um FD `O_PATH` antes de abrir o inode regular para
+I/O, exige um único link e modos admitidos e compara seus metadados antes/depois
+da leitura limitada. Nenhum descritor de controle é herdado pelo workload.
+
+Alias inicial do home é permitido; retargeting não muda o descritor já retido
+pelo Kernel. Ausência real de AGENTS é `null`; UTF-8/TOML inválido, links,
+origem insegura e mudança observada não fornecem conteúdo nem defaults. Providers
+conserva o snapshot do boot e strings de `[ext]` continuam opacas.
+
+Os erros do protocolo preservam códigos/mensagens e acrescentam somente
+`data.reason` e `data.file`, com nome lógico fixo. Excesso mantém `TOO_LARGE`.
+`init` publica configuração nova 0600 por fsync/rename sem sobrescrita; diretórios
+e controles existentes são validados, sem chmod/chown ou reparo automático.
+
+Passaram 31 testes dirigidos no Toolbx Fedora 44 sobre Bazzite: primitiva (7),
+integração de controles (4), limites/releituras do Kernel (7) e bootstrap (13).
+A recusa de grants que exponham a árvore por aliases de montagem ainda está
+em implementação; esta base não declara encerrados todos os critérios 51–56.

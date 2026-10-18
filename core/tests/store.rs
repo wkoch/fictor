@@ -6,6 +6,7 @@ use fictor::{
     },
 };
 use serde_json::json;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::{TempDir, tempdir};
 
 async fn fixture() -> (TempDir, Store, String) {
@@ -476,6 +477,7 @@ async fn unsafe_workspaces_are_rejected_and_canonical_paths_are_saved() {
 #[tokio::test]
 async fn corrupted_blob_reference_cannot_enter_the_event_log() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     fictor::initialize(dir.path()).await.unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let hash = store.put_blob(b"audited response".to_vec()).await.unwrap();

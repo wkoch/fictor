@@ -3,10 +3,11 @@ use fictor::store::{
     ProposalUpdate, ResolvedPackage, Store,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 async fn store() -> (tempfile::TempDir, Arc<Store>) {
     let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     fictor::initialize(temp.path()).await.unwrap();
     let store = Arc::new(Store::open(temp.path()).await.unwrap());
     (temp, store)
@@ -576,6 +577,7 @@ async fn audit_failure_rolls_back_both_receive_and_transition() {
 #[tokio::test]
 async fn proposals_survive_reopen_with_nonce_and_checked_results() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     fictor::initialize(root.path()).await.unwrap();
     let store = Store::open(root.path()).await.unwrap();
     let id = ready(&store).await;

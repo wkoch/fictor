@@ -660,7 +660,9 @@ mod tests {
         );
     }
     async fn audit() -> (tempfile::TempDir, AuditIdentity) {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::initialize(dir.path()).await.unwrap();
         let store = Arc::new(Store::open(dir.path()).await.unwrap());
         (

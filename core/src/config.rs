@@ -1,36 +1,12 @@
+use crate::control_files::{ControlError, ControlFiles};
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
 };
 
 pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
-
-/// Kernel-triggered reloads accept user-managed regular-file symlinks, but must
-/// never open a pipe/device or leave a non-cancellable blocking worker behind.
-pub(crate) fn open_regular_config_file(path: &Path) -> io::Result<fs::File> {
-    if !fs::metadata(path)?.is_file() {
-        return Err(io::Error::other(
-            "configuration source must be a regular file",
-        ));
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        // O_NONBLOCK prevents a raced-in FIFO from blocking before the FD type
-        // check. No O_NOFOLLOW: regular-file symlinks remain supported.
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other(
-            "configuration source must be a regular file",
-        ));
-    }
-    Ok(file)
-}
 
 // Extension configuration stays opaque; provider bodies and model formats never enter the core.
 #[derive(Deserialize, Serialize)]
@@ -143,6 +119,8 @@ pub struct Installer {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Control(#[from] ControlError),
     #[error("não foi possível acessar a configuração: {0}")]
     Io(#[from] std::io::Error),
     // Parser errors may contain the original line, including credentials.
@@ -192,36 +170,40 @@ impl Config {
     }
 
     pub fn load(home: &Path) -> Result<Self, ConfigError> {
-        Self::parse(&fs::read_to_string(home.join("config.toml"))?)
+        let controls = ControlFiles::open(home)?;
+        Self::load_controls(&controls)
+    }
+
+    fn load_controls(controls: &ControlFiles) -> Result<Self, ConfigError> {
+        let text = controls.validate_boot()?;
+        Self::parse(&text).map_err(|_| ControlError::invalid_config().into())
     }
 
     /// The kernel supplies the authenticated extension id, never a caller-selected
     /// table name. Only this opaque section is reloaded; core settings await restart.
     pub fn extension(home: &Path, ext_id: &str) -> Result<toml::Table, ConfigError> {
+        Self::extension_from(&ControlFiles::open(home)?, ext_id)
+    }
+
+    pub fn extension_from(
+        controls: &ControlFiles,
+        ext_id: &str,
+    ) -> Result<toml::Table, ConfigError> {
         #[derive(Deserialize)]
         struct Reload {
             #[serde(default)]
             ext: BTreeMap<String, toml::Table>,
         }
-        let mut text = String::new();
-        open_regular_config_file(&home.join("config.toml"))?.read_to_string(&mut text)?;
-        let mut config: Reload = toml::from_str(&text).map_err(|_| ConfigError::Parse)?;
+        let text = controls.config()?;
+        let mut config: Reload =
+            toml::from_str(&text).map_err(|_| ControlError::invalid_config())?;
         Ok(config.ext.remove(ext_id).unwrap_or_default())
     }
 
     pub fn create_if_missing(home: &Path) -> Result<Self, ConfigError> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        options.mode(0o600);
-        match options.open(home.join("config.toml")) {
-            Ok(mut file) => {
-                file.write_all(DEFAULT_CONFIG.as_bytes())?;
-                file.sync_all()?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        Self::load(home)
+        let controls = ControlFiles::open(home)?;
+        controls.create_config_if_missing(DEFAULT_CONFIG.as_bytes())?;
+        Self::load_controls(&controls)
     }
 }
 

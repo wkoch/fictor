@@ -10,7 +10,7 @@ use fictor::{
 use serde_json::json;
 use std::{
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -25,6 +25,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Store>) {
         .prefix("fx-recovery-")
         .tempdir_in("/tmp")
         .unwrap();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fictor::home::prepare(home.path()).unwrap();
     let store = Arc::new(Store::open(home.path()).await.unwrap());
     (home, store)
@@ -444,6 +445,7 @@ async fn cancelling_recovery_keeps_the_lease_until_its_detached_worker_finishes(
 #[test]
 fn cleanup_helper_refuses_unrecognized_ids() {
     let home = tempfile::tempdir().unwrap();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fictor::home::prepare(home.path()).unwrap();
     for id in ["../store", "/outside", "", ".", "01J-not-valid"] {
         assert!(recovery::remove_receipt(home.path(), id, true).is_err());

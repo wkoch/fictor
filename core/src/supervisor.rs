@@ -1724,6 +1724,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_deadline_returns_without_claiming_cleanup_completed() {
         let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
         crate::home::prepare(home.path()).unwrap();
         let store = Arc::new(Store::open(home.path()).await.unwrap());
         let (stop, stopped) = watch::channel(false);
