@@ -1,6 +1,7 @@
 //! MCP stdio client, rmcp 3.5.1 (protocol 2026-07-28 compatibility).
 //! https://docs.rs/rmcp/3.5.1/rmcp/
 //! Tools are pinned using RFC 8785; annotations never authorize execution.
+pub mod registry;
 mod transport;
 use crate::store::{AppendEvent, Provenance, Store};
 use rmcp::{

@@ -308,6 +308,24 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
             }
             Ok(json!({"base64":STANDARD.encode(&bytes),"size":bytes.len()}))
         }
+        "tools.list" => {
+            let p: SessionId = params(value)?;
+            session_id(&p.session_id)?;
+            if state.identity.session_id.as_deref() != Some(&p.session_id) {
+                return Err(RpcError::SCOPE);
+            }
+            state.store.session(p.session_id).await?;
+            let home = state.home.clone();
+            let tools =
+                tokio::task::spawn_blocking(move || crate::gateway::registry::model_tools(&home))
+                    .await
+                    .map_err(|_| RpcError::INTERNAL)?
+                    .map_err(|error| match error {
+                        crate::gateway::registry::RegistryError::TooLarge => RpcError::TOO_LARGE,
+                        _ => RpcError::INTERNAL,
+                    })?;
+            Ok(json!({"tools":tools}))
+        }
         "config.get" => {
             let p: Section = params(value)?;
             match p.section.as_str() {

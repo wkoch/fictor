@@ -18,7 +18,7 @@ use unsafe_libyaml as unsafe_yaml;
 const SCHEMA: &str = include_str!("../../../spec/schemas/extension.schema.json");
 // The local-receipt per-file ceiling is already fixed by ADR-024. Valid manifest
 // structure is shallow; bound invalid YAML before allocating a recursive Value.
-const MAX_MANIFEST_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 50 * 1024 * 1024;
 const MAX_PARSE_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
