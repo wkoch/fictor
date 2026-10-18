@@ -166,6 +166,63 @@ struct Fixture {
     resolver: DependencyResolver,
     lease: Arc<InstallerLease>,
 }
+
+struct CliFixture {
+    _root: tempfile::TempDir,
+    home: PathBuf,
+    real_home: PathBuf,
+    source: PathBuf,
+}
+impl CliFixture {
+    async fn new(registries: Vec<String>, runtime: &str) -> Self {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let home = root.path().join("core");
+        fictor::initialize(&home).await.unwrap();
+        let config_path = home.join("config.toml");
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["installer"]["registries"] =
+            toml::Value::Array(registries.into_iter().map(toml::Value::String).collect());
+        config["secrets"]["backend"] = toml::Value::String("file".into());
+        fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+        let real_home = root.path().join("user");
+        fs::create_dir(&real_home).unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let entry = if runtime == "node" {
+            "main.mjs"
+        } else {
+            "main.py"
+        };
+        fs::write(source.join("fictor.yaml"), format!("schema: 1\nid: fixture\nversion: 0.1.0\ndescription: Installer regression\nscope: session\nmcp: false\nkernel: [kv]\nruntime:\n  kind: {runtime}\n  entry: {entry}\n")).unwrap();
+        fs::write(
+            source.join(entry),
+            if runtime == "node" {
+                "process.exit(0);\n"
+            } else {
+                "pass\n"
+            },
+        )
+        .unwrap();
+        Self {
+            _root: root,
+            home,
+            real_home,
+            source,
+        }
+    }
+
+    async fn check(&self) -> std::process::Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_fictor"))
+            .args(["ext", "check"])
+            .arg(&self.source)
+            .env("FICTOR_HOME", &self.home)
+            .env("HOME", &self.real_home)
+            .output()
+            .await
+            .unwrap()
+    }
+}
 impl Fixture {
     async fn new(registries: Vec<String>) -> Self {
         let root = tempfile::Builder::new()
@@ -318,6 +375,99 @@ async fn npm_refuses_a_tampered_hash_and_a_registry_outside_the_allowlist() {
             .iter()
             .any(|path| path == "/denied.tgz")
     );
+}
+
+#[tokio::test]
+async fn cli_refuses_npm_packages_missing_from_the_installed_lock() {
+    if !requires_toolbx() {
+        return;
+    }
+    for with_metadata in [true, false] {
+        let mut files = BTreeMap::from([
+            (
+                "package/package.json",
+                json!({"name":"fixture-pkg","version":"1.0.0"}).to_string(),
+            ),
+            ("package/index.js", "module.exports = 1;\n".into()),
+            (
+                "package/node_modules/extra-pkg/index.js",
+                "module.exports = 2;\n".into(),
+            ),
+        ]);
+        if with_metadata {
+            files.insert(
+                "package/node_modules/extra-pkg/package.json",
+                json!({"name":"extra-pkg","version":"9.9.9"}).to_string(),
+            );
+        }
+        let artifact = archive("tar", files);
+        let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&artifact)));
+        let registry = Registry::new("/fixture.tgz", artifact).await;
+        let fixture = CliFixture::new(vec![registry.address.to_string()], "node").await;
+        npm_candidate(&fixture.source, &registry.url("/fixture.tgz"), &integrity);
+        let output = fixture.check().await;
+        assert!(!output.status.success(), "unlisted package was accepted");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("invalid package metadata"), "{stderr}");
+        let id = stderr
+            .split_whitespace()
+            .find(|value| value.parse::<ulid::Ulid>().is_ok())
+            .unwrap();
+        let store = Store::open(&fixture.home).await.unwrap();
+        let proposal = store.proposal(id.into()).await.unwrap();
+        assert_eq!(proposal.state, ProposalState::Failed);
+        assert!(proposal.packages.is_none());
+        let checks = proposal.checks.unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "dependencies" && !check.passed)
+        );
+        assert!(!checks.iter().any(|check| check.name == "smoke"));
+    }
+}
+
+#[tokio::test]
+async fn npm_inventories_bundled_scoped_packages_without_treating_fixture_metadata_as_packages() {
+    if !requires_toolbx() {
+        return;
+    }
+    let artifact = archive("tar", BTreeMap::from([
+        ("package/package.json", json!({"name":"fixture-pkg","version":"1.0.0","dependencies":{"@nested/pkg":"2.0.0"},"bundledDependencies":["@nested/pkg"]}).to_string()),
+        ("package/index.js", "module.exports = 1;\n".into()),
+        ("package/node_modules/@nested/pkg/package.json", json!({"name":"@nested/pkg","version":"2.0.0"}).to_string()),
+        ("package/node_modules/@nested/pkg/index.js", "module.exports = 2;\n".into()),
+        ("package/tests/fixture/package.json", "deliberately not package metadata".into()),
+    ]));
+    let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(&artifact)));
+    let registry = Registry::new("/fixture.tgz", artifact).await;
+    let fixture = Fixture::new(vec![registry.address.to_string()]).await;
+    npm_candidate(
+        &fixture.candidate,
+        &registry.url("/fixture.tgz"),
+        &integrity,
+    );
+    let lock_path = fixture.candidate.join("package-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+    lock["packages"]["node_modules/fixture-pkg"]["dependencies"] = json!({"@nested/pkg":"2.0.0"});
+    lock["packages"]["node_modules/fixture-pkg"]["bundleDependencies"] = json!(["@nested/pkg"]);
+    lock["packages"]["node_modules/fixture-pkg/node_modules/@nested/pkg"] =
+        json!({"version":"2.0.0","inBundle":true});
+    fs::write(lock_path, lock.to_string()).unwrap();
+    let report = fixture
+        .resolver
+        .resolve(
+            DependencyKind::Npm,
+            &fixture.candidate,
+            fixture.lease.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.packages.len(), 2);
+    assert_eq!(report.packages[0].name, "@nested/pkg");
+    assert_eq!(report.packages[0].version, "2.0.0");
+    assert_eq!(report.packages[1].name, "fixture-pkg");
 }
 
 #[tokio::test]
@@ -482,9 +632,13 @@ for await (const line of createInterface({ input: process.stdin })) {
 }
 
 fn wheel() -> Vec<u8> {
+    wheel_with_metadata("Metadata-Version: 2.1\nName: fixture-pkg\nVersion: 1.0.0\n\n")
+}
+
+fn wheel_with_metadata(metadata: &str) -> Vec<u8> {
     let mut files = BTreeMap::from([
         ("fixture_pkg/__init__.py", "VALUE = 'fixture'\n".into()),
-        ("fixture_pkg-1.0.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: fixture-pkg\nVersion: 1.0.0\n\n".into()),
+        ("fixture_pkg-1.0.0.dist-info/METADATA", metadata.into()),
         ("fixture_pkg-1.0.0.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: fictor-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n".into()),
     ]);
     let record = files
@@ -543,6 +697,88 @@ async fn uv_installs_a_hashed_local_wheel_and_inventories_metadata() {
             .iter()
             .any(|path| path == endpoint)
     );
+}
+
+#[tokio::test]
+async fn cli_accepts_standard_case_insensitive_python_metadata_headers() {
+    if !requires_toolbx() {
+        return;
+    }
+    let artifact = wheel_with_metadata(
+        "Metadata-Version: 2.1\r\nname:fixture-pkg\r\nVERSION:\t1.0.0 \t\r\n\r\n",
+    );
+    let digest: String = Sha256::digest(&artifact)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let endpoint = "/fixture_pkg-1.0.0-py3-none-any.whl";
+    let registry = Registry::new(endpoint, artifact).await;
+    let fixture = CliFixture::new(vec![registry.address.to_string()], "python").await;
+    fs::write(
+        fixture.source.join("requirements.lock"),
+        format!(
+            "fixture-pkg @ {} --hash=sha256:{digest}\n",
+            registry.url(endpoint)
+        ),
+    )
+    .unwrap();
+    let output = fixture.check().await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli["state"], "checked");
+    let store = Store::open(&fixture.home).await.unwrap();
+    let proposal = store
+        .proposal(cli["proposal_id"].as_str().unwrap().into())
+        .await
+        .unwrap();
+    let packages = proposal.packages.unwrap();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0].ecosystem, "pypi");
+    assert_eq!(packages[0].name, "fixture-pkg");
+    assert_eq!(packages[0].version, "1.0.0");
+}
+
+#[test]
+fn python_inventory_unfolds_headers_and_rejects_case_insensitive_identity_duplicates() {
+    for (headers, accepted) in [
+        (
+            "Metadata-Version: 2.1\r\nNAME:\r\n fixture-pkg\r\nVERSION:\t1.0.0\t\r\nDescription: fixture\r\n Name: not-an-identity\r\n\r\nName: body-not-identity\r\n",
+            true,
+        ),
+        (
+            "Metadata-Version: 2.1\nName: fixture-pkg\nnAmE: hidden\nVersion: 1.0.0\n\n",
+            false,
+        ),
+        (
+            "Metadata-Version: 2.1\nName: fixture-pkg\nVersion: 1.0.0\nvErSiOn: 9.9.9\n\n",
+            false,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = root
+            .path()
+            .join(".pydeps/fixture_pkg-1.0.0.dist-info/METADATA");
+        fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        fs::write(metadata, headers).unwrap();
+        let inspected = bundle::inspect(
+            root.path(),
+            &BundleBudget::start(BundleProfile::PostDependencies),
+        )
+        .unwrap();
+        let result = dependencies::inventory(DependencyKind::Python, root.path(), &inspected);
+        if accepted {
+            let packages = result.unwrap();
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].name, "fixture-pkg");
+            assert_eq!(packages[0].version, "1.0.0");
+        } else {
+            assert!(matches!(result, Err(DependencyError::Metadata)));
+        }
+    }
 }
 
 #[tokio::test]

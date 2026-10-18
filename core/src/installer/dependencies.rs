@@ -468,6 +468,16 @@ pub fn inventory(
                 .get("packages")
                 .and_then(Value::as_object)
                 .ok_or(DependencyError::Metadata)?;
+            // A tarball may ship undeclared nested node_modules. The hidden
+            // lock is usable only when it accounts for the physical tree too.
+            let actual = npm_package_roots(inspected)?;
+            if actual.len() != entries.len()
+                || entries
+                    .keys()
+                    .any(|entry| !actual.contains(Path::new(entry)))
+            {
+                return Err(DependencyError::Metadata);
+            }
             for (entry, value) in entries {
                 let relative = Path::new(entry).join("package.json");
                 if !entry.starts_with("node_modules/") || !present.contains(relative.as_path()) {
@@ -507,29 +517,7 @@ pub fn inventory(
                     continue;
                 }
                 let bytes = metadata(&path.join(&file.path))?.ok_or(DependencyError::Metadata)?;
-                let headers = std::str::from_utf8(&bytes).map_err(|_| DependencyError::Metadata)?;
-                let mut name = None;
-                let mut version = None;
-                for line in headers.lines().take_while(|line| !line.is_empty()) {
-                    if let Some(value) = line.strip_prefix("Name: ")
-                        && name
-                            .replace(text(Some(&Value::String(value.into())))?.to_owned())
-                            .is_some()
-                    {
-                        return Err(DependencyError::Metadata);
-                    }
-                    if let Some(value) = line.strip_prefix("Version: ")
-                        && version
-                            .replace(text(Some(&Value::String(value.into())))?.to_owned())
-                            .is_some()
-                    {
-                        return Err(DependencyError::Metadata);
-                    }
-                }
-                packages.insert((
-                    name.ok_or(DependencyError::Metadata)?,
-                    version.ok_or(DependencyError::Metadata)?,
-                ));
+                packages.insert(python_metadata(&bytes)?);
             }
         }
     }
@@ -545,6 +533,94 @@ pub fn inventory(
             version,
         })
         .collect())
+}
+
+fn npm_package_roots(inspected: &Inspection) -> Result<BTreeSet<PathBuf>, DependencyError> {
+    let mut roots = BTreeSet::new();
+    for file in &inspected.files {
+        let Ok(relative) = file.path.strip_prefix("node_modules") else {
+            continue;
+        };
+        let mut parts = relative.components().peekable();
+        let mut root = PathBuf::from("node_modules");
+        while let Some(name) = parts.next() {
+            if name.as_os_str() == ".package-lock.json" && parts.peek().is_none() {
+                break;
+            }
+            root.push(name);
+            if name
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('@'))
+            {
+                root.push(parts.next().ok_or(DependencyError::Metadata)?);
+            }
+            roots.insert(root.clone());
+            // Only package-manager nesting starts another package root. A
+            // package's test fixtures or ordinary package.json files do not.
+            if parts
+                .next()
+                .is_none_or(|part| part.as_os_str() != "node_modules")
+            {
+                break;
+            }
+            root.push("node_modules");
+        }
+    }
+    Ok(roots)
+}
+
+fn python_metadata(bytes: &[u8]) -> Result<(String, String), DependencyError> {
+    let headers = std::str::from_utf8(bytes).map_err(|_| DependencyError::Metadata)?;
+    let (mut name, mut version): (Option<String>, Option<String>) = (None, None);
+    let mut active = None;
+    // Core Metadata uses email headers: case-insensitive field names, optional
+    // horizontal whitespace and folded values. Name/Version remain singletons.
+    for line in headers.lines().take_while(|line| !line.is_empty()) {
+        let value = line.trim_matches([' ', '\t']);
+        if line.starts_with([' ', '\t']) {
+            let target = match active {
+                Some(true) => &mut name,
+                Some(false) => &mut version,
+                None => continue,
+            };
+            if let Some(previous) = target {
+                if !previous.is_empty() && !value.is_empty() {
+                    previous.push(' ');
+                }
+                previous.push_str(value);
+            }
+            continue;
+        }
+        active = None;
+        let (field, value) = line.split_once(':').ok_or(DependencyError::Metadata)?;
+        let target = if field.eq_ignore_ascii_case("Name") {
+            active = Some(true);
+            &mut name
+        } else if field.eq_ignore_ascii_case("Version") {
+            active = Some(false);
+            &mut version
+        } else {
+            continue;
+        };
+        if target
+            .replace(value.trim_matches([' ', '\t']).into())
+            .is_some()
+        {
+            return Err(DependencyError::Metadata);
+        }
+    }
+    let name = name.ok_or(DependencyError::Metadata)?;
+    let version = version.ok_or(DependencyError::Metadata)?;
+    if [&name, &version].into_iter().any(|value| {
+        value.is_empty()
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+    }) {
+        return Err(DependencyError::Metadata);
+    }
+    Ok((name, version))
 }
 
 fn text(value: Option<&Value>) -> Result<&str, DependencyError> {
