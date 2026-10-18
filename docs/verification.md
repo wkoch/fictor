@@ -1,5 +1,19 @@
 # Verificação da implementação
 
+## Revisão documental do ADR-045 — 2026-10-18
+
+ARQ-029 resolvida no contrato; não equivale a implementação aceita. Verificação
+estática no Toolbx `fictor-dev` (Fedora 44 sobre Bazzite, não COSMIC): 164 links e
+âncoras dos sete documentos de arquitetura editados válidos, 70 critérios da Fase 0
+contíguos, 89 critérios no plano e `git diff --check` sem erros. Revisão independente
+de instalação/segredos conferiu nonce, base, journal, EOF, TTY e sigilo desde o parser;
+foram corrigidas consulta durante `prepared` e lista de caminhos omitidos no smoke.
+A revisão de controle/reset fechou a exclusão até commit/publicação e a garantia
+de que `none`/`busy` não deixam trabalho capaz de commitar depois.
+Não rodei suítes de produto para esta alteração documental. Critérios 66–70,
+integração pelo dev e gate no Fedora COSMIC Atomic permanecem pendentes.
+
+
 ## Promoção, crash loop e administração — 2026-10-18
 
 Código validado: `154d187f36cf395d03258fbb9564fcfc274e4d94`, na `main`.

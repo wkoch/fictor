@@ -729,7 +729,9 @@ Uma chamada que já encontra o valor pedido ainda confere a publicação desse e
 em `versions`. Sessão explícita deve existir e é inválida para bundle global.
 Sem sessão, seleciona todas as linhas da chave e devolve `session_id: null`;
 com sessão, devolve a seleção exata. `cleared` é inteiro não negativo, contando
-linhas removidas. O writer serializa seleção, remoção e um `ext.crash_reset` por
+linhas removidas. Conservar a seção crítica do instalador desde a resolução da
+chave até o commit e a publicação/invalidação da disponibilidade em memória.
+O writer serializa seleção, remoção e um `ext.crash_reset` por
 linha numa transação FULL; observações posteriores não são apagadas. Zero é sucesso
 sem evento fictício. Não altera `enabled`, integridade, recursos retidos nem inicia
 processos. Valem integralmente as restrições de [reabilitação humana](#reabilitação-humana).
@@ -881,11 +883,13 @@ Razões de checks ficam no snapshot, não são novos códigos de RPC. `not_found
 ID, chave, sessão ou proposta ausente; `invalid_state` cobre escopo global com
 sessão e operação incompatível com o estado/origem. Não expor paths privados,
 segredos ou detalhes brutos. `effect` descreve apenas a operação pedida, não efeitos
-da reconciliação prévia: `none` quando comprovadamente não houve commit; `committed`
+da reconciliação prévia: `none` somente quando comprovadamente não houve commit
+e nenhum trabalho desse pedido puder executá-lo posteriormente; `committed`
 quando houve persistência, mas falhou a conclusão/publicação; `unknown` quando não
 se pode afirmar. Consulta usa `none`. Nunca declarar `none` após commit incerto.
 
-O prazo para adquirir a seção crítica/admitir operação é 5 s; sem admissão, `busy`.
+O prazo para adquirir a seção crítica/admitir operação é 5 s; sem admissão, `busy`,
+sem deixar mutação enfileirada que possa executar depois dessa resposta.
 Cliente lento nunca segura locks após o resultado copiado. A CLI mantém timeout
 sem progresso de 5 s por RPC; espera de checks/promoção usa novas consultas
 somente leitura, no máximo uma por segundo. Timeout/EOF após envio significa efeito
