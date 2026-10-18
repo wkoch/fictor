@@ -1212,6 +1212,92 @@ async fn a_discovery_connection_cannot_be_upgraded_to_an_explicit_pin() {
     );
 }
 
+async fn cancelled_mcp_handshake_reaps_the_instance(pinned: bool) {
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"/usr/bin/readlink /proc/self/ns/pid > "$FICTOR_WORKSPACE/catalog.namespace"
+printf '%s\n' "$HTTP_PROXY" > "$FICTOR_WORKSPACE/catalog.proxy"
+IFS= read -r line || exit 90
+case "$line" in
+*'"method":"initialize"'*) printf 'received\n' > "$FICTOR_WORKSPACE/initialize.received" ;;
+*) exit 91 ;;
+esac
+# Hold initialize open regardless of transport EOF from a cancelled client.
+/bin/sleep 60"#,
+    );
+    let manifest = mutable_catalog_manifest("fixed", "fixed");
+    let external = Arc::new(tempfile::tempdir().unwrap());
+    let retained = Arc::downgrade(&external);
+    let mut instance = fixture
+        .supervisor
+        .spawn_with_owner(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+            external,
+        )
+        .await
+        .unwrap();
+    let pid = instance.pid();
+    let record = fixture
+        .home
+        .join(format!("run/{}.pid", instance.instance_id));
+    let received = fixture.workspace.join("initialize.received");
+    {
+        let handshake = instance.connect_mcp(pinned.then(fixed_catalog));
+        tokio::pin!(handshake);
+        tokio::select! {
+            _ = &mut handshake => panic!("fixture must keep initialize pending"),
+            _ = wait_file(&received) => {}
+        }
+        // Drop only the connect future. The caller keeps ManagedInstance alive.
+    }
+    assert!(instance.connection().is_none());
+    assert!(retained.upgrade().is_some());
+    assert!(record.exists());
+    let exit = tokio::time::timeout(Duration::from_secs(7), instance.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!exit.crashed);
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    assert_catalog_instance_released(&fixture, &instance.instance_id).await;
+    assert!(retained.upgrade().is_none());
+    assert!(!record.exists());
+    assert!(matches!(
+        instance.connect_mcp(pinned.then(fixed_catalog)).await,
+        Err(SupervisorError::Mcp)
+    ));
+    let events = fixture
+        .store
+        .query_events(EventQuery {
+            kinds: vec![
+                "ext.stopped".into(),
+                "ext.crashed".into(),
+                "ext.tools_changed".into(),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "ext.stopped");
+}
+
+#[tokio::test]
+async fn cancelled_pinned_handshake_stops_the_instance_while_the_handle_remains_alive() {
+    cancelled_mcp_handshake_reaps_the_instance(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_discovery_handshake_stops_the_instance_while_the_handle_remains_alive() {
+    cancelled_mcp_handshake_reaps_the_instance(false).await;
+}
+
 #[tokio::test]
 async fn permission_templates_cannot_follow_symlinks_outside_their_root() {
     let fixture = Fixture::new().await;

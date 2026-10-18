@@ -919,6 +919,9 @@ impl ManagedInstance {
             return Err(SupervisorError::Mcp);
         }
         if self.connection.is_none() {
+            // Once pipes leave the handle, a cancelled handshake cannot be
+            // retried. Its Drop must hand shutdown to the existing process owner.
+            let mut handshake = HandshakeGuard(Some(self.stop.clone()));
             let stdout = self.stdout.take().ok_or(SupervisorError::Mcp)?;
             let stdin = self.stdin.take().ok_or(SupervisorError::Mcp)?;
             let connection = McpConnection::connect_monitored(
@@ -934,6 +937,7 @@ impl ManagedInstance {
                 Ok(connection) => {
                     self.connection = Some(connection);
                     self.pinned_hash = pinned_hash;
+                    handshake.0.take();
                 }
                 Err(_) => {
                     let _ = self.shutdown().await;
@@ -974,6 +978,15 @@ impl ManagedInstance {
         })
         .await
         .map_err(|_| SupervisorError::Process)?
+    }
+}
+
+struct HandshakeGuard(Option<watch::Sender<bool>>);
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            stop.send_replace(true);
+        }
     }
 }
 impl Drop for ManagedInstance {
