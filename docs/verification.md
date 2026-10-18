@@ -1,5 +1,57 @@
 # Verificação da implementação
 
+## Diagnóstico no Bazzite — 2026-10-18
+
+Executado no computador do usuário: **Bazzite 44.20261012.0 (Kinoite), x86-64**,
+SELinux **Enforcing**, Podman rootless 5.8.7 e Toolbx 0.3. Todas as ferramentas,
+builds e suítes rodaram **dentro do `fictor-dev`, Fedora 44**, criado de
+`dev/Containerfile`; nenhum pacote foi instalado no host nem como ferramenta
+global no `$HOME`.
+
+Base do código: `80e04ab71da8f272231a92c407e79323db1aa53e`, com as alterações
+locais desta entrega ainda não commitadas. Imagem construída:
+`65e9e051ef66b1905fbe70de87d8f9f6ebe52662e90a424d5ed2457299a45b2b`.
+
+| Ferramenta | Versão |
+|---|---|
+| Rust / Cargo | 1.99.0, pacotes Fedora 44 |
+| Node | 24.18.0 LTS |
+| npm | 11.16.0 |
+| bubblewrap | 0.12.0 |
+
+Dependências foram obtidas previamente com `cargo fetch --locked`, em cache
+local `.fictor/cargo`. Builds, lint e testes usaram `--locked --offline`:
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo build --locked --offline` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline` | **219 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+
+A suíte completa incluiu os testes reais de sandbox, init e supervisor, sem
+desativar isolamento. A cobertura nova inclui Node Permission Model, proibição de
+subprocessos, grants reais omitidos no smoke, arquivos do HOME inacessíveis ao
+harness/escopo `tools`, fork duplo com `setsid()`, crash e SIGKILL do processo dono.
+Também cobriu `tools.default` sem uma tool MCP desse nome, checks preservados em
+falhas, cancelamento do chamador e aviso de shutdown antes da limpeza do socket.
+Os providers são falsos e locais; os testes não usaram chaves reais ou rede externa.
+
+Não há workspace TypeScript, shell ou extensões first-party nesta base; portanto
+nenhuma suíte `vp` foi executada. O Trail 0.23.0, instalado apenas em
+`.fictor/tools/trail`, atualizou o grafo de 47 arquivos sem passe de LLM.
+
+Logs completos ficam localmente em `.fictor/logs/` (`container-build.log`,
+`cargo-fetch.log`, `fmt.log`, `build.log`, `clippy.log`, `test.log`, `release.log`
+e `trail-build.log`). A receita de criação do ambiente está no README.
+
+**Estes resultados são diagnósticos no Bazzite, não satisfazem o gate de release.**
+Não são execução no desktop COSMIC Atomic nem na CI. Os critérios completos no
+Fedora COSMIC Atomic e os jobs remotos Ubuntu/Fedora continuam pendentes.
+
+## Histórico da migração — 2026-10-17
+
 ## Estado da entrega Linux x86-64
 
 Data: 2026-10-17. Alvo único: **Linux x86-64**, validado no **Fedora COSMIC Atomic**
@@ -41,7 +93,8 @@ execução na CI, no desktop nem como gate de release.
 Registrar data, saída de `cat /etc/os-release`, `uname -m`, `rpm-ostree status`,
 `getenforce`, `rustc --version`, `cargo --version` e `git rev-parse HEAD` junto aos
 resultados. Manter SELinux enforcing e as políticas de namespaces intactas.
-Executar no terminal do host:
+Executar dentro do Toolbx na máquina COSMIC Atomic, seguindo o README e com os
+caches Cargo/npm no workspace (sem instalar toolchains no host):
 
 ```sh
 cd core
@@ -93,3 +146,25 @@ São testes presentes no código; **sua execução em Linux ainda precisa ser re
 - A v0.1 também exige toolchains no sandbox, compactação, guarda de migração com
   backup, login, rollback e roteiro de desenvolvimento de dentro do Fictor.
 - Esta entrega não constitui aprovação de release v0.1 nem v1.0.
+
+## Verificação arquitetural do ADR-035 — 2026-10-18
+
+Base: `80e04ab71da8f272231a92c407e79323db1aa53e`, com alterações locais.
+Execução no Toolbx `fictor-dev`, Fedora Linux 44, SQLite 3.51.2, sobre host
+Bazzite `44.20261012.0` (Kinoite). É diagnóstico da especificação, não evidência
+do gate no Fedora COSMIC Atomic nem execução de CI.
+
+- SQL de `spec/schemas/0003_proposal_receipts.sql` executado via Python/SQLite
+  em bancos descartáveis na memória, após as migrações 0001/0002.
+- Passou: preservação de todos os valores em propostas dos sete estados,
+  incluindo nonces, e preservação de eventos e sessões; 28 combinações de
+  identidade/estado; índice `proposals_state`, foreign keys, integridade, FTS e
+  triggers que proíbem UPDATE/DELETE de eventos.
+- Uma falha injetada depois da reconstrução da tabela confirmou rollback
+  integral da transação, conservando o schema e os registros da versão 2.
+- Passaram 106 links/âncoras locais dos documentos revisados, numeração dos
+  37 critérios da Fase 0 e `git diff --check`. As migrações 0001/0002 não mudaram.
+- Revisão arquitetural independente não encontrou bloqueios. ARQ-019 resolvida
+  pelo ADR-035; código do recebimento/recuperação e testes dos critérios 35–37
+  continuam pendentes para o implementador. Nenhuma suíte Rust ou teste de
+  aceitação foi executado nesta revisão de arquitetura.

@@ -366,13 +366,19 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `hook.failed` | core | `{point, ext_id, error}` |
 | `net.denied` | core | `{ext_id, host, count}` |
 | `ext.started`, `ext.stopped`, `ext.crashed`, `ext.tools_changed`, `ext.cleanup_failed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
-| `ext.proposed`, `ext.promoted`, `ext.rejected`, `ext.rolled_back` | core ou user | `{proposal_id?, ext_id, key}` — sessão `sys` |
+| `ext.proposed`, `ext.checking`, `ext.checked`, `ext.approved`, `ext.rejected`, `ext.failed` | core ou user | `{proposal_id, ext_id: string \| null, version: string \| null, from: string \| null, state, reason?}` — sessão `sys`. `from = null` na criação; `reason` obrigatório em `ext.failed`. Identidade nula somente em `ext.proposed`/`ext.failed`; não há `key` antes da promoção. Ver [06-lifecycle.md](06-lifecycle.md#identidade-e-persistência). |
+| `ext.promoted` | core | `{proposal_id, ext_id, key}` — sessão `sys` |
+| `ext.rolled_back` | core ou user | `{proposal_id?, ext_id, key}` — sessão `sys` |
 | `workspace.flagged` | core | `{workspace, flag: "U", session_id, source_event_id}` — sessão `sys` |
 | `workspace.cleared` | user | `{workspace}` — sessão `sys` |
 | `ext.flags_changed` | core | `{ext_id, flags: {U, P}, session_id?, reason}` — marca d'água de extensão global (Fase 1), sessão `sys` |
 | `runtime.installed`, `runtime.activated`, `runtime.rolled_back`, `runtime.integrity_failed` | core ou user | `{name, version, from?}` — sessão `sys` |
 | `update.batch` | user | `{batch_id, items: [{kind: "runtime" \| "extension", id, from, to}]}` — sessão `sys` |
 | `ext.state_reset` | user | `{ext_id}` — kv, `${ext_data}` e marca d'água apagados (Fase 1), sessão `sys` |
+
+`ext.failed.reason` é um código estável do core para a checagem bloqueante que falhou, nunca o texto livre de `detail`. Antes da identidade e na recuperação, usar os códigos de [06-lifecycle.md](06-lifecycle.md#falhas-antes-da-identidade). Nas demais checagens, usar `check:failed` se não houver código específico.
+
+Os campos novos dos eventos de proposta valem a partir do ADR-035. Consumidores do histórico aceitam eventos anteriores sem `version`, `from`, `state` ou `reason`; não inferem uma identidade ausente e não reescrevem eventos. `proposal.updated` continua contendo somente `{proposal_id, state}`, e `ext.proposal_status` não muda de formato nem de fase.
 
 ### Gravados pelo harness
 

@@ -266,3 +266,16 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
   - `[sandbox.toolchains]` e `permissions.toolchains` saem. Variáveis de projeto para os comandos (como `CARGO_HOME`) vêm de `<workspace>/.fictor/env`, aplicado por `fs-tools` e `shell-net`.
   - Ferramentas para outros projetos na instalação de uso ficam para a Fase 3, com o tier `container` usando uma imagem por workspace.
 - **Consequências.** O host fica limpo, e as ferramentas de desenvolvimento ficam num único lugar. O bubblewrap dentro do toolbx precisa funcionar; isso vira critério de aceitação. Plano de saída do Vite+: chamar Vite, Vitest, Oxlint, Oxfmt e tsdown diretamente.
+
+## ADR-035 — Propostas duráveis antes da identidade (resolve ARQ-019)
+
+- **Data:** 2026-10-18.
+- **Contexto.** O recebimento pode falhar por limites, entradas proibidas ou manifest inválido antes de descobrir uma identidade válida. A tabela `proposals` exigia `ext_id` e `version`, deixando essas recusas sem registro durável e temporários `.receipt-*` sem contrato de recuperação.
+- **Decisão.**
+  - Usar a própria proposta como registro da tentativa, com `ext_id`/`version` nulos em conjunto enquanto a identidade não foi validada. Não criar uma segunda entidade nem usar identidades sentinela.
+  - Criar `received` e `ext.proposed` atomicamente antes de abrir a origem. O temporário é `.receipt-<proposal_id>`. Vincular a identidade uma única vez, após validação do manifest, na transição para `checking`.
+  - Recusas anteriores à identidade terminam em `failed`, com check bloqueante e código estável. A auditoria não copia conteúdo inválido, caminhos privados ou erros brutos. Falha de persistência impede o pipeline de continuar.
+  - No boot, recebimentos e checagens interrompidos falham com `recovery:interrupted`; nenhuma execução é retomada implicitamente. Limpeza confinada à quarentena, sem seguir links, preserva o registro e é idempotente. Órfãos legados não geram identidades ou propostas inventadas.
+  - Migração 0003 preserva linhas, nonces e índice; 0001/0002 e eventos antigos ficam intactos. Os eventos de proposta passam a admitir identidade nula, separados dos eventos de promoção/rollback, que têm chave do store.
+  - Contrato completo em [06-lifecycle.md](06-lifecycle.md#identidade-e-persistência), [03-kernel-protocol.md](03-kernel-protocol.md#gravados-pelo-core) e [schemas/0003_proposal_receipts.sql](schemas/0003_proposal_receipts.sql). Critérios 35–37 da Fase 0 cobrem persistência, interrupções, limpeza e migração.
+- **Consequências.** Toda tentativa admitida é rastreável pelo ID da proposta, mesmo sem extensão identificada. Leituras de propostas precisam aceitar identidade nula. O implementador deve aplicar a migração e adaptar o recebimento, a auditoria e a recuperação em M0.5; isso não antecipa APIs ou origens de fases posteriores e não altera as invariantes I1–I11.
