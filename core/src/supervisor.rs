@@ -174,6 +174,19 @@ impl Supervisor {
         .await
     }
 
+    /// Consume the single ADR-037 snapshot; no permissions merge occurs here.
+    pub async fn spawn_effective(
+        &self,
+        effective: &crate::installer::overrides::EffectiveManifest,
+        bundle: &Path,
+        key: &str,
+        session_id: Option<&str>,
+        workspace: Option<&Path>,
+    ) -> Result<ManagedInstance, SupervisorError> {
+        self.spawn(effective.manifest(), bundle, key, session_id, workspace)
+            .await
+    }
+
     /// Retain trusted caller resources through namespace confirmation, including
     /// startup failure or cancellation. This changes no grants or child inputs.
     pub async fn spawn_with_owner(

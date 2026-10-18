@@ -376,7 +376,7 @@ async fn symlinked_and_mutable_catalog_content_is_rejected_without_following_it(
 }
 
 #[tokio::test]
-async fn invalid_identity_phase_one_declarations_and_uninterpreted_overrides_fail_closed() {
+async fn invalid_identity_phase_one_declarations_and_invalid_overrides_fail_closed() {
     let fixture = Fixture::new().await;
     let (mut server, mut socket) = fixture.client(&["catalog"]).await;
     let original = fixture.manifest();
@@ -414,6 +414,14 @@ async fn invalid_identity_phase_one_declarations_and_uninterpreted_overrides_fai
     }
     fixture.set_manifest(&original);
     fixture.edit_lock(|value| value["extensions"]["example"]["versions"]["1.0.0-aaaaaaaaaaaa"]["overrides"]["permissions"] = json!({"fs":{"read":[]}}));
+    let valid = call(
+        &mut socket,
+        "catalog.list",
+        json!({"session_id":fixture.session}),
+    )
+    .await;
+    assert!(valid.get("result").is_some(), "{valid}");
+    fixture.edit_lock(|value| value["extensions"]["example"]["versions"]["1.0.0-aaaaaaaaaaaa"]["overrides"]["permissions"] = json!({"fs":{"read":["${workspace}"]}}));
     assert_eq!(
         call(
             &mut socket,

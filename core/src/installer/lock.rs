@@ -1,7 +1,8 @@
 //! Schema-1 extension lock persistence. This module neither approves nor promotes.
+pub use super::overrides::Overrides;
 use crate::gateway::PinnedCatalog;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +48,7 @@ pub struct LockedVersion {
     pub path: String,
     pub source: Value,
     pub approved: Approval,
+    #[serde(default)]
     pub overrides: Overrides,
     pub privileges: Vec<String>,
     pub tools: Vec<Value>,
@@ -61,13 +63,6 @@ pub struct Approval {
     pub by: String,
     pub at: String,
     pub approval_id: Option<String>,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Overrides {
-    pub permissions: Map<String, Value>,
-    pub tools: Map<String, Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,7 +159,11 @@ impl Lock {
                 {
                     return Err(LockError::Invalid);
                 }
-                version.catalog()?;
+                let catalog = version.catalog()?;
+                version
+                    .overrides
+                    .validate_catalog(&catalog, &version.approved.by)
+                    .map_err(|_| LockError::Invalid)?;
             }
         }
         Ok(())
@@ -576,6 +575,35 @@ mod tests {
                 .unwrap()
                 .tools[0]["description"],
             "Pinned description"
+        );
+    }
+
+    #[test]
+    fn overrides_preserve_sparse_approved_json_and_accept_legacy_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let mut lock = fixture(home.path());
+        let extension = lock.extensions.get_mut("example").unwrap();
+        let version = extension.versions.get_mut(&extension.active).unwrap();
+        let patch = serde_json::json!({"tools":{"echo":{"model_visible":false}}});
+        version.overrides = Overrides::from_value(patch.clone()).unwrap();
+        lock.write_atomic(home.path()).unwrap();
+        let loaded = Lock::load(home.path()).unwrap();
+        let extension = &loaded.extensions["example"];
+        assert_eq!(
+            extension.versions[&extension.active].overrides.as_value(),
+            &patch
+        );
+        let mut legacy = serde_json::to_value(loaded).unwrap();
+        legacy["extensions"]["example"]["versions"]["1.2.3-0123456789ab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("overrides");
+        save_json(home.path(), &legacy);
+        let loaded = Lock::load(home.path()).unwrap();
+        let extension = &loaded.extensions["example"];
+        assert_eq!(
+            extension.versions[&extension.active].overrides,
+            Overrides::default()
         );
     }
 

@@ -82,8 +82,9 @@ fn list_bounded(home: &Path, limit: usize) -> Result<Catalog, CatalogError> {
             .versions
             .get(&extension.active)
             .ok_or(CatalogError::Invalid)?;
-        let manifest =
+        let effective =
             registry::active_manifest(&home, id, version).map_err(|_| CatalogError::Invalid)?;
+        let manifest = effective.manifest();
         if manifest
             .hooks
             .as_ref()
@@ -142,15 +143,15 @@ fn list_bounded(home: &Path, limit: usize) -> Result<Catalog, CatalogError> {
                 catalog.skills.push(skill);
             }
         }
-        for command in manifest.commands {
+        for command in &manifest.commands {
             time.check_time().map_err(|_| CatalogError::TooLarge)?;
             let prompt = relative(&bundle, &command.prompt, false)?;
             immutable(&prompt, false)?;
             let command = Command {
                 ext_id: id.clone(),
-                name: command.name,
-                description: command.description,
-                prompt_path: bundle_path.join(command.prompt),
+                name: command.name.clone(),
+                description: command.description.clone(),
+                prompt_path: bundle_path.join(&command.prompt),
             };
             account(&mut output, &command, !catalog.commands.is_empty())?;
             catalog.commands.push(command);

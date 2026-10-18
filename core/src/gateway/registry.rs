@@ -2,7 +2,8 @@
 //! from a live process or MCP annotations. This module does not execute tools.
 use crate::installer::{
     lock::{Lock, LockedVersion},
-    manifest::{Effect, MAX_MANIFEST_BYTES, Manifest, RuntimeKind, Scope, Sensitivity, ToolClass},
+    manifest::{Effect, MAX_MANIFEST_BYTES, Manifest, RuntimeKind, Scope, Sensitivity},
+    overrides::{self, EffectiveManifest},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -19,8 +20,6 @@ pub enum RegistryError {
     Unavailable,
     #[error("active tool manifest or catalog is invalid")]
     Invalid,
-    #[error("tool registry overrides require an architectural contract")]
-    UnsupportedOverrides,
     #[error("active tool registry exceeds the protocol message limit")]
     TooLarge,
 }
@@ -59,21 +58,16 @@ fn model_tools_bounded(home: &Path, limit: usize) -> Result<Vec<ToolDef>, Regist
             .versions
             .get(&extension.active)
             .ok_or(RegistryError::Invalid)?;
-        let manifest = active_manifest(home, id, version)?;
-        let catalog = version.catalog().map_err(|_| RegistryError::Invalid)?;
+        let effective = active_manifest(home, id, version)?;
+        let manifest = effective.manifest();
+        let catalog = effective.catalog();
         if !manifest.mcp_enabled() && !catalog.tools().is_empty() {
             return Err(RegistryError::Invalid);
         }
         for tool in catalog.tools() {
             let name = tool["name"].as_str().ok_or(RegistryError::Invalid)?;
-            // `default` is a classification fallback, not an MCP tool name.
-            let class = manifest
-                .tools
-                .get(name)
-                .or_else(|| manifest.tools.get("default"))
-                .cloned()
-                .unwrap_or_else(ToolClass::default);
-            if name.starts_with("hook_") || !class.model_visible {
+            let class = effective.tool_class(name).ok_or(RegistryError::Invalid)?;
+            if !class.model_visible {
                 continue;
             }
             let definition = ToolDef {
@@ -126,12 +120,7 @@ pub(crate) fn active_manifest(
     home: &Path,
     id: &str,
     version: &LockedVersion,
-) -> Result<Manifest, RegistryError> {
-    // Merge/restriction semantics have not been specified. Never silently fall
-    // back to broader manifest grants/classification (ARQ-021).
-    if !version.overrides.permissions.is_empty() || !version.overrides.tools.is_empty() {
-        return Err(RegistryError::UnsupportedOverrides);
-    }
+) -> Result<EffectiveManifest, RegistryError> {
     let manifest = read_manifest(&home.join("extensions").join(&version.path))?;
     if manifest.id != id
         || manifest.version != version.version
@@ -139,7 +128,15 @@ pub(crate) fn active_manifest(
     {
         return Err(RegistryError::Invalid);
     }
-    Ok(manifest)
+    let catalog = version.catalog().map_err(|_| RegistryError::Invalid)?;
+    overrides::resolve(
+        &manifest,
+        &catalog,
+        &version.overrides,
+        &version.approved.by,
+        &crate::proxy::nat64::Nat64Prefixes::default(),
+    )
+    .map_err(|_| RegistryError::Invalid)
 }
 
 fn read_manifest(bundle: &Path) -> Result<Manifest, RegistryError> {
@@ -277,20 +274,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_state_and_uninterpreted_overrides_fail_closed() {
+    fn approved_override_hides_the_tool_without_ignoring_invalid_state() {
         let home = tempfile::tempdir().unwrap();
         let mut lock = fixture(home.path(), json!({}), vec![tool("echo")]);
         let extension = lock.extensions.get_mut("example").unwrap();
         let version = extension.versions.get_mut(&extension.active).unwrap();
-        version
-            .overrides
-            .tools
-            .insert("echo".into(), json!({"model_visible":false}));
+        version.overrides = crate::installer::overrides::Overrides::from_value(
+            json!({"tools":{"echo":{"model_visible":false}}}),
+        )
+        .unwrap();
         lock.write_atomic(home.path()).unwrap();
-        assert!(matches!(
-            model_tools(home.path()),
-            Err(RegistryError::UnsupportedOverrides)
-        ));
+        assert!(model_tools(home.path()).unwrap().is_empty());
         let path = home.path().join("extensions/lock.json");
         fs::write(path, b"invalid lock").unwrap();
         assert!(matches!(

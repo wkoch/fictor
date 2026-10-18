@@ -517,3 +517,25 @@ Passaram 31 testes dirigidos no Toolbx Fedora 44 sobre Bazzite: primitiva (7),
 integração de controles (4), limites/releituras do Kernel (7) e bootstrap (13).
 A recusa de grants que exponham a árvore por aliases de montagem ainda está
 em implementação; esta base não declara encerrados todos os critérios 51–56.
+
+## Overrides humanos — base do ADR-037
+
+`Overrides` conserva o JSON esparso validado, sem inserir folhas ou defaults
+ausentes. O parser recusa campos/nomes desconhecidos, duplicatas e valores fora do
+schema; folhas explícitas exigem decisão humana. O lock admite ausência legada
+como patch vazio, preservando exatamente os patches novos ao gravar/reabrir.
+
+`resolve` produz um snapshot de permissões e classificações efetivas. Listas são
+subconjuntos das declarações originais, com rebaixamento de escrita para leitura;
+env e bindings de segredos não aceitam novos valores. Classificações aplicam base,
+patch default e patch nominal, conservando os pisos estáticos de rede/modelos e
+hooks. Gateway, catálogo e `spawn_effective` consomem o snapshot; o catálogo MCP
+original permanece intacto para o pin da conexão. O supervisor e o proxy validam
+novamente as permissões no contexto NAT64 do boot antes de executar.
+
+Passaram 25 testes dirigidos no Toolbx Fedora 44 sobre Bazzite: overrides (6),
+lock (7), registry (6), catálogo (5) e um teste real do supervisor. Este último
+compara um controle positivo com a remoção de env/segredo/modelos/rede/spawn e o
+rebaixamento do workspace para leitura. A persistência do patch junto da aprovação
+na proposta e a publicação pelo journal ainda fazem parte da promoção pendente;
+a política contextual do M0.6 continua fora desta entrega.

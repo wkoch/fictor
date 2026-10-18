@@ -6,6 +6,7 @@ pub mod lease;
 pub mod local;
 pub mod lock;
 pub mod manifest;
+pub mod overrides;
 pub mod promotion;
 pub mod recovery;
 pub(crate) mod registries;

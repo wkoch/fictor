@@ -1907,3 +1907,144 @@ PY"#,
         "session-b"
     );
 }
+
+#[tokio::test]
+async fn approved_effective_restrictions_reach_node_environment_filesystem_and_proxy() {
+    use fictor::installer::{
+        manifest::RuntimeKind,
+        overrides::{Overrides, resolve},
+    };
+    // /tmp is an implicit writable Node base. Keep the workspace outside it so
+    // this probe independently exercises the runtime's removed write grant.
+    let fixture = Fixture::new_in(Path::new("/var/tmp")).await;
+    let session = fixture.session().await;
+    let canary = fixture.workspace.join("readonly-canary");
+    fs::write(&canary, "original data").unwrap();
+    fixture
+        .secrets
+        .set("extension_token", "fake-extension-token")
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let bundle = fixture.bundle(
+        false,
+        r#"
+[ "$KEEP" = retained ] && [ -z "${DROP+x}" ] && [ -z "${API_TOKEN+x}" ] || exit 61
+[ "$(/usr/bin/cat "$READ_PATH")" = 'original data' ] || exit 62
+if (printf overwritten > "$READ_PATH") 2>/dev/null; then exit 63; fi
+"#,
+    );
+    fs::write(bundle.join("main.mjs"), r#"import assert from 'node:assert/strict';
+import {readFileSync, writeFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {createConnection} from 'node:net';
+assert.equal(process.env.KEEP, 'retained');
+assert.equal(process.env.DROP, undefined);
+assert.equal(process.env.API_TOKEN, undefined);
+assert.equal(process.env.FICTOR_MODELS_URL, undefined);
+assert.equal(readFileSync(process.env.READ_PATH, 'utf8'), 'original data');
+assert.throws(() => writeFileSync(process.env.READ_PATH, 'overwritten'), {code:'ERR_ACCESS_DENIED'});
+assert.throws(() => spawnSync('/usr/bin/true'), {code:'ERR_ACCESS_DENIED'});
+const proxy = new URL(process.env.HTTP_PROXY);
+const target = new URL(process.env.PROBE_URL);
+const status = await new Promise((resolve, reject) => {
+  const socket = createConnection(Number(proxy.port), proxy.hostname);
+  let response = '';
+  socket.on('error', reject);
+  socket.on('data', chunk => { response += chunk; });
+  socket.on('end', () => resolve(response.split('\r\n')[0]));
+  socket.on('connect', () => {
+    const basic = Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64');
+    socket.end(`GET ${target.href} HTTP/1.1\r\nHost: ${target.host}\r\nProxy-Authorization: Basic ${basic}\r\nConnection: close\r\n\r\n`);
+  });
+});
+assert.match(status, /^HTTP\/1\.[01] 403 /);
+"#).unwrap();
+    let kept = json!({"KEEP":"retained","READ_PATH":canary.to_str().unwrap(),"PROBE_URL":format!("http://127.0.0.1:{port}/")});
+    let mut environment = kept.as_object().unwrap().clone();
+    environment.insert("DROP".into(), "removed".into());
+    let mut original = manifest(
+        json!({
+            "spawn":true,"fs":{"write":["${workspace}"]},
+            "net":{"allow":[format!("127.0.0.1:{port}")]},"models":["fake-provider"],
+            "secrets":[{"name":"extension_token","env":"API_TOKEN"}],"env":environment
+        }),
+        true,
+        false,
+    );
+    original.kernel = vec![KernelScope::Kv];
+    let patch = Overrides::from_value(json!({"permissions":{
+        "fs":{"read":["${workspace}"],"write":[]},"spawn":false,
+        "net":{"allow":[]},"models":[],"secrets":[],"env":kept
+    }}))
+    .unwrap();
+    let effective = resolve(
+        &original,
+        &PinnedCatalog::new(vec![]).unwrap(),
+        &patch,
+        "user",
+        &fictor::proxy::nat64::Nat64Prefixes::default(),
+    )
+    .unwrap();
+    // Exercise the OS mount independently, so Node's permission model cannot
+    // conceal an accidentally writable sandbox mount. This also runs outside Toolbx.
+    let native_session = fixture.session().await;
+    let mut native = fixture
+        .supervisor
+        .spawn_effective(
+            &effective,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&native_session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    let native_exit = tokio::time::timeout(Duration::from_secs(5), native.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(native_exit.code, Some(0));
+    assert_eq!(fs::read_to_string(&canary).unwrap(), "original data");
+    original.runtime.kind = RuntimeKind::Node;
+    original.runtime.entry = Some("main.mjs".into());
+    let effective = resolve(
+        &original,
+        &PinnedCatalog::new(vec![]).unwrap(),
+        &patch,
+        "user",
+        &fictor::proxy::nat64::Nat64Prefixes::default(),
+    )
+    .unwrap();
+    let result = fixture
+        .supervisor
+        .spawn_effective(
+            &effective,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await;
+    if !Path::new("/run/.toolboxenv").is_file() {
+        server.abort();
+        assert!(matches!(result, Err(SupervisorError::Unsupported)));
+        return;
+    }
+    let mut instance = result.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), instance.wait()).await;
+    server.abort();
+    let log = fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap();
+    assert_eq!(outcome.unwrap().unwrap().code, Some(0), "{log}");
+    assert_eq!(fs::read_to_string(canary).unwrap(), "original data");
+}
