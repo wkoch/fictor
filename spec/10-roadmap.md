@@ -6,7 +6,7 @@ Cada fase termina com todos os critérios de aceitação passando, de preferênc
 
 | Release | Conteúdo obrigatório | Pode ficar para depois |
 |---|---|---|
-| v0.1 | Fase 0 completa | — |
+| **v0.1** | [Marco de autossuficiência](#marco-de-autossuficiência-v01): Fase 0 completa, incluindo compactação, toolchains no sandbox, guarda de migração e `fictor ext rollback` | — |
 | v0.2 | Fase 1 completa | — |
 | v0.3 | Fase 2 completa | — |
 | **v1.0** | Fases 0–2 e o núcleo da Fase 3: origens `git`, `mcp`, `skill`, `claude-plugin`; normalização; MCP remoto; checagens OSV, de segredos e de capacidades inferidas; extensão `auditor`; watcher de atualizações com auditoria do diff; Landlock e seccomp no Linux | — |
@@ -14,11 +14,10 @@ Cada fase termina com todos os critérios de aceitação passando, de preferênc
 
 ### Gate de cada release
 
-1. Todos os critérios de aceitação das fases incluídas passam em duas máquinas reais: Fedora Atomic (COSMIC, x86_64) e macOS (Apple Silicon). Execução registrada em `docs/` com data, versão do SO e commit.
-2. CI verde em Ubuntu 22.04 e macOS 15. A CI é necessária, mas não substitui o item 1: Ubuntu não reproduz o Fedora Atomic.
+1. Todos os critérios de aceitação das fases incluídas passam na máquina do usuário: Fedora COSMIC Atomic, versão estável corrente, x86-64. Execução registrada em `docs/` com data, versão do SO e commit.
+2. CI verde: Ubuntu 22.04 x86-64 (todos os testes) e container Fedora da versão alvo (build e testes sem sandbox real). A CI é necessária, mas não substitui o item 1.
 3. Cada invariante I1–I11 tem pelo menos um teste automatizado que falharia se ela fosse quebrada. Lista de testes por invariante em `docs/`.
 4. A tabela de riscos residuais de [05-security.md](05-security.md#riscos-residuais) foi revisada: cada linha tem fase de mitigação igual ou posterior à release, ou foi removida.
-5. Windows/WSL2 não bloqueia release.
 
 Critérios da Fase 3 que são do núcleo v1.0: 1 a 5. Itens de v1.x ganham critérios próprios quando forem planejados.
 
@@ -32,17 +31,18 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 |---|---|
 | M0.1 | Crate `core`, CLI com clap, `config.toml`, `FICTOR_HOME`, migrações, `fictor init`, `fictor doctor`. |
 | M0.2 | Store: eventos (append-only, flags cumulativas, FTS), sessões (fork), blobs, kv. Testes unitários. |
-| M0.3 | Sandbox: backend Linux (bubblewrap + `__sandbox-init`) e macOS (Seatbelt). Testes de integração por plataforma. |
+| M0.3 | Sandbox: bubblewrap + `__sandbox-init`, com as regras do Fedora Atomic. Testes de integração em Linux. |
 | M0.4 | Egress proxy, model proxy, segredos (keyring). |
 | M0.5 | Supervisor, gateway MCP (rmcp), Kernel Protocol, instalador mínimo (origem `local`, smoke test, lock, store). |
 | M0.6 | Política, aprovações, grants. |
 | M0.7 | Servidor web (auth, WS, CSP, host de surfaces vazio), shell com chat, sessões, modal de aprovação. |
-| M0.8 | `@fictor/sdk` mínimo, `harness` v0 (adapters `anthropic` e `openai-chat`, loop, AGENTS.md, skills, `load_skill`, `todo_write`), `fs-tools`, `shell-net`. |
-| M0.9 | Testes de aceitação de ponta a ponta. |
+| M0.8 | `@fictor/sdk` mínimo, `harness` v0 (adapters `anthropic` e `openai-chat`, loop, AGENTS.md, skills, `load_skill`, `todo_write`, compactação), `fs-tools`, `shell-net`. |
+| M0.9 | Autossuficiência: `[sandbox.toolchains]`, guarda de migração com backup, `fictor login`, `fictor ext rollback`, unidade systemd de usuário. |
+| M0.10 | Testes de aceitação de ponta a ponta e roteiro de autossuficiência no Fedora COSMIC Atomic. |
 
 ### Critérios de aceitação
 
-1. Em Fedora Atomic e em macOS: `fictor init --first-party .` e `fictor serve` sobem; o login pela URL impressa funciona; uma conversa com um modelo Anthropic e com um compatível com OpenAI retorna resposta em streaming.
+1. No Fedora COSMIC Atomic: `fictor init --first-party .` e `fictor serve` sobem; o login pela URL impressa funciona; uma conversa com um modelo Anthropic e com um compatível com OpenAI retorna resposta em streaming.
 2. Pedir "crie `hello.txt` com o texto oi" num workspace cria o arquivo. O event log tem `user.message`, `model.call`, `assistant.message`, `tool.call` e `tool.result` encadeados.
 3. Dentro de `fs-tools__bash`: `curl https://example.com` falha (sem rede); ler `<HOME real>/.ssh/id_rsa` pelo caminho absoluto falha; criar arquivo num caminho absoluto fora do workspace falha; `touch ./x` no workspace funciona.
 4. `shell-net__bash_network` com `curl https://example.com` pede aprovação no modo `default`; aprovado, funciona; a sessão ganha a flag U com motivo `net:example.com`.
@@ -60,16 +60,47 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 16. Uma extensão `scope: session` grava em `kv` e em `${ext_data}` na sessão A; na sessão B, não enxerga nenhum dos dois.
 17. Model proxy com o provider falso: (a) cancelar o cliente no meio do stream gera `model.call` com `outcome = client_cancelled`, `resp_complete = false` e blob parcial; (b) o provider derrubar a conexão gera `upstream_error`; (c) com limite diário 2, a terceira requisição recebe 429, inclusive depois de reiniciar o core; (d) `base_url = "http://localhost:<porta>"` impede o core de subir.
 18. Manifest com `permissions.env` contendo `PATH`, `NODE_OPTIONS` ou `LD_PRELOAD` é recusado na validação.
-19. Linux: com `SSH_AUTH_SOCK` apontando para um socket dentro de um diretório pedido em `fs.read`, o spawn é recusado.
+19. Com `SSH_AUTH_SOCK` apontando para um socket dentro de um diretório pedido em `fs.read`, o spawn é recusado.
 20. `secrets.backend = "keyring"` com o keyring indisponível: `fictor secrets set` falha sem criar `secrets.toml`, e o model proxy responde 503 `fictor_secret_unavailable`.
 21. NAT64: com `nat64_prefixes` contendo um prefixo /96 e um /64 (globais de teste, fora das faixas não públicas), um nome que resolve para um endereço desses prefixos com IPv4 embutido `192.168.1.1` é negado sem regra exata para `192.168.1.1:<porta>`. Um destino em `64:ff9b:1::/48` é negado sem regra exata. Um prefixo com bits de host impede o core de subir.
-22. `fictor ext install` de um diretório com 5 001 arquivos vazios falha com `limit:entries` sem ultrapassar o tempo limite. Um diretório com `node_modules/` na raiz instala, e `node_modules/` aparece na lista de ignorados. Um diretório com `A.txt` e `a.txt` falha.
+22. `fictor ext install` de um diretório com 5 001 arquivos vazios falha com `limit:entries` sem ultrapassar o tempo limite. Um diretório com `node_modules/` na raiz instala, e `node_modules/` aparece na lista de ignorados.
 23. Na Fase 0, instalar um bundle `scope: global` com processo falha com `phase:global`. Um bundle `runtime: none` só com skills instala.
 24. São recusados: `runtime: none` com `mcp: true`; `role: harness` com `runtime: none`; processo com `mcp: false` sem `kernel`; versão `1.0.0-01`. A versão `1.0.0+build.5` é aceita.
 25. Bundle com `fs.read: ["~/Documents/x"]`: o smoke passa sem acesso ao caminho real, um teste do bundle que tenta ler o caminho falha, e a tela de revisão lista o caminho não concedido.
-26. macOS: uma extensão de teste com `spawn: true` faz fork duplo e `setsid()`, e o pai sai. Depois do encerramento da instância, nenhum processo dela existe. Matar o core com SIGKILL e subir de novo também elimina os processos que sobraram.
+26. Uma extensão de teste com `spawn: true` faz fork duplo e `setsid()`, e o pai sai. Depois do encerramento da instância, nenhum processo dela existe. Matar o core com SIGKILL também encerra os sandboxes (`--die-with-parent`), e o boot seguinte remove sockets e diretórios que sobraram.
+27. Uma conversa longa passa do limite de contexto e continua depois de `harness.compaction`.
+28. Toolchains: com `[sandbox.toolchains]` configurado, `cargo --version`, `rustc --version` e `deno --version` funcionam em `fs-tools__bash`, e `CARGO_HOME` aponta para `<workspace>/.fictor/cargo`. `mounts = ["~/.cargo"]` impede o core de subir. `~/.cargo/credentials.toml` não é legível dentro do sandbox.
+29. Fedora Atomic: em `fs-tools__bash`, tanto `/home/<usuário>/<caminho no workspace>` quanto o caminho canônico `/var/home/...` funcionam, e `/var` só mostra os caminhos montados. Uma extensão com `fs.write: ["~/.bashrc"]` ou `["~/.local/bin"]` tem o spawn recusado.
+30. Migrações: subir um binário com migração nova cria `fictor.db.bak-<n>` antes de migrar. Subir de novo o binário anterior falha com mensagem explicativa e não altera o banco.
+31. Roteiro de autossuficiência (manual, registrado em `docs/`): no Fedora COSMIC Atomic, com o Fictor rodando como serviço de usuário e workspace = clone do repositório, o agente implementa uma mudança pequena no core com teste. Ele roda `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e `cargo test --offline` dentro do Fictor e faz commit local. O usuário instala o binário novo e reinicia o serviço, e a sessão anterior continua acessível.
 
-Fora da Fase 0: propostas da IA, surfaces, hooks, web, compactação, evals, terceiros.
+Fora da Fase 0: propostas da IA, surfaces, hooks, web, evals, terceiros.
+
+## Marco de autossuficiência (v0.1)
+
+A partir da v0.1, o Fictor é desenvolvido de dentro do próprio Fictor, no Fedora COSMIC Atomic ([ADR-031](11-decisions.md#adr-031--v01-autossuficiente-e-fluxo-de-desenvolvimento)).
+
+### Instalação de uso
+
+- Binário em `~/.local/bin/fictor`, `FICTOR_HOME` padrão.
+- Serviço de usuário opcional, `~/.config/systemd/user/fictor.service`, com `ExecStart=%h/.local/bin/fictor serve`. `fictor login` pede ao core em execução uma URL de login nova, já que a do boot fica no journal.
+- Workspace: clone do repositório, com `workspace_trust: trusted`. O `.gitignore` do repositório DEVE incluir `.fictor/` (caches de toolchains no workspace).
+- `[sandbox.toolchains]` configurado para rustup, cargo e deno. `gcc` e `git` vêm do sistema (`rpm-ostree install gcc git`, se ainda não estiverem).
+
+### Ciclo de desenvolvimento dentro do Fictor
+
+1. O agente lê spec e código, edita, roda `cargo fmt`, `cargo clippy`, `cargo test --offline` e `deno test` com `fs-tools__bash` (sem rede).
+2. Dependências novas: `cargo fetch` ou `deno install` com `shell-net__bash_network`, com aprovação.
+3. O agente faz commit local. Nenhuma credencial de git ou SSH entra no sandbox.
+4. O usuário revisa e faz `git push` fora do Fictor.
+5. Atualizar o core é ação do usuário, fora do Fictor: testar a build com `FICTOR_HOME` temporário, `install -m 0755 core/target/release/fictor ~/.local/bin/fictor` e `systemctl --user restart fictor`. O core faz backup do banco antes de migrar.
+6. Atualizar extensões first-party (`harness`, `fs-tools`, `shell-net`): `fictor ext install <caminho>` pelo usuário. Se uma versão nova quebrar o agente, `fictor ext rollback <id>` volta à anterior sem depender do agente.
+
+Testes do core que criam sandboxes reais podem falhar dentro do Fictor por aninhamento de namespaces ([05-security.md](05-security.md#linux-bubblewrap)). Nesse caso, rodam no terminal ou na CI, e isso não bloqueia o marco.
+
+### Antes da v0.1
+
+O desenvolvimento acontece num Mac, que serve só como estação de edição. O core não compila para macOS. Build e testes do core só contam quando rodam em Linux x86-64: na máquina Fedora (por SSH) ou na CI. Testes unitários de TypeScript (shell, SDK, harness, extensões) podem rodar no Mac; integração com o core, só em Linux.
 
 ## Fase 1 — Auto-extensão
 
@@ -82,7 +113,6 @@ Entregas:
 - Hot swap com `tools.changed` e `catalog.changed`.
 - Fan-out de hooks e hook points da `hooks_api: 1` no harness.
 - Host de MCP Apps, `ui.mount`, design system `fx-*` e `CATALOG.md`.
-- Compactação no harness.
 - Extensões `web`, `search`, `authoring`.
 - Marca d'água de extensões globais, propagação de flags por hooks, "limpar estado".
 
@@ -95,7 +125,7 @@ Critérios de aceitação:
 5. Um iframe de surface que tenta `fetch("http://127.0.0.1:<listen>/api/blobs")` ou `fetch("https://example.com")` é bloqueado pelo CSP.
 6. Uma surface que chama uma tool de outra extensão recebe erro.
 7. Um hook `tool.after` que trava é pulado após o timeout, gera `hook.failed` e o turno continua.
-8. Uma conversa longa passa do limite de contexto e continua após `harness.compaction`.
+8. (Movido para a Fase 0, critério 27.)
 9. Uma extensão global de teste com estado, chamada por uma sessão com U, devolve resultados `untrusted` a outra sessão; depois de "limpar estado", volta a `trusted`.
 10. Um hook `context.assemble` de extensão com `output_trust: untrusted` acende U na sessão que o invoca.
 11. Uma extensão global grava `x.<id>.*` numa sessão: o evento sai com a classificação default da extensão combinada com a marca d'água e acende as flags dessa sessão.

@@ -55,21 +55,21 @@ Regras comuns:
 - `FICTOR_HOME` nunca é montado, exceto o bundle, o `${ext_data}` da instância e os sockets da instância. O HOME real nunca é montado inteiro (só `sandbox.home_ro_files`, em instâncias de sessão).
 - Arquivos montados um a um (`fs.read` apontando para arquivo, `home_ro_files`) que sejam sockets são recusados.
 - Caminhos sensíveis: o supervisor recusa o spawn se um caminho do perfil for igual a um caminho sensível, o contiver ou estiver contido nele. Lista:
-  - credenciais: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.local/share/keyrings`, `~/Library/Keychains`;
+  - credenciais: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.local/share/keyrings`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.config/containers/auth.json`;
   - diretórios de runtime com sockets: `$XDG_RUNTIME_DIR` (ou `/run/user/<uid>`), `/run`, `/var/run`, `/tmp/.X11-unix`;
   - endpoints descobertos na inicialização do core (e de novo em `fictor doctor`):
     - `SSH_AUTH_SOCK` do ambiente do core;
     - saída de `gpgconf --list-dirs` (`homedir`, `socketdir`, `agent-socket`, `agent-ssh-socket`, `agent-extra-socket`, `agent-browser-socket`, `dirmngr-socket`, `keyboxd-socket`), com timeout de 2 s. Esse comando não inicia o agente. Se `gpgconf` não existir ou falhar, usar `~/.gnupg` e `$XDG_RUNTIME_DIR/gnupg`, seguir e avisar no `doctor`;
     - `DOCKER_HOST` e `DBUS_SESSION_BUS_ADDRESS` quando apontam para Unix socket; `/run/docker.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, `/run/podman/podman.sock`, `/run/dbus/system_bus_socket`.
-- Sockets Unix que não estão na lista, criados dentro de um diretório montado (por exemplo, no workspace):
-  - no macOS, não são alcançáveis: o perfil Seatbelt só permite `network-outbound` para o socket do kernel;
-  - no Linux, montagem somente leitura não impede `connect()` em socket. Ficam alcançáveis até a Fase 3, quando o seccomp nega `socket(AF_UNIX, …)` à carga de trabalho. Risco residual documentado no fim deste arquivo.
+- Sockets Unix que não estão na lista, criados dentro de um diretório montado (por exemplo, no workspace): montagem somente leitura não impede `connect()` em socket. Ficam alcançáveis até a Fase 3, quando o seccomp nega `socket(AF_UNIX, …)` à carga de trabalho. Risco residual documentado no fim deste arquivo.
+- Destinos proibidos para escrita (persistência fora do sandbox): o diretório do executável do core (por padrão `~/.local/bin`), `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.config/autostart`, `~/.config/systemd/user`, `~/.config/environment.d`, `~/.local/share/applications`. Montar qualquer um deles, ou um diretório que os contenha, com escrita é recusado.
+- As mesmas regras valem para `[sandbox.toolchains].mounts`. Montar `~/.cargo` inteiro é recusado (contém credenciais); monte `~/.cargo/bin`. As variáveis de `[sandbox.toolchains].env` não podem usar nomes reservados e só aceitam `~/` e `${workspace}` como templates; caminhos graváveis (como `CARGO_HOME`) DEVEM ficar dentro do workspace. Erro em qualquer regra impede o core de subir.
 - Não existe rede direta. Só o proxy.
 - O ambiente é construído do zero ([02-core.md](02-core.md#spawn)).
 
 ### Linux (bubblewrap)
 
-O supervisor executa `bwrap` com ambiente vazio. Estrutura dos argumentos (ajustar por teste em Fedora Atomic e em uma distro tradicional):
+O supervisor executa `bwrap` com ambiente vazio. Estrutura dos argumentos (ajustar por teste no Fedora COSMIC Atomic):
 
 ```text
 bwrap
@@ -80,6 +80,8 @@ bwrap
   --ro-bind-try /etc/ca-certificates /etc/ca-certificates
   --ro-bind-try /etc/alternatives /etc/alternatives --ro-bind-try /etc/localtime /etc/localtime
   --ro-bind-try /etc/passwd /etc/passwd --ro-bind-try /etc/group /etc/group
+  --ro-bind-try /etc/crypto-policies /etc/crypto-policies --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
+  --symlink var/home /home ...                               (Fedora Atomic; ver abaixo)
   --proc /proc --dev /dev --tmpfs /tmp
   --ro-bind <dir do runtime> <mesmo caminho>
   --ro-bind <bundle> <mesmo caminho>
@@ -93,7 +95,16 @@ bwrap
   /fx/fictor __sandbox-init -- <comando do runtime>
 ```
 
-Caminhos do host são montados no mesmo caminho dentro do sandbox, exceto `${tmp}`, que é o `/tmp` interno. `--unshare-all` cria namespaces de rede, PID, IPC, UTS, cgroup e usuário; o bubblewrap ativa o loopback.
+Caminhos do host são montados no mesmo caminho canônico dentro do sandbox, exceto `${tmp}`, que é o `/tmp` interno. `--unshare-all` cria namespaces de rede, PID, IPC, UTS, cgroup e usuário; o bubblewrap ativa o loopback.
+
+No Fedora Atomic:
+
+- Montagens usam sempre o caminho canônico (`/var/home/<usuário>/...`). Para cada um de `/home`, `/opt`, `/srv`, `/mnt` e `/root` que no host seja symlink para `var/...`, o sandbox recebe o mesmo symlink (`--symlink var/home /home` etc.). Assim, `/home/<usuário>/Projetos/x` funciona dentro do sandbox quando o caminho canônico está montado; o resto de `/var` continua invisível.
+- `/etc/crypto-policies` e `/etc/nsswitch.conf` são necessários para o OpenSSL do Fedora (git, curl).
+- Pacotes sobrepostos com `rpm-ostree` aparecem em `/usr` e ficam disponíveis no sandbox. Toolchains em `$HOME` entram só por `[sandbox.toolchains]`.
+- SELinux: processos do usuário rodam como `unconfined_t`, e o bubblewrap funciona sem política extra. O `doctor` reporta negações que afetem o sandbox quando conseguir detectá-las.
+
+Sandbox aninhado: os testes do próprio core que criam sandboxes reais, rodados dentro de uma sessão Fictor, dependem de user namespaces aninhados. Até a Fase 3 isso DEVERIA funcionar; o seccomp da Fase 3 nega `unshare`. Esses testes DEVEM continuar executáveis fora do Fictor (terminal e CI). A Fase 3 decide, por ADR, se haverá permissão para sandbox aninhado.
 
 `fictor __sandbox-init` roda como PID 1 dentro do sandbox:
 
@@ -104,50 +115,13 @@ Caminhos do host são montados no mesmo caminho dentro do sandbox, exceto `${tmp
 
 Até a Fase 3, `spawn: false` só é aplicado pelo Deno (`--allow-run` ausente). Para `node` e `python` é apenas declarativo. Isso DEVE aparecer na UI de aprovação.
 
-### macOS (Seatbelt)
-
-O supervisor gera um perfil SBPL por instância e executa `/usr/bin/sandbox-exec -p <perfil> -- <comando>`. Estrutura (ilustrativa; partir da política base auditada do Codex ou do sandbox-runtime e validar):
-
-```scheme
-(version 1)
-(deny default)
-; base: sysctl-read, mach-lookup necessários, leitura de /usr, /System, /Library, /private/etc, dyld
-(allow process-exec (literal "<binário do runtime>"))
-(allow process-fork)                                   ; só se spawn
-(allow process-exec)                                   ; só se spawn
-(allow file-read* (subpath "<dir do runtime>") (subpath "<bundle>"))
-(allow file-read* (subpath "<cada fs.read>"))
-(allow file-read* file-write* (subpath "<ext_data>") (subpath "<tmp>") (subpath "<cada fs.write>"))
-(allow network-outbound (remote tcp "localhost:<porta do proxy>"))
-(allow network-outbound (remote unix-socket (path-literal "<socket do kernel>")))
-```
-
-`${tmp}` no macOS é `$TMPDIR/fictor/<instance_id>`, removido só depois que a árvore da instância estiver vazia ([02-core.md](02-core.md#encerramento)).
-
-`sandbox-exec` é uma API depreciada pela Apple, mas é usada por Codex e Claude Code. Monitorar e manter o tier `vm` como alternativa.
-
-#### Contenção de processos no macOS
-
-O macOS não tem namespace de PID. Com `spawn: true`, um descendente pode chamar `setsid()`, trocar de grupo ou ficar órfão e ser adotado pelo `launchd`. O Seatbelt continua aplicado a ele, mas o processo sobreviveria ao encerramento por grupo.
-
-- **Identidade pelo perfil.** Um processo pertence à instância se todas as condições valerem:
-  1. tem o mesmo UID do core;
-  2. está sob sandbox: `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)` retorna 1;
-  3. o perfil dele permite escrever no caminho exclusivo `${tmp}/.instance`: `sandbox_check(pid, "file-write-data", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, <caminho>)` retorna 0.
-
-  Essa identidade não muda com `setsid`, troca de grupo, orfandade ou limpeza do ambiente, porque o perfil é herdado e não pode ser trocado.
-- **Varredura.** Listar os processos do UID (`proc_listpids`) e aplicar o teste. No encerramento, repetir até não sobrar membro, por até 10 s, enviando SIGKILL a cada membro. Antes de cada sinal, testar de novo o mesmo PID, para não atingir um PID reutilizado.
-- **`spawn: false`.** O perfil nega `process-fork` e só permite `process-exec` do binário do runtime, então a árvore tem um único processo.
-- **Rede e kernel.** Os tokens são revogados antes dos sinais. Um processo que escape fica sem proxy e sem kernel.
-- **Validação.** `sandbox_check` é exportada pela `libsystem_sandbox`, mas não é documentada pela Apple. O implementador DEVE validá-la em cada versão suportada do macOS com o teste adversarial do roadmap. Se ela ficar indisponível, o fallback é rastrear por ancestralidade (`kqueue` com `NOTE_FORK`/`NOTE_EXIT` e `proc_listchildpids`). Nesse caso, o `doctor` avisa e a fuga vira risco residual.
-
 ### Tiers de isolamento
 
 | Tier | Mecanismo | Fase | Uso |
 |---|---|---|---|
-| `os` | bubblewrap / Seatbelt | 0 | default |
+| `os` | bubblewrap | 0 | default |
 | `container` | podman rootless, com o mesmo proxy e init | 3 | dependências de sistema pesadas, imagens OCI de MCP |
-| `vm` | podman com runtime krun (Linux), Apple `container` (macOS) | 4 | computer use, tarefas estilo Cowork, código de alto risco |
+| `vm` | podman com runtime krun | 4 | computer use, tarefas estilo Cowork, código de alto risco |
 
 ## Proveniência
 
@@ -318,7 +292,5 @@ Senão, o resultado é `untrusted`. Valores fechados não carregam instruções;
 | Rede com prefixo NAT64 específico não configurado: o IPv4 embutido não é avaliado e pode alcançar um destino privado via gateway | `fictor doctor` detecta e sugere `[egress] nat64_prefixes`; o prefixo bem conhecido e o de uso local já são cobertos | — |
 | Segredo via env visível para a extensão | Allowlist de rede obrigatória; injeção no proxy | 3 |
 | `spawn: false` não aplicado para node/python no Linux | Documentado na aprovação; seccomp | 3 |
-| Seatbelt depreciado | Tier `vm` | 4 |
-| macOS: sem `sandbox_check` utilizável, um descendente que se separe entre duas varreduras escapa do encerramento (continua sob Seatbelt, sem rede e sem kernel) | Identidade pelo perfil; fallback por ancestralidade; varredura no boot | 0 |
 | Instruções maliciosas dentro de skills | Revisão no pipeline; skills só de bundles promovidos | 3 |
 | Fadiga de aprovação | Grants por sessão; motivo explícito; modo `auto` com Rule of Two | — |

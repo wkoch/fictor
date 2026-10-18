@@ -141,6 +141,7 @@
           "items": { "type": "string", "pattern": "^(\\*|[a-z0-9][a-z0-9-]*)$" }
         },
         "spawn": { "type": "boolean", "default": false },
+        "toolchains": { "type": "boolean", "default": false, "description": "Recebe [sandbox.toolchains] do config. Exige scope session." },
         "secrets": {
           "type": "array",
           "items": {
@@ -188,6 +189,14 @@
     {
       "if": { "required": ["hooks"] },
       "then": { "required": ["hooks_api"] }
+    },
+    {
+      "description": "Toolchains só em instâncias de sessão.",
+      "if": {
+        "properties": { "permissions": { "properties": { "toolchains": { "const": true } }, "required": ["toolchains"] } },
+        "required": ["permissions"]
+      },
+      "then": { "properties": { "scope": { "const": "session" } }, "required": ["scope"] }
     },
     {
       "description": "Sem processo: só skills, commands, tests e evals.",

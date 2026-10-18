@@ -43,7 +43,7 @@ Exemplo completo:
 [ext.harness]
 default_model = "main"
 max_iterations = 50            # chamadas ao modelo por turno
-compaction_threshold = 0.8     # fração da janela de contexto (Fase 1)
+compaction_threshold = 0.8     # fração da janela de contexto
 
 [ext.harness.models.main]
 provider = "anthropic"         # id em [providers]
@@ -100,7 +100,7 @@ type HMessage =
 
 3. **Tools**: `tools.list` mais as tools locais do harness.
 4. Hook `context.assemble` (pipeline) sobre `{system, messages, tools}`.
-5. Se a estimativa de tokens (caracteres ÷ 4, ou contagem do provider quando disponível) passar de `compaction_threshold × context_window`, compactar antes (Fase 1). Na Fase 0, truncar as mensagens mais antigas e avisar via `status`.
+5. Se a estimativa de tokens (caracteres ÷ 4, ou contagem do provider quando disponível) passar de `compaction_threshold × context_window`, compactar antes ([Compactação](#compactação-v01)).
 
 ### Adapters de provider
 
@@ -156,7 +156,7 @@ Tools executadas dentro do harness. Regra: elas só gravam no event log ou chama
 | `propose_extension` | 1 | `{dir, note?}` | Lê o diretório (relativo ao workspace; ignora os mesmos diretórios do recebimento, ver [06-lifecycle.md](06-lifecycle.md#1-recebimento)), chama `ext.propose` e acompanha `ext.proposal_status` por até 120 s. Devolve o estado final ou "aguardando aprovação", com os motivos de falha das checagens para o modelo corrigir. |
 | `delegate` | 2 | `{prompt, title?, model?}` | Chama `sessions.delegate` e devolve o texto final do subagente. |
 
-### Compactação (Fase 1)
+### Compactação (v0.1)
 
 1. Escolher o intervalo: do início (ou da compactação anterior) até antes dos últimos 4 turnos de usuário.
 2. `hooks.invoke("compact", collect, {event_ids})`. Se algum hook devolver `summary`, usar.
@@ -195,6 +195,7 @@ runtime: { kind: deno, entry: server.ts }
 permissions:
   fs: { read: ["${workspace}"], write: ["${workspace}"] }
   spawn: true
+  toolchains: true
 tools:
   read_file:  { effect: read,        sensitivity: private, output_trust: workspace }
   list_dir:   { effect: read,        sensitivity: private, output_trust: workspace }
@@ -230,6 +231,7 @@ permissions:
   fs: { read: ["${workspace}"], write: ["${workspace}"] }
   net: { allow: ["*"] }
   spawn: true
+  toolchains: true
 tools:
   bash_network: { effect: external, sensitivity: private, output_trust: untrusted, timeout_ms: 600000 }
 ```

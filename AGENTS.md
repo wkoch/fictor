@@ -38,8 +38,10 @@ Build do shell: `deno task build` em `shell/` (Vite via `npm:vite`). Desenvolvim
 
 - Unitários junto ao código. Integração do core em `core/tests/`. Aceitação de ponta a ponta em `tests/acceptance/` (Deno), dirigindo o core pelo WebSocket e pelo socket admin.
 - **Sem chaves reais nem rede externa nos testes.** Use um provider falso: servidor HTTP local que imita o streaming das APIs Anthropic e OpenAI com respostas roteirizadas. Configure-o como provider com `base_url = "http://127.0.0.1:<porta>"`.
-- Testes de sandbox são por plataforma (`#[cfg(target_os = "linux")]` / `"macos"`). Ao mexer em `core/src/sandbox/`, rode nas duas plataformas ou avise que só uma foi testada.
-- O usuário roda Fedora Atomic (COSMIC) e macOS (Apple Silicon).
+- **Plataforma única: Linux x86-64; alvo validado: Fedora COSMIC Atomic** ([ADR-030](spec/11-decisions.md#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic)). Não escreva código, testes nem CI para macOS ou Windows. Remova o que já existir para macOS.
+- **Onde os testes contam.** Build e testes do core só valem como evidência quando rodam em Linux x86-64: na máquina Fedora do usuário (por SSH) ou na CI (Ubuntu 22.04 x86-64 e container Fedora). Testes unitários de TypeScript podem rodar no Mac. Ao reportar, diga onde cada suíte rodou; nunca declare o core testado só com execução no Mac.
+- **Gate de release:** os critérios de aceitação passando na máquina Fedora COSMIC Atomic do usuário ([spec/10-roadmap.md](spec/10-roadmap.md#gate-de-cada-release)).
+- **Prioridade atual:** chegar à v0.1 autossuficiente ([spec/10-roadmap.md](spec/10-roadmap.md#marco-de-autossuficiência-v01)). Depois dela, o desenvolvimento continua de dentro do próprio Fictor.
 
 ## Convenções
 

@@ -17,26 +17,27 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 
 1. Resolver o bundle ativo no lock (`store/<id>/<key>/`).
 2. Resolver as permissões do manifest em um `SandboxProfile` ([05-security.md](05-security.md#perfil-de-sandbox)), expandindo templates de caminho.
-3. Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel. No Linux, `__sandbox-init` expõe esse socket dentro do sandbox como TCP em `127.0.0.1:3129` ([05-security.md](05-security.md#linux-bubblewrap)).
+3. Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel. `__sandbox-init` expõe esse socket dentro do sandbox como TCP em `127.0.0.1:3129` ([05-security.md](05-security.md#linux-bubblewrap)).
 4. Montar o ambiente do zero (nada herdado do usuário). Recusar o spawn se `permissions.env` ou `permissions.secrets[].env` usar nome reservado ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)); a validação principal ocorre no pipeline, esta é a segunda barreira.
 
 | Variável | Valor |
 |---|---|
-| `PATH` | binários do runtime + `/usr/bin:/bin` (+ `/usr/local/bin`, `/opt/homebrew/bin` no macOS se existirem) |
+| `PATH` | diretórios de `[sandbox.toolchains].path` (só com `permissions.toolchains: true`) + binários do runtime + `/usr/bin:/bin` |
 | `HOME` | diretório temporário da instância (`${tmp}/home`) |
 | `TMPDIR` | `${tmp}` |
-| `LANG` | `C.UTF-8` (Linux) ou `en_US.UTF-8` (macOS) |
+| `LANG` | `C.UTF-8` |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` e minúsculas | `http://fx:<proxy_token>@127.0.0.1:<porta>` |
 | `NO_PROXY`, `no_proxy` | vazio |
 | `NODE_USE_ENV_PROXY` | `1` |
 | `FICTOR_EXT_ID`, `FICTOR_INSTANCE_ID` | identidade |
 | `FICTOR_SESSION_ID`, `FICTOR_WORKSPACE` | só para instâncias de sessão |
-| `FICTOR_KERNEL_URL`, `FICTOR_KERNEL_TOKEN` | só se houver escopos de kernel. Linux: `tcp://127.0.0.1:3129`. macOS: `unix://<caminho absoluto do socket>` |
+| `FICTOR_KERNEL_URL`, `FICTOR_KERNEL_TOKEN` | só se houver escopos de kernel; URL `tcp://127.0.0.1:3129` |
 | `FICTOR_MODELS_URL` | `http://models.fictor.internal/p` se `permissions.models` não for vazio |
 | variáveis de `permissions.env` | valores estáticos do manifest |
 | variáveis de `permissions.secrets` | ver [05-security.md](05-security.md#segredos) |
+| variáveis de `[sandbox.toolchains].env` | só com `permissions.toolchains: true`, com templates expandidos |
 
-5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no backend de sandbox da plataforma.
+5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap.
 6. Conectar stdin/stdout ao cliente MCP (se `mcp: true`). Stderr vai para `logs/ext/<ext_id>.log`, com rotação a 10 MiB.
 7. Gravar o evento `ext.started` na sessão `sys`.
 
@@ -47,14 +48,11 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 3. Aguardar 2 s e enviar SIGKILL à árvore.
 4. Confirmar que a árvore está vazia. Só então liberar `${tmp}`, os sockets e o slot da instância.
 
-A árvore da instância é:
-
-- **Linux:** o namespace de PID. Quando `__sandbox-init` (PID 1) morre, o kernel mata todos os processos do namespace. A confirmação é a saída do `bwrap`.
-- **macOS:** os processos identificados pelo perfil Seatbelt da instância ([05-security.md](05-security.md#contenção-de-processos-no-macos)). Grupo de processos não basta.
+A árvore da instância é o namespace de PID. Quando `__sandbox-init` (PID 1) morre, o kernel mata todos os processos do namespace, inclusive os que chamaram `setsid()`. A confirmação é a saída do `bwrap`.
 
 Sem confirmação em 10 s: a instância fica `cleanup_failed`, o core grava `ext.cleanup_failed` na sessão `sys`, retém os recursos, mantém os tokens revogados e alerta no shell. Uma nova instância da mesma extensão pode subir, com identidade nova.
 
-O mesmo procedimento roda quando o processo raiz sai sozinho (crash) e, no boot do core, para cada `${tmp}` de instância que tenha sobrado de uma execução anterior.
+O mesmo procedimento roda quando o processo raiz sai sozinho (crash). Se o core morrer, `--die-with-parent` encerra os sandboxes; no boot seguinte, o core remove sockets e diretórios de instância que sobraram.
 
 ### Falhas
 
@@ -77,6 +75,8 @@ Ao promover uma versão nova:
 
 - Arquivo `fictor.db`, `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`.
 - Migrações em `core/migrations/NNNN_nome.sql`, aplicadas no boot dentro de uma transação, controladas por `PRAGMA user_version`. A migração inicial é [schemas/0001_init.sql](schemas/0001_init.sql).
+- Antes de aplicar qualquer migração, o core copia o banco para `fictor.db.bak-<user_version atual>` (API de backup do SQLite, 0600) e mantém as 3 cópias mais recentes. Migrações só avançam; não existe migração reversa.
+- Se `user_version` for maior que a última migração que o binário conhece, o core não sobe e explica: um binário antigo nunca abre um banco de versão mais nova. Para voltar um binário, restaure também o backup correspondente.
 - Escritas serializadas por uma única task (fila tokio). Leituras usam um pequeno pool de conexões somente leitura.
 
 ### Eventos
@@ -162,8 +162,7 @@ Um único proxy HTTP no core.
 
 ### Escuta
 
-- Linux: Unix socket `run/proxy.sock`. Dentro do sandbox, `__sandbox-init` escuta em `127.0.0.1:3128` e repassa para o socket montado em `/fx/proxy.sock`.
-- macOS: TCP em `127.0.0.1:<porta aleatória>`. O perfil Seatbelt só permite saída para essa porta.
+- Unix socket `run/proxy.sock`. Dentro do sandbox, `__sandbox-init` escuta em `127.0.0.1:3128` e repassa para o socket montado em `/fx/proxy.sock`.
 
 ### Autenticação
 
@@ -261,7 +260,7 @@ Gravado uma única vez, ao final, para toda requisição autenticada que chegou 
 ## Segredos
 
 - **Backend explícito:** `[secrets] backend = "keyring"` (default) ou `"file"`. Nunca há fallback automático entre backends nem cópia de segredos do keyring para disco.
-- **`keyring`:** crate `keyring` (Secret Service no Linux, Keychain no macOS), serviço `fictor`, conta = nome do segredo.
+- **`keyring`:** crate `keyring` via Secret Service (D-Bus), serviço `fictor`, conta = nome do segredo. Se a sessão COSMIC não tiver um provedor de Secret Service ativo, usar `backend = "file"` ou instalar um provedor (ex.: `gnome-keyring`).
   - Backend ausente (por exemplo, sem Secret Service): `fictor doctor` e `fictor secrets` falham com mensagem que sugere `backend = "file"`.
   - Backend presente mas bloqueado, ou com erro transitório: a operação falha e pode ser repetida depois. O model proxy responde 503 `fictor_secret_unavailable`. O arquivo nunca é usado como alternativa.
 - **`file`:** `$FICTOR_HOME/secrets.toml`, do próprio usuário, modo 0600. O core recusa ler se o dono for outro ou o modo for mais aberto. Formato:
@@ -353,6 +352,11 @@ idle_timeout_min = 30
 [sandbox]
 home_ro_files = ["~/.gitconfig"] # arquivos do HOME real montados só leitura em instâncias de sessão
 
+[sandbox.toolchains]             # só para extensões com permissions.toolchains = true
+mounts = ["~/.rustup", "~/.cargo/bin", "~/.deno"]   # somente leitura; caminho sensível é recusado
+path = ["~/.cargo/bin", "~/.deno/bin"]              # prefixados ao PATH
+env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "${workspace}/.fictor/cargo" }   # sem nomes reservados
+
 [installer]
 registries = ["jsr.io", "registry.npmjs.org", "deno.land", "pypi.org", "files.pythonhosted.org"]
 trusted_packages = ["jsr:@std/*", "npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
@@ -377,18 +381,19 @@ Seções `[ext.<id>]` são opacas para o core e só legíveis pela extensão `<i
 
 ## CLI
 
-Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets` e `serve`.
+Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext rollback|enable|disable`; estes três editam o lock diretamente, para recuperar o sistema mesmo com o core parado.
 
 | Comando | Fase | Função |
 |---|---|---|
 | `fictor init [--first-party <repo>]` | 0 | Cria `FICTOR_HOME`, config, banco, sessão `sys`; instala bundles first-party do repositório com confirmação. |
-| `fictor doctor` | 0 | Verifica sandbox (bwrap/userns ou sandbox-exec), runtimes, keyring, portas. |
+| `fictor doctor` | 0 | Verifica bubblewrap e user namespaces, SELinux, runtimes, toolchains vistas de dentro do sandbox, keyring e portas. |
 | `fictor serve [--open] [--shell-dir <dir>]` | 0 | Sobe o core e imprime a URL de login com token único. `--shell-dir` serve assets do disco (desenvolvimento). |
 | `fictor secrets set\|list\|rm <nome>` | 0 | Gerencia segredos. `list` mostra só nomes. |
+| `fictor login` | 0 | Pede ao core em execução uma URL de login nova, com token de uso único. Útil quando o core roda como serviço systemd de usuário. |
 | `fictor ext list` | 0 | Extensões, versões ativas, estado. |
 | `fictor ext install <caminho> [--yes]` | 0 | Proposta de origem `local`; mostra permissões e pede confirmação no TTY. |
 | `fictor ext enable\|disable <id>` | 0 | Liga ou desliga no lock. |
-| `fictor ext rollback <id> [--to <key>]` | 1 | Volta para a versão anterior (ou a indicada). |
+| `fictor ext rollback <id> [--to <key>]` | 0 | Volta para a versão anterior (ou a indicada). |
 | `fictor ext remove <id> [--purge-data]` | 1 | Remove do lock; store e dados ficam até `gc`/`--purge-data`. |
 | `fictor proposal list\|show\|approve\|reject <id>` | 1 | Revisão de propostas pela CLI. |
 | `fictor ext add git\|mcp\|skill\|claude-plugin <ref>` | 3 | Importação de terceiros. |

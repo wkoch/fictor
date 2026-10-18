@@ -50,7 +50,7 @@ Regras:
 | Navegador ↔ core | HTTP + WebSocket em `127.0.0.1` | UI confiável, eventos, aprovações. Ver [08-shell.md](08-shell.md). |
 | Navegador ↔ surfaces | iframe em `localhost` (host diferente), postMessage | UI de extensões (MCP Apps). |
 | Core ↔ extensão (MCP) | stdio, JSON-RPC delimitado por linha (transporte stdio do MCP) | tools, resources, hooks. O core é o cliente MCP. |
-| Core ↔ extensão (Kernel Protocol) | Unix socket por instância no host. No Linux, `__sandbox-init` o expõe dentro do sandbox como TCP em `127.0.0.1:3129`; no macOS a extensão conecta ao socket. JSON-RPC delimitado por linha. | serviços do kernel. Ver [03-kernel-protocol.md](03-kernel-protocol.md#transporte). |
+| Core ↔ extensão (Kernel Protocol) | Unix socket por instância no host, exposto dentro do sandbox por `__sandbox-init` como TCP em `127.0.0.1:3129`. JSON-RPC delimitado por linha. | serviços do kernel. Ver [03-kernel-protocol.md](03-kernel-protocol.md#transporte). |
 | Extensão → internet | HTTP(S) via egress proxy do core | allowlist por domínio, log, contaminação. |
 | Extensão → modelo | HTTP via proxy para o host interno `models.fictor.internal` | o core injeta a chave e repassa via TLS. |
 | CLI ↔ core | Unix socket `run/admin.sock` (0600) | comandos administrativos. |
@@ -82,7 +82,7 @@ fictor/
 │       ├── config.rs
 │       ├── store/            events, sessions, blobs, kv, approvals, proposals, timers
 │       ├── supervisor.rs     ciclo de vida dos processos de extensão
-│       ├── sandbox/          linux.rs (bubblewrap), macos.rs (Seatbelt), init.rs (__sandbox-init)
+│       ├── sandbox/          linux.rs (bubblewrap), init.rs (__sandbox-init)
 │       ├── proxy/            egress.rs, models.rs
 │       ├── gateway/          cliente MCP, registro de tools, fan-out de hooks
 │       ├── kernel/           servidor do Kernel Protocol
@@ -102,10 +102,7 @@ Um crate único com módulos. Dividir em crates só quando houver motivo concret
 
 ## Diretório de dados
 
-`FICTOR_HOME`, com default:
-
-- Linux: `$XDG_DATA_HOME/fictor` ou `~/.local/share/fictor`
-- macOS: `~/Library/Application Support/fictor`
+`FICTOR_HOME`, com default `$XDG_DATA_HOME/fictor` ou `~/.local/share/fictor` (no Fedora Atomic, `/var/home/<usuário>/.local/share/fictor`).
 
 ```text
 $FICTOR_HOME/
@@ -143,10 +140,22 @@ Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da próp
 
 ## Plataformas
 
-| Plataforma | Status | Sandbox |
-|---|---|---|
-| Linux (Fedora Atomic, outras com userns sem restrição) | primeira classe | bubblewrap + namespaces; Landlock e seccomp na Fase 3 |
-| macOS (Apple Silicon) | primeira classe | Seatbelt (`sandbox-exec`) |
-| Windows | via WSL2 | o da build Linux |
+Só Linux x86-64 ([ADR-030](11-decisions.md#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic)). O core não compila em outro SO ou arquitetura.
 
-Ubuntu 24.04+ restringe user namespaces via AppArmor. `fictor doctor` DEVE detectar e explicar.
+| Ambiente | Papel |
+|---|---|
+| Fedora COSMIC Atomic, versão estável corrente, x86-64 (máquina do usuário) | Alvo único validado e gate de toda release. |
+| Ubuntu 22.04 x86-64 (CI) | Roda todos os testes, inclusive de sandbox real. Necessário, mas não substitui o Fedora. |
+| Container Fedora da versão alvo (CI) | Build e testes que não criam sandbox. |
+| Outras distros Linux x86-64 | Podem funcionar; não são testadas. |
+
+Sandbox: bubblewrap + namespaces; Landlock e seccomp na Fase 3. `fictor doctor` DEVE detectar e explicar user namespaces bloqueados (por exemplo, AppArmor no Ubuntu 24.04+).
+
+### Fedora COSMIC Atomic
+
+- `/usr` é imutável. Pacotes do sistema (como `gcc` e `git`) entram por `rpm-ostree install` e aparecem em `/usr`, que o sandbox monta só leitura.
+- Toolchains do usuário (rustup, cargo, deno, uv) ficam em `$HOME` e entram no sandbox por `[sandbox.toolchains]` ([02-core.md](02-core.md#configuração)).
+- `/home`, `/opt`, `/srv`, `/mnt`, `/root` e `/usr/local` são symlinks para `/var/...`. O core trabalha com caminhos canônicos e recria esses symlinks dentro do sandbox ([05-security.md](05-security.md#linux-bubblewrap)).
+- SELinux fica em modo enforcing. O core não exige mudanças de política; `fictor doctor` reporta negações (AVC) que afetem o sandbox.
+- Toolbox e distrobox não são usados pelo Fictor.
+- Navegador alvo do shell: Firefox, o padrão do Fedora.

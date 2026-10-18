@@ -10,7 +10,7 @@ Fictor é um runtime pessoal de agentes de IA. O core é um kernel de confiança
 
 | ID | Requisito |
 |---|---|
-| R1 | Core minimalista e multiplataforma (Linux e macOS de primeira classe). |
+| R1 | Core minimalista para Linux x86-64. Alvo atual e único validado: Fedora COSMIC Atomic ([ADR-030](11-decisions.md#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic)). |
 | R2 | A IA cria funcionalidades novas e o app passa a usá-las sem reiniciar. |
 | R3 | Qualquer funcionalidade de concorrentes (Claude Code, Codex, Cowork, Pi, Kimi, DeepSeek etc.) é implementável sem alterar o core. |
 | R4 | Compatibilidade com padrões: MCP, MCP Apps, Agent Skills, AGENTS.md. Inventar só onde não há padrão. |
@@ -92,7 +92,7 @@ Ordem de leitura para implementar: README → 01 → 10 → o arquivo da fase/co
 
 - Múltiplos usuários, contas ou sincronização em nuvem.
 - App nativo mobile ou desktop (Tauri, Electron). A UI é só web.
-- Windows nativo. Windows roda via WSL2.
+- macOS, Windows (inclusive WSL2) e Linux ARM64. Outras distros Linux x86-64 não são testadas.
 - Acesso remoto à UI (fora de localhost).
 - Distribuição de extensões via OCI e protocolo A2A.
 - Bancos especializados no core (vetorial, grafo, séries temporais). Extensões podem trazer os seus.
@@ -115,8 +115,8 @@ Verificar a versão vigente de cada padrão no início da implementação e regi
 | ACP (Fase 4) | https://agentclientprotocol.com |
 | Permissões do Deno | https://docs.deno.com/runtime/fundamentals/security/ |
 | uv | https://docs.astral.sh/uv/ |
-| Referência de sandbox | https://github.com/anthropic-experimental/sandbox-runtime (bubblewrap/Seatbelt + proxy) |
-| Referência de sandbox | https://github.com/openai/codex (`codex-rs`: Landlock/seccomp, Seatbelt) |
+| Referência de sandbox | https://github.com/anthropic-experimental/sandbox-runtime (bubblewrap + proxy) |
+| Referência de sandbox | https://github.com/openai/codex (`codex-rs`: Landlock/seccomp) |
 | Agents Rule of Two | Meta AI, "Agents Rule of Two: A Practical Approach to AI Agent Security" (2025) |
 | CaMeL | Google DeepMind, "Defeating Prompt Injections by Design" (2025) |
 | OSV | https://osv.dev |

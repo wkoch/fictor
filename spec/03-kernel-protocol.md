@@ -5,10 +5,8 @@ Protocolo entre o core e extensões para serviços do kernel. Ferramentas, resou
 ## Transporte
 
 - JSON-RPC 2.0, uma mensagem JSON UTF-8 por linha.
-- Endereço em `FICTOR_KERNEL_URL`, token em `FICTOR_KERNEL_TOKEN`.
-  - macOS: `unix://<caminho absoluto>`, o Unix socket da instância.
-  - Linux: `tcp://127.0.0.1:3129`. `__sandbox-init` escuta nesse endereço, dentro do namespace de rede isolado da instância, e repassa para o Unix socket da instância. Assim a carga de trabalho não precisa de sockets Unix por caminho, e a Fase 3 pode bloqueá-los com seccomp ([05-security.md](05-security.md#linux-bubblewrap)).
-  - O SDK DEVE aceitar os dois esquemas.
+- Endereço em `FICTOR_KERNEL_URL` (sempre `tcp://127.0.0.1:3129`), token em `FICTOR_KERNEL_TOKEN`.
+- `__sandbox-init` escuta nesse endereço, dentro do namespace de rede isolado da instância, e repassa para o Unix socket da instância no host. Assim a carga de trabalho não precisa de sockets Unix por caminho, e a Fase 3 pode bloqueá-los com seccomp ([05-security.md](05-security.md#linux-bubblewrap)).
 - Tamanho máximo de mensagem: 16 MiB.
 - A primeira requisição DEVE ser `kernel.hello`. Antes dela, qualquer outra requisição recebe `UNAUTHENTICATED` e a conexão é fechada.
 - Só existe canal se o manifest declarar pelo menos um escopo em `kernel`.

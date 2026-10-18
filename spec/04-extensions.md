@@ -16,7 +16,7 @@ Uma extensão é um bundle (diretório) com um manifest `fictor.yaml` na raiz. E
 └── evals/               casos de eval (Fase 2)
 ```
 
-Restrições: sem symlinks, sem arquivos especiais, sem `..` em caminhos, nomes em UTF-8 válido e sem colisão entre caminhos que diferem só em maiúsculas/minúsculas ou normalização Unicode. Limites de entradas, bytes, profundidade e tempo em [06-lifecycle.md](06-lifecycle.md#limites).
+Restrições: sem symlinks, sem arquivos especiais, sem `..` em caminhos, nomes em UTF-8 válido. Limites de entradas, bytes, profundidade e tempo em [06-lifecycle.md](06-lifecycle.md#limites).
 
 ## Manifest
 
@@ -143,9 +143,9 @@ Flags do Deno derivadas das permissões (o sandbox do SO continua sendo a fronte
 
 | Permissão | Flag |
 |---|---|
-| `fs.read` | `--allow-read=<bundle>,<caminhos expandidos>` (+ socket do kernel no macOS) |
-| `fs.write` | `--allow-write=<caminhos expandidos>,${tmp}` (+ socket do kernel no macOS) |
-| `net.allow` ou `models` não vazios, ou escopos de kernel no Linux | `--allow-net=<hosts>` (inclui `models.fictor.internal` se `models` não vazio e `127.0.0.1:3129` se houver kernel no Linux) |
+| `fs.read` | `--allow-read=<bundle>,<caminhos expandidos>` (+ montagens de toolchains, se `toolchains: true`) |
+| `fs.write` | `--allow-write=<caminhos expandidos>,${tmp}` |
+| `net.allow` ou `models` não vazios, ou escopos de kernel | `--allow-net=<hosts>` (inclui `models.fictor.internal` se `models` não vazio e `127.0.0.1:3129` se houver kernel) |
 | `spawn: true` | `--allow-run` |
 | env | `--allow-env` (o ambiente já é construído pelo core) |
 | sempre | sem `--allow-ffi`, sem `--allow-sys` |
@@ -183,6 +183,7 @@ Regras de validação por escopo (bloqueantes no pipeline):
 | `spawn` | bool | Pode criar subprocessos (dentro do mesmo sandbox). |
 | `secrets` | `{name, env}[]` | Segredo injetado como variável de ambiente. Ver [05-security.md](05-security.md#segredos). |
 | `env` | mapa | Variáveis estáticas. Não podem usar nomes reservados. |
+| `toolchains` | bool | Recebe as montagens, o `PATH` e as variáveis de `[sandbox.toolchains]` do config ([02-core.md](02-core.md#configuração)). Exige `scope: session`. Nunca entra no perfil dev. |
 
 ### Variáveis de ambiente reservadas
 
@@ -315,7 +316,7 @@ export default defineExtension({
 Responsabilidades do SDK:
 
 - Subir o servidor MCP no stdio e registrar tools, hooks (`hook_*`) e resources.
-- Conectar ao Kernel Protocol se `FICTOR_KERNEL_URL` existir (esquemas `tcp:` e `unix:`) e expor `ctx.kv`, `ctx.events`, `ctx.ui`, `ctx.timers`, `ctx.tools` conforme os escopos.
+- Conectar ao Kernel Protocol se `FICTOR_KERNEL_URL` existir e expor `ctx.kv`, `ctx.events`, `ctx.ui`, `ctx.timers`, `ctx.tools` conforme os escopos.
 - `ctx.exec`: subprocesso com timeout e truncamento de saída.
 - Validar que hooks implementados batem com `hooks` do manifest na inicialização.
 

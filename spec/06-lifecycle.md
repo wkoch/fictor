@@ -34,7 +34,7 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 
 - Percorrer a origem de forma iterativa e copiar para `quarantine/<proposal_id>/`.
 - **Ignorados**: não são percorridos, não contam nos limites e aparecem na lista de ignorados da proposta. São eles `.git/` em qualquer nível, `__pycache__/` em qualquer nível e, na raiz do bundle, `node_modules/`, `vendor/`, `.deno/`, `.pydeps/` e `.venv/`. Dependências sempre vêm da etapa 3.
-- **Recusados** (proposta `failed`): symlinks; arquivos especiais; caminhos absolutos ou com `..`; nomes que não sejam UTF-8 válido ou que contenham caracteres de controle ou `\`; dois caminhos que colidem depois de normalização NFC e conversão para minúsculas. Este último garante o mesmo store em Linux e macOS.
+- **Recusados** (proposta `failed`): symlinks; arquivos especiais; caminhos absolutos ou com `..`; nomes que não sejam UTF-8 válido ou que contenham caracteres de controle ou `\`.
 - Diretórios vazios não entram no bundle.
 - O percurso conta entradas e bytes enquanto avança e para no primeiro limite excedido ([Limites](#limites)). A ordenação para o hash só acontece depois, com o percurso já dentro dos limites; assim, memória e tempo ficam limitados pelos tetos.
 - Origens remotas (Fase 3): o core resolve a referência para um SHA de commit (`git ls-remote`) ou versão exata de pacote e baixa nessa versão. O download roda num sandbox com rede só para o host de origem.
@@ -118,7 +118,8 @@ Código ainda não aprovado (smoke, testes, execução comportamental e evals de
 | `${workspace}` | Diretório temporário vazio, ou cópia de `tests/fixtures/workspace/` do bundle, se existir. |
 | `${ext_data}`, `${tmp}` | Temporários vazios. |
 | `${store}` | O store temporário. |
-| Caminhos absolutos e `~/` de `fs.read`/`fs.write` | Não concedidos. No Linux o caminho não existe no namespace; no macOS o Seatbelt nega o acesso. Não há substituição por dados sintéticos. |
+| Caminhos absolutos e `~/` de `fs.read`/`fs.write` | Não concedidos: o caminho não existe no namespace. Não há substituição por dados sintéticos. |
+| Toolchains (`permissions.toolchains`) | Montadas normalmente, só leitura; `${workspace}` nas variáveis aponta para o workspace temporário. |
 | `sandbox.home_ro_files` | Não montados. |
 | Rede | Nenhuma: o proxy nega tudo e registra as tentativas. |
 | Model proxy | Nega tudo com 403 `{"error": "fictor_preapproval"}`. |
@@ -186,7 +187,7 @@ Promoção automática (`auto:dev-profile`) só se **todas** as condições vale
   - `permissions.net.allow`, `models` e `secrets` vazios;
   - `fs.write` ⊆ {`${ext_data}`, subcaminhos de `${ext_data}`}; `fs.read` ⊆ {`${workspace}`, `${ext_data}`} e subcaminhos;
   - `kernel` ⊆ {`kv`, `ui`, `timers`, `blobs`}, mais `events.read` se `scope: session`;
-  - `isolation: os`;
+  - `isolation: os` e `permissions.toolchains` ausente ou `false`;
 - nenhuma dependência nova;
 - todas as checagens bloqueantes passaram.
 
