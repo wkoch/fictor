@@ -394,6 +394,11 @@ impl McpConnection {
         if !self.pinned || self.is_disabled() {
             return Err(GatewayError::Unavailable);
         }
+        // A cancelled session must not acquire a fresh external side effect.
+        // Only requests already issued may receive notifications/cancelled.
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Err(GatewayError::Cancelled);
+        }
         self.catalog.validate_arguments(name, &arguments)?;
         let args = arguments
             .as_object()
@@ -628,7 +633,7 @@ mod tests {
                     let result=match method{
                         "initialize"=>{let _=seen.send(request.clone()).await;json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true},"resources":{}},"serverInfo":{"name":"fake","version":"1"}})},
                         "tools/list"=>json!({"tools":[tool(description)]}),
-                        "resources/list"=>json!({"resources":[]}),
+                        "resources/list"=>{let _=seen.send(request.clone()).await;json!({"resources":[]})},
                         "tools/call"=>{
                             let _=seen.send(request.clone()).await;
                             if request["params"]["arguments"]["text"]=="wait"{continue;}
@@ -729,6 +734,68 @@ mod tests {
         connection.shutdown().await.unwrap();
         fake.await.unwrap();
     }
+    #[tokio::test]
+    async fn cancellation_prevents_dispatch_and_notifies_only_an_inflight_request() {
+        let (_root, audit) = audit().await;
+        let (client, server) = tokio::io::duplex(65536);
+        let (_change, changes) = tokio::sync::mpsc::channel(1);
+        let (seen, mut received) = tokio::sync::mpsc::channel(8);
+        let fake = tokio::spawn(mock_server(server, changes, seen));
+        let (read, write) = tokio::io::split(client);
+        let connection = McpConnection::connect(
+            read,
+            write,
+            None,
+            Some(PinnedCatalog::new(vec![tool("fixed")]).unwrap()),
+            audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.recv().await.unwrap()["method"], "initialize");
+        for already_cancelled in [true, false] {
+            let (cancel, cancelled) = watch::channel(already_cancelled);
+            // A lost cancellation owner is also refused before dispatch.
+            let _owner = already_cancelled.then_some(cancel);
+            assert!(matches!(
+                connection
+                    .call(
+                        "echo",
+                        json!({"text":"wait"}),
+                        Duration::from_secs(2),
+                        cancelled
+                    )
+                    .await,
+                Err(GatewayError::Cancelled)
+            ));
+            // The reply is an ordered barrier: no tool call or spurious cancel
+            // notification may precede this later request at the server.
+            connection.resources().await.unwrap();
+            assert_eq!(received.recv().await.unwrap()["method"], "resources/list");
+        }
+        {
+            let (cancel, cancelled) = watch::channel(false);
+            let request = connection.call(
+                "echo",
+                json!({"text":"wait"}),
+                Duration::from_secs(2),
+                cancelled,
+            );
+            tokio::pin!(request);
+            let sent = tokio::select! {
+                result = &mut request => panic!("call completed before dispatch: {result:?}"),
+                request = received.recv() => request.unwrap(),
+            };
+            assert_eq!(sent["method"], "tools/call");
+            cancel.send(true).unwrap();
+            assert!(matches!(request.await, Err(GatewayError::Cancelled)));
+            let notification = received.recv().await.unwrap();
+            assert_eq!(notification["method"], "notifications/cancelled");
+            assert_eq!(notification["params"]["requestId"], sent["id"]);
+        }
+        connection.shutdown().await.unwrap();
+        fake.await.unwrap();
+    }
+
     #[tokio::test]
     async fn timeout_sends_mcp_cancelled_and_global_client_has_no_roots() {
         let (_root, audit) = audit().await;
