@@ -44,6 +44,7 @@ pub struct LocalReport {
     pub ignored: Vec<PathBuf>,
     pub catalog: PinnedCatalog,
 }
+#[derive(Clone)]
 pub struct LocalChecker {
     home: PathBuf,
     nat64: Nat64Prefixes,
@@ -70,6 +71,16 @@ impl LocalChecker {
     /// Receipt and validation failures before an extension can be identified
     /// return directly. Identified proposals persist every checking transition.
     pub async fn check_local(&self, source: &Path) -> Result<LocalReport, LocalError> {
+        // Dropping the caller must not strand an identified proposal in checking.
+        // This core-owned worker completes its bounded receipt/smoke independently.
+        let checker = self.clone();
+        let source = source.to_path_buf();
+        tokio::spawn(async move { checker.check_owned(&source).await })
+            .await
+            .map_err(|_| LocalError::Task)?
+    }
+
+    async fn check_owned(&self, source: &Path) -> Result<LocalReport, LocalError> {
         let pending = self
             .home
             .join("extensions/quarantine")
@@ -110,10 +121,24 @@ impl LocalChecker {
                 update_of,
             })
             .await?;
+        let mut checks = vec![
+            passed("manifest", None),
+            informative("receipt", json!({"ignored":receipt.ignored})),
+            informative(
+                "permissions",
+                json!({
+                    "requested":manifest.permissions,
+                    "omitted_fs": {
+                        "read":manifest.permissions.fs.read.iter().filter(|path| !path.starts_with("${")).collect::<Vec<_>>(),
+                        "write":manifest.permissions.fs.write.iter().filter(|path| !path.starts_with("${")).collect::<Vec<_>>()
+                    }
+                }),
+            ),
+        ];
         let destination = self.home.join("extensions/quarantine").join(&proposal.id);
         // Both parents are core-owned; the randomized receipt was created new.
         if let Err(error) = fs::rename(&pending, &destination) {
-            self.fail(&proposal.id, "receipt", "quarantine unavailable")
+            self.fail(&proposal.id, checks, "receipt", "quarantine unavailable")
                 .await?;
             return Err(error.into());
         }
@@ -121,7 +146,7 @@ impl LocalChecker {
         if let Err(error) =
             fs::File::open(self.home.join("extensions/quarantine")).and_then(|dir| dir.sync_all())
         {
-            self.fail(&proposal.id, "receipt", "quarantine sync failed")
+            self.fail(&proposal.id, checks, "receipt", "quarantine sync failed")
                 .await?;
             return Err(error.into());
         }
@@ -135,29 +160,37 @@ impl LocalChecker {
             .await?;
         // ADR-025: process-bearing global extensions await Phase-1 watermarking.
         if manifest.scope == Scope::Global && manifest.runtime.kind != RuntimeKind::None {
-            self.fail(&proposal.id, "phase", "phase:global").await?;
+            self.fail(&proposal.id, checks, "phase", "phase:global")
+                .await?;
             return Err(LocalError::Failed {
                 proposal_id: proposal.id,
                 reason: "phase:global",
             });
         }
         // Vendored directories were intentionally discarded at receipt. Never
-        // pretend Deno/npm/uv dependencies were checked until stage 3 exists.
-        if !matches!(
-            manifest.runtime.kind,
-            RuntimeKind::Binary | RuntimeKind::None
-        ) {
-            self.fail(
-                &proposal.id,
-                "dependencies",
-                "dependency resolver unavailable",
-            )
-            .await?;
+        // pretend npm/uv dependencies were checked until stage 3 exists.
+        // A prepacked Node bundle without package.json dependencies needs no npm resolver.
+        let dependency_failure = match manifest.runtime.kind {
+            RuntimeKind::Binary | RuntimeKind::None => None,
+            RuntimeKind::Node => match node_dependencies(&destination) {
+                Ok(false) => None,
+                Ok(true) => Some("dependency resolver unavailable"),
+                Err(reason) => Some(reason),
+            },
+            _ => Some("dependency resolver unavailable"),
+        };
+        if let Some(reason) = dependency_failure {
+            self.fail(&proposal.id, checks, "dependencies", reason)
+                .await?;
             return Err(LocalError::Failed {
                 proposal_id: proposal.id,
-                reason: "dependency resolver unavailable",
+                reason,
             });
         }
+        checks.push(passed(
+            "dependencies",
+            Some("no runtime dependency installation required".into()),
+        ));
         let inspected = destination.clone();
         let post = tokio::task::spawn_blocking(move || {
             bundle::inspect(
@@ -165,21 +198,31 @@ impl LocalChecker {
                 &BundleBudget::start(BundleProfile::PostDependencies),
             )
         })
-        .await
-        .map_err(|_| LocalError::Task)?;
+        .await;
         let post = match post {
-            Ok(post) => post,
-            Err(error) => {
-                self.fail(&proposal.id, "bundle", "bundle inspection failed")
+            Ok(Ok(post)) => post,
+            Ok(Err(error)) => {
+                self.fail(&proposal.id, checks, "bundle", "bundle inspection failed")
                     .await?;
                 return Err(error.into());
             }
+            Err(_) => {
+                self.fail(
+                    &proposal.id,
+                    checks,
+                    "bundle",
+                    "bundle inspection interrupted",
+                )
+                .await?;
+                return Err(LocalError::Task);
+            }
         };
+        checks.push(passed("bundle", None));
         let key = format!("{}-{}", manifest.version, &post.bundle_hash[7..19]);
         let report = match self.supervisor.smoke(&manifest, &destination, &key).await {
             Ok(report) => report,
             Err(_) => {
-                self.fail(&proposal.id, "smoke", "sandbox smoke failed")
+                self.fail(&proposal.id, checks, "smoke", "sandbox smoke failed")
                     .await?;
                 return Err(LocalError::Failed {
                     proposal_id: proposal.id,
@@ -201,16 +244,22 @@ impl LocalChecker {
                 .iter()
                 .any(|resource| resource.uri == surface.resource)
         });
-        let tools_valid = manifest.tools.keys().all(|name| {
-            report
-                .catalog
-                .tools()
-                .iter()
-                .any(|tool| tool["name"].as_str() == Some(name))
-        });
+        // `default` supplies fallback classification; it is not a declared MCP tool.
+        let tools_valid = manifest
+            .tools
+            .keys()
+            .filter(|name| *name != "default")
+            .all(|name| {
+                report
+                    .catalog
+                    .tools()
+                    .iter()
+                    .any(|tool| tool["name"].as_str() == Some(name))
+            });
         if !hooks_valid || !surfaces_valid || !tools_valid {
             self.fail(
                 &proposal.id,
+                checks,
                 "declarations",
                 "declared MCP tools or resources absent",
             )
@@ -221,19 +270,13 @@ impl LocalChecker {
             });
         }
         let catalog = report.catalog;
-        let checks = vec![
-            passed("manifest", None),
-            passed(
-                "dependencies",
-                Some("no runtime dependency installation required".into()),
-            ),
-            passed("bundle", None),
+        checks.extend([
             passed("declarations", None),
             passed(
                 "smoke",
                 Some(json!({"tools":catalog.tools(),"tools_hash":catalog.hash()}).to_string()),
             ),
-        ];
+        ]);
         let proposal = self
             .store
             .transition_proposal(
@@ -254,25 +297,72 @@ impl LocalChecker {
             catalog,
         })
     }
-    async fn fail(&self, id: &str, name: &str, reason: &'static str) -> Result<(), StoreError> {
+    async fn fail(
+        &self,
+        id: &str,
+        mut checks: Vec<ProposalCheck>,
+        name: &str,
+        reason: &'static str,
+    ) -> Result<(), StoreError> {
         let current = self.store.proposal(id.into()).await?;
-        let update = if current.state == ProposalState::Checking {
-            ProposalUpdate {
-                checks: Some(vec![ProposalCheck {
-                    name: name.into(),
-                    passed: false,
-                    blocking: true,
-                    detail: Some(reason.into()),
-                }]),
-                ..Default::default()
-            }
-        } else {
-            ProposalUpdate::default()
+        checks.push(ProposalCheck {
+            name: name.into(),
+            passed: false,
+            blocking: true,
+            detail: Some(reason.into()),
+        });
+        let update = ProposalUpdate {
+            checks: Some(checks),
+            ..Default::default()
         };
         self.store
             .transition_proposal(id.into(), current.state, ProposalState::Failed, update)
             .await?;
         Ok(())
+    }
+}
+fn node_dependencies(bundle: &Path) -> Result<bool, &'static str> {
+    let text = match read_manifest(&bundle.join("package.json")) {
+        Ok(text) => text,
+        Err(LocalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(_) => return Err("invalid package metadata"),
+    };
+    let package: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "invalid package metadata")?;
+    let package = package.as_object().ok_or("invalid package metadata")?;
+    let mut dependencies = false;
+    for name in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        if let Some(value) = package.get(name) {
+            dependencies |= !value
+                .as_object()
+                .ok_or("invalid package metadata")?
+                .is_empty();
+        }
+    }
+    for name in ["bundledDependencies", "bundleDependencies"] {
+        if let Some(value) = package.get(name) {
+            dependencies |= match value {
+                serde_json::Value::Array(entries) => !entries.is_empty(),
+                serde_json::Value::Bool(enabled) => *enabled,
+                _ => return Err("invalid package metadata"),
+            };
+        }
+    }
+    Ok(dependencies)
+}
+fn informative(name: &str, detail: serde_json::Value) -> ProposalCheck {
+    ProposalCheck {
+        name: name.into(),
+        passed: true,
+        blocking: false,
+        detail: Some(detail.to_string()),
     }
 }
 fn passed(name: &str, detail: Option<String>) -> ProposalCheck {

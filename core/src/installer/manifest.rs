@@ -100,7 +100,6 @@ pub enum Isolation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
-    Deno,
     Node,
     Python,
     Binary,
@@ -250,7 +249,6 @@ pub struct Permissions {
     pub net: NetworkPermissions,
     pub models: Vec<String>,
     pub spawn: bool,
-    pub toolchains: bool,
     pub secrets: Vec<SecretBinding>,
     pub env: BTreeMap<String, String>,
 }
@@ -261,7 +259,6 @@ impl Permissions {
             && self.net.allow.is_empty()
             && self.models.is_empty()
             && !self.spawn
-            && !self.toolchains
             && self.secrets.is_empty()
             && self.env.is_empty()
     }
@@ -360,10 +357,7 @@ impl Manifest {
         {
             return Err(ManifestError::Semantic("processo sem MCP exige kernel"));
         }
-        if self.runtime.kind == RuntimeKind::Remote
-            || self.isolation != Isolation::Os
-            || self.permissions.toolchains
-        {
+        if self.runtime.kind == RuntimeKind::Remote || self.isolation != Isolation::Os {
             return Err(ManifestError::UnsupportedPhase);
         }
         if self.kernel.iter().any(|scope| {

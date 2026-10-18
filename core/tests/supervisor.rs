@@ -1,7 +1,7 @@
 use fictor::{
     config::{Config, Mode},
     home,
-    installer::manifest::{Manifest, ManifestError},
+    installer::manifest::{KernelScope, Manifest, ManifestError, Role},
     proxy::EgressProxy,
     secrets::{BackendKind, Redactor, SecretStore},
     store::{EventQuery, NewSession, Store, Trust},
@@ -10,8 +10,10 @@ use fictor::{
 use serde_json::json;
 use std::{
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -28,9 +30,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::new_in(Path::new("/tmp")).await
+    }
+    async fn new_in(parent: &Path) -> Self {
         let root = tempfile::Builder::new()
             .prefix("fx-t-")
-            .tempdir_in("/tmp")
+            .tempdir_in(parent)
             .unwrap();
         let base = root.path().canonicalize().unwrap();
         let home = base.join("core");
@@ -97,6 +102,61 @@ impl Fixture {
         fs::set_permissions(path.join("server"), fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
+    fn daemon_bundle(&self) -> PathBuf {
+        let bundle = self.bundle(false, "exit 0");
+        // A native fixture makes the double fork and setsid explicit. cc is part
+        // of the supported development/CI toolchain; no downloaded code is used.
+        let mut compiler = Command::new("cc")
+            .args(["-x", "c", "-O2", "-Wall", "-Werror", "-o"])
+            .arg(bundle.join("server"))
+            .arg("-")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        compiler.stdin.take().unwrap().write_all(br#"
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    const char *workspace = getenv("FICTOR_WORKSPACE");
+    char activity[4096], marker[4096], namespace_path[4096];
+    if (!workspace) return 90;
+    snprintf(activity, sizeof(activity), "%s/daemon.activity", workspace);
+    snprintf(marker, sizeof(marker), "%s/parent.exit", workspace);
+    snprintf(namespace_path, sizeof(namespace_path), "%s/daemon.namespace", workspace);
+    pid_t first = fork();
+    if (first < 0) return 91;
+    if (first == 0) {
+        if (setsid() < 0) _exit(92);
+        pid_t second = fork();
+        if (second < 0) _exit(93);
+        if (second > 0) _exit(0);
+        signal(SIGTERM, SIG_IGN);
+        char namespace[128];
+        ssize_t length = readlink("/proc/self/ns/pid", namespace, sizeof(namespace));
+        int descriptor = open(namespace_path, O_WRONLY | O_CREAT, 0600);
+        if (descriptor < 0 || length < 0 || write(descriptor, namespace, (size_t)length) != length) _exit(94);
+        close(descriptor);
+        for (;;) {
+            descriptor = open(activity, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (descriptor < 0 || write(descriptor, "alive\n", 6) != 6) _exit(95);
+            close(descriptor);
+            usleep(10000);
+        }
+    }
+    int status;
+    if (waitpid(first, &status, 0) != first || !WIFEXITED(status) || WEXITSTATUS(status)) return 96;
+    while (access(marker, F_OK) != 0) usleep(10000);
+    return 37;
+}
+"#).unwrap();
+        assert!(compiler.wait().unwrap().success());
+        bundle
+    }
 }
 fn manifest(permissions: serde_json::Value, session: bool, mcp: bool) -> Manifest {
     let mut value = json!({"schema":1,"id":"test-extension","version":"1.0.0","description":"Test only","runtime":{"kind":"binary","entry":"server"},"scope":if session {"session"}else{"global"},"mcp":mcp,"permissions":permissions});
@@ -113,6 +173,35 @@ async fn wait_file(path: &Path) {
     })
     .await
     .unwrap();
+}
+
+fn namespace_members(namespace: &str) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let namespace_path = fs::read_link(entry.path().join("ns/pid")).ok()?;
+            (namespace_path == Path::new(namespace)).then_some(pid)
+        })
+        .collect()
+}
+
+async fn assert_namespace_ended(workspace: &Path) {
+    let namespace = fs::read_to_string(workspace.join("daemon.namespace")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !namespace_members(&namespace).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let activity = fs::read(workspace.join("daemon.activity")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fs::read(workspace.join("daemon.activity")).unwrap(),
+        activity
+    );
 }
 
 #[tokio::test]
@@ -229,6 +318,128 @@ wait"#,
 }
 
 #[tokio::test]
+async fn shutdown_confirms_double_forked_setsid_descendants_have_exited() {
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let bundle = fixture.daemon_bundle();
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let mut instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    wait_file(&fixture.workspace.join("daemon.activity")).await;
+    let namespace = fs::read_to_string(fixture.workspace.join("daemon.namespace")).unwrap();
+    assert!(!namespace_members(&namespace).is_empty());
+    let pid_path = fixture
+        .home
+        .join("run")
+        .join(format!("{}.pid", instance.instance_id));
+    assert!(pid_path.exists());
+    assert!(!instance.shutdown().await.unwrap().crashed);
+    assert_namespace_ended(&fixture.workspace).await;
+    assert!(!pid_path.exists());
+}
+
+#[tokio::test]
+async fn unexpected_parent_exit_also_removes_double_forked_setsid_descendants() {
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let bundle = fixture.daemon_bundle();
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let mut instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    wait_file(&fixture.workspace.join("daemon.activity")).await;
+    fs::write(fixture.workspace.join("parent.exit"), "exit").unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), instance.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exit.crashed);
+    assert_eq!(exit.code, Some(37));
+    assert_namespace_ended(&fixture.workspace).await;
+}
+
+#[tokio::test]
+async fn killing_core_owner_also_ends_the_entire_sandbox_namespace() {
+    let parent = tempfile::Builder::new()
+        .prefix("fx-owner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ready = parent.path().join("ready");
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "core_owner_subprocess", "--nocapture"])
+        .env("FICTOR_TEST_OWNER_ROOT", parent.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_file(&ready).await;
+    let workspace = PathBuf::from(fs::read_to_string(&ready).unwrap());
+    let namespace = fs::read_to_string(workspace.join("daemon.namespace")).unwrap();
+    assert!(!namespace_members(&namespace).is_empty());
+    owner.kill().unwrap(); // SIGKILL: no Rust destructors or async shutdown run.
+    assert!(!owner.wait().unwrap().success());
+    assert_namespace_ended(&workspace).await;
+}
+
+#[tokio::test]
+async fn core_owner_subprocess() {
+    // The parent test opts into this subprocess workload; ordinary suite runs
+    // return immediately instead of creating another owner recursively.
+    let Some(parent) = std::env::var_os("FICTOR_TEST_OWNER_ROOT") else {
+        return;
+    };
+    let parent = PathBuf::from(parent);
+    let fixture = Fixture::new_in(&parent).await;
+    let session = fixture.session().await;
+    let bundle = fixture.daemon_bundle();
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let _instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    wait_file(&fixture.workspace.join("daemon.activity")).await;
+    fs::write(parent.join("ready"), fixture.workspace.to_str().unwrap()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[tokio::test]
 async fn smoke_uses_fake_credentials_disposable_kernel_state_and_no_real_data() {
     let fixture = Fixture::new().await;
     fixture
@@ -295,17 +506,47 @@ async fn supervisor_second_barrier_refuses_globals_path_escape_and_fake_none_ser
         fixture.supervisor.smoke(&bad, &bundle, "key").await,
         Err(SupervisorError::Invalid)
     ));
-    let mut escaped = global;
-    escaped.scope = fictor::installer::manifest::Scope::Session;
-    escaped
-        .permissions
-        .fs
-        .read
-        .push("/var/lib/fictor-denied".into());
-    assert!(matches!(
-        fixture.supervisor.smoke(&escaped, &bundle, "key").await,
-        Err(SupervisorError::Path)
-    ));
+}
+
+#[tokio::test]
+async fn smoke_omits_real_host_grants_and_preserves_the_reviewed_manifest() {
+    let fixture = Fixture::new().await;
+    let private = fixture.workspace.join("production-private");
+    fs::write(&private, "private fixture data").unwrap();
+    fs::write(fixture.real_home.join("private"), "home fixture data").unwrap();
+    let bundle = fixture.bundle(
+        true,
+        r#"[ ! -e "$PRIVATE_FILE" ] || exit 91
+[ ! -e "$PRIVATE_HOME" ] || exit 92
+printf 'disposable\n' > "$FICTOR_WORKSPACE/allowed"
+exit 0"#,
+    );
+    let manifest = manifest(
+        json!({
+            "fs": {"read": [private.to_str().unwrap(), "~/private"],
+                   "write": [fixture.workspace.to_str().unwrap(), "${workspace}"]},
+            "env": {"PRIVATE_FILE": private.to_str().unwrap(),
+                    "PRIVATE_HOME": fixture.real_home.join("private").to_str().unwrap()},
+            "spawn": true
+        }),
+        true,
+        false,
+    );
+    fixture
+        .supervisor
+        .smoke(&manifest, &bundle, "key")
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest.permissions.fs.read,
+        vec![private.to_str().unwrap(), "~/private"]
+    );
+    assert_eq!(manifest.permissions.fs.write.len(), 2);
+    assert_eq!(
+        fs::read_to_string(&private).unwrap(),
+        "private fixture data"
+    );
+    assert!(!fixture.workspace.join("allowed").exists());
 }
 
 #[tokio::test]
@@ -415,31 +656,47 @@ wait"#,
 }
 
 #[tokio::test]
-async fn smoke_runtime_installation_cannot_mount_the_production_core() {
+async fn node_permission_model_denies_spawn_and_uses_only_the_sandbox_environment() {
     let fixture = Fixture::new().await;
-    fixture
-        .secrets
-        .set("canary", "fake-production-only-canary")
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(false, "exit 0");
+    fs::write(bundle.join("main.mjs"), r#"import { writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+if (process.permission.has('child') || process.permission.has('worker')) process.exit(91);
+try { spawnSync('/usr/bin/true'); process.exit(92); }
+catch (error) { if (error.code !== 'ERR_ACCESS_DENIED') throw error; }
+if (process.env.NODE_OPTIONS !== undefined || process.env.NODE_USE_ENV_PROXY !== '1') process.exit(93);
+writeFileSync(`${process.env.FICTOR_WORKSPACE}/node-result`, 'denied');
+"#).unwrap();
+    let mut manifest = manifest(json!({"fs":{"write":["${workspace}"]}}), true, false);
+    manifest.runtime.kind = fictor::installer::manifest::RuntimeKind::Node;
+    manifest.runtime.entry = Some("main.mjs".into());
+    let mut instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
         .unwrap();
-    let bin = fixture.home.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let runtime = bin.join("deno");
-    // If the runtime were launched, it would attempt to read this fake production
-    // secret; the expected Sandbox error precedes process creation entirely.
-    fs::write(
-        &runtime,
-        format!(
-            "#!/bin/sh\n/bin/cat '{}' >&2\nexit 0\n",
-            fixture.home.join("secrets.toml").display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(instance.wait().await.unwrap().code, Some(0));
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("node-result")).unwrap(),
+        "denied"
+    );
+}
+
+#[tokio::test]
+async fn implicit_home_files_are_unreadable_to_harness_and_tools_clients() {
+    let fixture = Fixture::new().await;
+    let private = fixture.real_home.join(".gitconfig");
+    fs::write(&private, "private user configuration").unwrap();
     let mut config = Config::load(&fixture.home).unwrap();
     config.providers.clear();
-    config
-        .runtimes
-        .insert("deno".into(), runtime.to_str().unwrap().into());
+    config.sandbox.home_ro_files = vec!["~/.gitconfig".into()];
     let supervisor = Supervisor::new(
         &fixture.home,
         &fixture.real_home,
@@ -451,11 +708,40 @@ async fn smoke_runtime_installation_cannot_mount_the_production_core() {
     .unwrap()
     .with_fictor_exe(PathBuf::from(env!("CARGO_BIN_EXE_fictor")))
     .unwrap();
-    let bundle = fixture.bundle(true, "exit 0");
-    let mut manifest = manifest(json!({"spawn":true}), true, false);
-    manifest.runtime.kind = fictor::installer::manifest::RuntimeKind::Deno;
-    assert!(matches!(
-        supervisor.smoke(&manifest, &bundle, "key").await,
-        Err(SupervisorError::Sandbox)
-    ));
+    let bundle = fixture.bundle(
+        false,
+        r#"case "$EXPECTED" in
+denied) [ ! -r "$PRIVATE" ] ;;
+allowed) [ -r "$PRIVATE" ] ;;
+*) exit 99 ;;
+esac"#,
+    );
+    for role in ["harness", "tools", "ordinary"] {
+        let session = fixture.session().await;
+        let mut manifest = manifest(
+            json!({"env":{
+                "PRIVATE":private.to_str().unwrap(),
+                "EXPECTED":if role == "ordinary" { "allowed" } else { "denied" }
+            }}),
+            true,
+            false,
+        );
+        if role == "harness" {
+            manifest.role = Role::Harness;
+        }
+        if role == "tools" {
+            manifest.kernel.push(KernelScope::Tools);
+        }
+        let mut instance = supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                "1.0.0-000000000000",
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        assert_eq!(instance.wait().await.unwrap().code, Some(0), "{role}");
+    }
 }

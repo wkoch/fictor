@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
                     "proposal_id":result.proposal.id,"ext_id":result.proposal.ext_id,
                     "state":result.proposal.state,"bundle_hash":result.proposal.hash,
                     "tools_hash":result.catalog.hash(),"tools":result.catalog.tools().len(),
-                    "ignored":result.ignored,"activated":false
+                    "ignored":result.ignored,"checks":result.proposal.checks,"activated":false
                 }))?
             );
         }

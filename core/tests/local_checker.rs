@@ -95,6 +95,11 @@ async fn runtime_dependencies_are_not_silently_skipped() {
     fs::create_dir(&real).unwrap();
     let source = root.path().join("source");
     manifest(&source, "node");
+    fs::write(
+        source.join("package.json"),
+        r#"{"dependencies":{"zod":"4.1.12"}}"#,
+    )
+    .unwrap();
     let (checker, store) = setup(&home, &real).await;
     let error = checker.check_local(&source).await.err().unwrap();
     let LocalError::Failed {
@@ -107,8 +112,130 @@ async fn runtime_dependencies_are_not_silently_skipped() {
     assert_eq!(reason, "dependency resolver unavailable");
     let proposal = store.proposal(proposal_id).await.unwrap();
     assert_eq!(proposal.state, ProposalState::Failed);
-    assert!(!proposal.checks.unwrap()[0].passed);
+    let checks = proposal.checks.unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "manifest" && check.passed)
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "dependencies" && !check.passed)
+    );
     assert!(!home.join("extensions/lock.json").exists());
+}
+
+#[tokio::test]
+async fn prepacked_node_skips_resolution_but_dependency_metadata_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    fs::create_dir(&real).unwrap();
+    let (checker, store) = setup(&home, &real).await;
+    for (index, metadata, reason) in [
+        (0, None, "sandbox smoke failed"),
+        (
+            1,
+            Some(r#"{"type":"module","dependencies":{},"scripts":{"postinstall":"touch never"}}"#),
+            "sandbox smoke failed",
+        ),
+        (
+            2,
+            Some(r#"{"optionalDependencies":{"package":"1.0.0"}}"#),
+            "dependency resolver unavailable",
+        ),
+        (
+            3,
+            Some(r#"{"devDependencies":{"package":"1.0.0"}}"#),
+            "dependency resolver unavailable",
+        ),
+        (
+            4,
+            Some(r#"{"dependencies":"malformed"}"#),
+            "invalid package metadata",
+        ),
+        (5, Some("not json"), "invalid package metadata"),
+    ] {
+        let source = root.path().join(format!("source-{index}"));
+        manifest(&source, "node");
+        if let Some(metadata) = metadata {
+            fs::write(source.join("package.json"), metadata).unwrap();
+        }
+        let LocalError::Failed {
+            proposal_id,
+            reason: actual,
+        } = checker.check_local(&source).await.err().unwrap()
+        else {
+            panic!("unexpected error");
+        };
+        assert_eq!(actual, reason);
+        let proposal = store.proposal(proposal_id).await.unwrap();
+        assert_eq!(proposal.state, ProposalState::Failed);
+        let checks = proposal.checks.unwrap();
+        assert!(checks.iter().any(|check| check.name == "dependencies"
+            && check.passed == (reason == "sandbox smoke failed")));
+        assert!(!source.join("never").exists());
+    }
+}
+
+#[tokio::test]
+async fn mcp_default_classification_is_not_a_required_tool_but_named_declarations_are() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    fs::create_dir(&real).unwrap();
+    let (checker, store) = setup(&home, &real).await;
+    for (index, named, expected) in [
+        (0, "", ProposalState::Checked),
+        (1, "  echo: {}\n", ProposalState::Checked),
+        (2, "  missing: {}\n", ProposalState::Failed),
+    ] {
+        let source = root.path().join(format!("source-{index}"));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("fictor.yaml"), format!("schema: 1\nid: fixture\nversion: 0.1.0\ndescription: MCP fixture\nscope: session\nruntime:\n  kind: node\n  entry: main.mjs\ntools:\n  default: {{effect: read, sensitivity: public, output_trust: trusted}}\n{named}")).unwrap();
+        fs::write(
+            source.join("main.mjs"),
+            r#"import { createInterface } from 'node:readline';
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  if (!Object.hasOwn(request, 'id')) continue;
+  let result;
+  switch (request.method) {
+    case 'initialize': result = {
+      protocolVersion: request.params.protocolVersion,
+      capabilities: { tools: {}, resources: {} },
+      serverInfo: { name: 'local-fixture', version: '1.0.0' }
+    }; break;
+    case 'tools/list': result = { tools: [{
+      name: 'echo', description: 'Fixture tool', inputSchema: { type: 'object' }
+    }] }; break;
+    case 'resources/list': result = { resources: [] }; break;
+    default: result = {};
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+}
+"#,
+        )
+        .unwrap();
+        let proposal = match checker.check_local(&source).await {
+            Ok(report) => {
+                assert_eq!(report.catalog.tools().len(), 1);
+                assert_eq!(report.catalog.tools()[0]["name"], "echo");
+                report.proposal
+            }
+            Err(LocalError::Failed {
+                proposal_id,
+                reason,
+            }) => {
+                assert_eq!(reason, "declared MCP tools or resources absent");
+                store.proposal(proposal_id).await.unwrap()
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        };
+        assert_eq!(proposal.state, expected);
+        assert!(!home.join("extensions/lock.json").exists());
+    }
 }
 
 #[tokio::test]
@@ -136,7 +263,13 @@ async fn global_process_fails_before_dependency_resolution_or_smoke() {
     assert_eq!(reason, "phase:global");
     let proposal = store.proposal(proposal_id).await.unwrap();
     assert_eq!(proposal.state, ProposalState::Failed);
-    assert!(!proposal.checks.unwrap()[0].passed);
+    assert!(
+        proposal
+            .checks
+            .unwrap()
+            .iter()
+            .any(|check| check.name == "phase" && !check.passed)
+    );
     assert!(!home.join("extensions/lock.json").exists());
     assert!(!home.join("logs/ext/fixture.log").exists());
 }
@@ -215,5 +348,148 @@ async fn cli_check_reports_hashes_and_never_activates_the_bundle() {
             .unwrap()
             .starts_with("sha256:")
     );
+    assert!(!home.join("extensions/lock.json").exists());
+}
+
+#[tokio::test]
+async fn review_preserves_requested_permissions_omitted_paths_and_ignored_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    fs::create_dir(&real).unwrap();
+    let source = root.path().join("source");
+    manifest(&source, "binary");
+    let path = source.join("fictor.yaml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("permissions:\n  fs:\n    read: [\"${workspace}\", \"~/Documents/x\", \"/opt/private\"]\n    write: [\"${ext_data}\", \"~/Documents/output\"]\n");
+    fs::write(path, text).unwrap();
+    fs::create_dir(source.join("node_modules")).unwrap();
+    fs::write(source.join("node_modules/ignored.js"), b"ignored").unwrap();
+    // This test intentionally fails before smoke, proving the review metadata is
+    // retained even when the requested executable cannot be started.
+    let (checker, store) = setup(&home, &real).await;
+    let LocalError::Failed {
+        proposal_id,
+        reason,
+    } = checker.check_local(&source).await.err().unwrap()
+    else {
+        panic!("unexpected error");
+    };
+    assert_eq!(reason, "sandbox smoke failed");
+    let proposal = store.proposal(proposal_id.clone()).await.unwrap();
+    let checks = proposal.checks.unwrap();
+    let summary: serde_json::Value = serde_json::from_str(
+        checks
+            .iter()
+            .find(|check| check.name == "permissions")
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        summary["requested"]["fs"]["read"],
+        serde_json::json!(["${workspace}", "~/Documents/x", "/opt/private"])
+    );
+    assert_eq!(
+        summary["omitted_fs"]["read"],
+        serde_json::json!(["~/Documents/x", "/opt/private"])
+    );
+    assert_eq!(
+        summary["omitted_fs"]["write"],
+        serde_json::json!(["~/Documents/output"])
+    );
+    assert!(
+        !checks
+            .iter()
+            .find(|check| check.name == "permissions")
+            .unwrap()
+            .blocking
+    );
+    let receipt: serde_json::Value = serde_json::from_str(
+        checks
+            .iter()
+            .find(|check| check.name == "receipt")
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["ignored"], serde_json::json!(["node_modules"]));
+    assert!(
+        home.join("extensions/quarantine")
+            .join(&proposal_id)
+            .join("fictor.yaml")
+            .exists()
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "smoke" && !check.passed)
+    );
+    assert!(!home.join("extensions/lock.json").exists());
+}
+
+#[tokio::test]
+async fn cancellation_of_caller_does_not_strand_the_core_owned_check() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    fs::create_dir(&real).unwrap();
+    let source = root.path().join("source");
+    manifest(&source, "none");
+    // The worker must be observed during receipt, before it can become checked.
+    fs::File::create(source.join("padding"))
+        .unwrap()
+        .set_len(40 * 1024 * 1024)
+        .unwrap();
+    let (checker, store) = setup(&home, &real).await;
+    let caller = tokio::spawn(async move { checker.check_local(&source).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if fs::read_dir(home.join("extensions/quarantine"))
+                .unwrap()
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".receipt-")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    let Err(error) = caller.await else {
+        panic!("caller unexpectedly completed")
+    };
+    assert!(error.is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let events = store
+                .event_path("sys".into(), None, None)
+                .await
+                .unwrap()
+                .events;
+            if let Some(event) = events.iter().find(|event| event.kind == "ext.checked") {
+                let proposal = store
+                    .proposal(event.payload["proposal_id"].as_str().unwrap().into())
+                    .await
+                    .unwrap();
+                assert_eq!(proposal.state, ProposalState::Checked);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(!home.join("extensions/lock.json").exists());
 }

@@ -5,7 +5,7 @@ use crate::{
     gateway::{AuditIdentity, McpConnection, PinnedCatalog},
     installer::{
         bundle::{self, BundleBudget, BundleProfile},
-        manifest::{Manifest, Role, RuntimeKind, Scope},
+        manifest::{KernelScope, Manifest, Role, RuntimeKind, Scope},
     },
     kernel::{KernelIdentity, KernelServer},
     proxy::{EgressProxy, ProxyIdentity, ProxyToken, nat64::Nat64Prefixes},
@@ -84,8 +84,8 @@ pub struct ProcessExit {
     pub crashed: bool,
 }
 
-/// Dropping this handle kills the whole process group. The detached owner task
-/// still reaps, audits, revokes transports and only then releases temporary paths.
+/// Dropping this handle kills the sandbox. Its detached owner confirms namespace
+/// exit by reaping bubblewrap before releasing sockets or temporary paths.
 pub struct ManagedInstance {
     pub instance_id: String,
     pid: u32,
@@ -203,17 +203,20 @@ impl Supervisor {
         if manifest.scope == Scope::Global {
             return Err(SupervisorError::Unsupported);
         }
-        // Every FS root in this launch must belong to the disposable core state.
-        if manifest
+        // ADR-028: verification has disposable template roots only. Keep the
+        // reviewed manifest intact; explicit real-host grants apply after install.
+        let mut smoke_manifest = manifest.clone();
+        smoke_manifest
             .permissions
             .fs
             .read
-            .iter()
-            .chain(&manifest.permissions.fs.write)
-            .any(|p| !p.starts_with("${"))
-        {
-            return Err(SupervisorError::Path);
-        }
+            .retain(|p| p.starts_with("${"));
+        smoke_manifest
+            .permissions
+            .fs
+            .write
+            .retain(|p| p.starts_with("${"));
+        let manifest = &smoke_manifest;
         let disposable = tempfile::Builder::new()
             .prefix("fx-")
             .tempdir_in("/tmp")
@@ -579,16 +582,31 @@ impl Supervisor {
             None
         };
         let kernel_socket = kernel.as_ref().map(|k| k.socket_path().to_path_buf());
+        // I11: model-facing processes receive private input through the kernel,
+        // never via implicit real-home mounts that bypass provenance tracking.
+        let mediated =
+            manifest.role == Role::Harness || manifest.kernel.contains(&KernelScope::Tools);
+        let home_ro_files = if !smoke && session.is_some() && !mediated {
+            self.config
+                .sandbox
+                .home_ro_files
+                .iter()
+                .map(|path| expand_home_file(path, &self.real_home))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let mut runtime_read = read.clone();
+        runtime_read.extend(home_ro_files.iter().cloned());
+        if manifest.role == Role::Harness {
+            runtime_read.push(store_root.clone());
+        }
         let (runtime, runtime_root, arguments) = runtime_command(
             manifest,
-            &self.config,
             &paths,
             RuntimeGrants {
-                read: &read,
+                read: &runtime_read,
                 write: &write,
-                kernel: kernel_socket.as_deref(),
-                proxy_port,
-                egress: !patterns.is_empty() || !models.is_empty(),
             },
             &mut environment,
         )?;
@@ -601,16 +619,6 @@ impl Supervisor {
         {
             return Err(SupervisorError::Sandbox);
         }
-        let home_ro_files = if !smoke && session.is_some() {
-            self.config
-                .sandbox
-                .home_ro_files
-                .iter()
-                .map(|path| expand_home_file(path, &self.real_home))
-                .collect::<Result<_, _>>()?
-        } else {
-            Vec::new()
-        };
         let plan = SandboxPlan::new(
             SandboxProfile {
                 read_paths: read,
@@ -680,7 +688,8 @@ impl Supervisor {
             exit,
         };
         tokio::spawn(async move {
-            let _ownership = (temporary, smoke_data, reservation, pid_file, smoke_home);
+            let _ownership = (temporary, smoke_data, pid_file, smoke_home);
+            let mut reservation = Some(reservation);
             let stderr = tokio::spawn(drain_stderr(stderr, log, stream));
             let started_result = audit_event(&audit, "ext.started", json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key,"pid":pid,"smoke":smoke}), vec![]).await;
             let success = started_result.is_ok();
@@ -688,10 +697,14 @@ impl Supervisor {
             let outcome = supervise(
                 &mut child,
                 stop_receiver,
-                &mut kernel,
-                guard,
                 success,
-                &registration,
+                CleanupContext {
+                    kernel: &mut kernel,
+                    guard: &guard,
+                    registration: &registration,
+                    audit: &audit,
+                    reservation: &mut reservation,
+                },
             )
             .await;
             drop(registration); // Revoke before potentially waiting on inherited pipes.
@@ -759,6 +772,8 @@ impl Supervisor {
             };
             // Observers of completion also observe PID and temporary-path cleanup.
             drop(kernel);
+            drop(reservation);
+            drop(guard);
             drop(_ownership);
             exit_sender.send_replace(Some(final_result));
         });
@@ -856,30 +871,64 @@ impl Drop for ManagedInstance {
     }
 }
 
+struct CleanupContext<'a> {
+    kernel: &'a mut Option<KernelServer>,
+    guard: &'a GroupGuard,
+    registration: &'a Registration,
+    audit: &'a AuditIdentity,
+    reservation: &'a mut Option<Reservation>,
+}
+
 async fn supervise(
     child: &mut Child,
     mut stop: watch::Receiver<bool>,
-    kernel: &mut Option<KernelServer>,
-    guard: GroupGuard,
     started: bool,
-    registration: &Registration,
+    cleanup: CleanupContext<'_>,
 ) -> Result<ProcessExit, SupervisorError> {
+    let CleanupContext {
+        kernel,
+        guard,
+        registration,
+        audit,
+        reservation,
+    } = cleanup;
     let (status, crashed) = if !started {
         signal_group(guard.pid, libc::SIGKILL);
         (child.wait().await, false)
     } else {
         tokio::select! { biased;
             _ = stop.changed() => {
-                let _ = registration.proxy.revoke(&registration.token);
-                if let Some(kernel) = kernel { kernel.revoke(); }
-                let status = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+                // Graceful notice closes traffic while retaining the socket and
+                // token registration until revocation after the grace period.
+                if let Some(kernel) = kernel { kernel.notify_shutdown(); }
+                let shutdown = async {
+                    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+                        Ok(status) => status,
+                        Err(_) => {
+                            let _ = registration.proxy.revoke(&registration.token);
+                            if let Some(kernel) = &kernel { kernel.revoke(); }
+                            signal_group(guard.pid, libc::SIGTERM);
+                            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                                Ok(status) => status,
+                                Err(_) => { signal_group(guard.pid, libc::SIGKILL); child.wait().await }
+                            }
+                        }
+                    }
+                };
+                let status = match tokio::time::timeout(Duration::from_secs(10), shutdown).await {
                     Ok(status) => status,
                     Err(_) => {
-                        signal_group(guard.pid, libc::SIGTERM);
-                        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                            Ok(status) => status,
-                            Err(_) => { signal_group(guard.pid, libc::SIGKILL); child.wait().await }
-                        }
+                        let _ = registration.proxy.revoke(&registration.token);
+                        if let Some(kernel) = &kernel { kernel.revoke(); }
+                        signal_group(guard.pid, libc::SIGKILL);
+                        let _ = audit_event(audit, "ext.cleanup_failed", json!({
+                            "ext_id": audit.ext_id, "instance_id": audit.instance_id,
+                            "key": audit.key
+                        }), vec![]).await;
+                        // A new identity may start, while this owner retains all
+                        // resources belonging to the unconfirmed namespace.
+                        reservation.take();
+                        child.wait().await
                     }
                 };
                 (status, false)
@@ -891,15 +940,34 @@ async fn supervise(
     if let Some(kernel) = kernel {
         kernel.revoke();
     }
-    // An exiting leader does not imply its children exited; kill the remaining
-    // group before releasing mounts, credentials, temporary paths or stderr pipe.
-    signal_group(guard.pid, libc::SIGKILL);
-    let status = status.map_err(|_| SupervisorError::Process)?;
-    // SIGKILL delivery is asynchronous; do not remove instance paths while a
-    // process still exists in this group, even after the leader has been reaped.
-    while unsafe { libc::kill(-(guard.pid as i32), 0) } == 0 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut status = status;
+    if status.is_err() {
+        signal_group(guard.pid, libc::SIGKILL);
+        let _ = audit_event(
+            audit,
+            "ext.cleanup_failed",
+            json!({
+                "ext_id": audit.ext_id, "instance_id": audit.instance_id,
+                "key": audit.key
+            }),
+            vec![],
+        )
+        .await;
+        reservation.take();
     }
+    // A failed wait is not confirmation. Keep the owner and all its resources
+    // alive until the OS actually reports bubblewrap's exit.
+    let status = loop {
+        match status {
+            Ok(status) => break status,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                status = child.wait().await;
+            }
+        }
+    };
+    // ADR-029: bubblewrap exit confirms the PID namespace is empty, including
+    // double-forked/setsid descendants. A host process group is not the tree.
     if let Ok(mut group) = guard.group.lock() {
         *group = None;
     }
@@ -1128,24 +1196,14 @@ fn proxy_endpoint(proxy: &EgressProxy) -> Result<ProxyEndpoint, SupervisorError>
 struct RuntimeGrants<'a> {
     read: &'a [PathBuf],
     write: &'a [PathBuf],
-    kernel: Option<&'a Path>,
-    proxy_port: u16,
-    egress: bool,
 }
 fn runtime_command(
     manifest: &Manifest,
-    config: &Config,
     paths: &Paths<'_>,
     grants: RuntimeGrants<'_>,
     environment: &mut BTreeMap<String, String>,
 ) -> Result<(PathBuf, PathBuf, Vec<OsString>), SupervisorError> {
-    let RuntimeGrants {
-        read,
-        write,
-        kernel,
-        proxy_port,
-        egress,
-    } = grants;
+    let RuntimeGrants { read, write } = grants;
     let entry = paths
         .bundle
         .join(
@@ -1163,27 +1221,18 @@ fn runtime_command(
     let (runtime, root, mut args) = if manifest.runtime.kind == RuntimeKind::Binary {
         (entry.clone(), paths.bundle.to_path_buf(), Vec::new())
     } else {
-        let name = match manifest.runtime.kind {
-            RuntimeKind::Deno => "deno",
-            RuntimeKind::Node => "node",
-            RuntimeKind::Python => "python",
+        // M0.5 development bootstrap only. The managed/checksummed runtime
+        // resolver belongs to M0.9; never use caller PATH or a config executable.
+        if !Path::new("/run/.toolboxenv").is_file() {
+            return Err(SupervisorError::Unsupported);
+        }
+        let runtime = PathBuf::from(match manifest.runtime.kind {
+            RuntimeKind::Node => "/usr/bin/node",
+            RuntimeKind::Python => "/usr/bin/python3",
             _ => return Err(SupervisorError::Unsupported),
-        };
-        let runtime = match config.runtimes.get(name).filter(|v| !v.is_empty()) {
-            Some(path) => PathBuf::from(path)
-                .canonicalize()
-                .map_err(|_| SupervisorError::Unsupported)?,
-            None => std::env::var_os("PATH")
-                .and_then(|value| {
-                    std::env::split_paths(&value)
-                        .filter(|p| p.is_absolute())
-                        .map(|path| path.join(name))
-                        .find(|path| executable(path))
-                })
-                .ok_or(SupervisorError::Unsupported)?
-                .canonicalize()
-                .map_err(|_| SupervisorError::Unsupported)?,
-        };
+        })
+        .canonicalize()
+        .map_err(|_| SupervisorError::Unsupported)?;
         if !executable(&runtime) {
             return Err(SupervisorError::Unsupported);
         }
@@ -1195,48 +1244,9 @@ fn runtime_command(
         }
         .to_path_buf();
         let mut args = Vec::new();
-        if manifest.runtime.kind == RuntimeKind::Deno {
-            args.extend(["run", "--cached-only", "--no-prompt", "--allow-env"].map(OsString::from));
-            let mut reads = vec![utf8(paths.bundle)?];
-            reads.extend(
-                read.iter()
-                    .map(|p| utf8(p))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            let mut writes = vec![utf8(paths.data)?, utf8(paths.tmp)?];
-            writes.extend(
-                write
-                    .iter()
-                    .map(|p| utf8(p))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            if reads.iter().chain(&writes).any(|v| v.contains(',')) {
-                return Err(SupervisorError::Path);
-            }
-            args.push(format!("--allow-read={}", reads.join(",")).into());
-            args.push(format!("--allow-write={}", writes.join(",")).into());
-            let mut hosts = Vec::new();
-            if egress {
-                hosts.extend(manifest.permissions.net.allow.iter().cloned());
-                hosts.push(format!("127.0.0.1:{proxy_port}"));
-            }
-            if !manifest.permissions.models.is_empty() && egress {
-                hosts.push("models.fictor.internal".into());
-            }
-            if kernel.is_some() {
-                hosts.push("127.0.0.1:3129".into());
-            }
-            if !hosts.is_empty() {
-                if hosts.iter().any(|v| v == "*") {
-                    args.push("--allow-net".into());
-                } else {
-                    args.push(format!("--allow-net={}", hosts.join(",")).into());
-                }
-            }
-            if manifest.permissions.spawn {
-                args.push("--allow-run".into());
-            }
-            environment.insert("DENO_DIR".into(), utf8(&paths.tmp.join("deno"))?);
+        if manifest.runtime.kind == RuntimeKind::Node {
+            args = node_permissions(paths, &root, read, write, manifest.permissions.spawn)?;
+            environment.insert("NODE_USE_ENV_PROXY".into(), "1".into());
         }
         if manifest.runtime.kind == RuntimeKind::Python {
             environment.insert("PYTHONPATH".into(), utf8(&paths.bundle.join(".pydeps"))?);
@@ -1247,6 +1257,49 @@ fn runtime_command(
     };
     args.extend(manifest.runtime.args.iter().map(OsString::from));
     Ok((runtime, root, args))
+}
+
+fn node_permissions(
+    paths: &Paths<'_>,
+    runtime_root: &Path,
+    read: &[PathBuf],
+    write: &[PathBuf],
+    spawn: bool,
+) -> Result<Vec<OsString>, SupervisorError> {
+    // Node 24 LTS Permission Model (v24.x/api/permissions.html). Network
+    // isolation is supplied by the namespace/proxy; --allow-net starts in v25.
+    let mut args = vec![OsString::from("--permission")];
+    for path in [paths.bundle, runtime_root, paths.data, paths.tmp]
+        .into_iter()
+        .chain(read.iter().map(PathBuf::as_path))
+        .chain(write.iter().map(PathBuf::as_path))
+    {
+        node_path_permission(&mut args, "read", path)?;
+    }
+    for path in [paths.data, paths.tmp]
+        .into_iter()
+        .chain(write.iter().map(PathBuf::as_path))
+    {
+        node_path_permission(&mut args, "write", path)?;
+    }
+    if spawn {
+        args.extend(["--allow-child-process", "--allow-worker"].map(OsString::from));
+    }
+    Ok(args)
+}
+
+fn node_path_permission(
+    args: &mut Vec<OsString>,
+    access: &str,
+    path: &Path,
+) -> Result<(), SupervisorError> {
+    let path = utf8(path)?;
+    // A literal host directory containing '*' must not become a Node wildcard.
+    if path.contains('*') {
+        return Err(SupervisorError::Path);
+    }
+    args.push(format!("--allow-fs-{access}={path}").into());
+    Ok(())
 }
 fn executable(path: &Path) -> bool {
     fs::metadata(path)
@@ -1362,6 +1415,41 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+    #[test]
+    fn node_permissions_keep_grants_separate_and_deny_undeclared_process_features() {
+        let paths = Paths {
+            bundle: Path::new("/bundle"),
+            data: Path::new("/data"),
+            tmp: Path::new("/temporary"),
+            store: Path::new("/store"),
+            workspace: None,
+            home: Path::new("/home/user"),
+        };
+        let read = vec![PathBuf::from("/read,with,commas")];
+        let write = vec![PathBuf::from("/work")];
+        let args = node_permissions(&paths, Path::new("/runtime"), &read, &write, false).unwrap();
+        assert!(args.contains(&OsString::from("--permission")));
+        assert!(args.contains(&OsString::from("--allow-fs-read=/read,with,commas")));
+        assert!(args.contains(&OsString::from("--allow-fs-read=/work")));
+        assert!(args.contains(&OsString::from("--allow-fs-write=/work")));
+        assert!(!args.iter().any(|a| a == "--allow-child-process"
+            || a == "--allow-worker"
+            || a == "--allow-addons"
+            || a == "--allow-wasi"));
+        let spawn = node_permissions(&paths, Path::new("/runtime"), &read, &write, true).unwrap();
+        assert!(spawn.contains(&OsString::from("--allow-child-process")));
+        assert!(spawn.contains(&OsString::from("--allow-worker")));
+        assert!(
+            node_permissions(
+                &paths,
+                Path::new("/runtime"),
+                &[PathBuf::from("/literal*path")],
+                &[],
+                false
+            )
+            .is_err()
         );
     }
     #[tokio::test]

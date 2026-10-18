@@ -1,0 +1,8 @@
+FROM registry.fedoraproject.org/fedora-toolbox:44
+
+# Keep development tools in the Toolbx image, never on the immutable host.
+# Fedora 44 defaults to Node 22; select its Node 24 LTS binaries explicitly.
+RUN dnf install --assumeyes \
+        rust cargo clippy rustfmt gcc git \
+        nodejs24-bin nodejs24-npm-bin bubblewrap ripgrep \
+    && dnf clean all

@@ -355,6 +355,68 @@ async fn explicit_user_rejection_is_terminal_and_received_can_fail() {
         State::Failed
     );
 }
+
+#[tokio::test]
+async fn receipt_failure_persists_checks_without_accepting_success_results() {
+    let (_root, store) = store().await;
+    let proposal = store.receive_proposal(input()).await.unwrap();
+    let failure = ProposalCheck {
+        name: "receipt".into(),
+        passed: false,
+        blocking: true,
+        detail: Some("quarantine sync failed".into()),
+    };
+    for update in [
+        ProposalUpdate {
+            hash: Some(format!("sha256:{}", "1".repeat(64))),
+            ..Default::default()
+        },
+        ProposalUpdate {
+            packages: Some(vec![]),
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            store
+                .transition_proposal(proposal.id.clone(), State::Received, State::Failed, update)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.proposal(proposal.id.clone()).await.unwrap().state,
+            State::Received
+        );
+    }
+    let failed = store
+        .transition_proposal(
+            proposal.id.clone(),
+            State::Received,
+            State::Failed,
+            ProposalUpdate {
+                checks: Some(vec![failure.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.checks, Some(vec![failure.clone()]));
+    assert_eq!(
+        store.proposal(proposal.id).await.unwrap().checks,
+        Some(vec![failure])
+    );
+    let events = store
+        .event_path("sys".into(), None, None)
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "ext.failed")
+            .count(),
+        1
+    );
+}
 #[tokio::test]
 async fn audit_failure_rolls_back_both_receive_and_transition() {
     let (_root, store) = store().await;

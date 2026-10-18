@@ -15,7 +15,7 @@ pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 pub struct Config {
     pub server: Server,
     pub paths: Paths,
-    pub runtimes: BTreeMap<String, String>,
+    pub runtimes: BTreeMap<String, RuntimeSource>,
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     pub policy: Policy,
@@ -39,6 +39,19 @@ pub struct Server {
 #[derive(Deserialize, Serialize)]
 pub struct Paths {
     pub default_workspace: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeSource {
+    Nodejs {
+        channel: String,
+    },
+    GithubRelease {
+        repo: String,
+        asset: String,
+        checksum: String,
+        bin: String,
+    },
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Provider {
@@ -96,6 +109,7 @@ pub struct Harness {
     pub idle_timeout_min: u64,
 }
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sandbox {
     pub home_ro_files: Vec<String>,
 }
@@ -119,6 +133,13 @@ pub enum ConfigError {
 impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
+        if config
+            .runtimes
+            .values()
+            .any(|source| matches!(source, RuntimeSource::Nodejs { channel } if channel != "lts"))
+        {
+            return Err(ConfigError::Invalid("o canal Node deve ser lts"));
+        }
         if config.server.listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return Err(ConfigError::Invalid("server.listen deve usar 127.0.0.1"));
         }

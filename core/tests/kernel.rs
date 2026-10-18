@@ -493,6 +493,22 @@ async fn kv_namespaces_blobs_config_reload_and_global_write_boundary() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_notifies_clients_and_retains_socket_until_cleanup() {
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    let mut client = Client::new(&server).await;
+    let socket = server.socket_path().to_path_buf();
+    server.notify_shutdown();
+    assert_eq!(client.read().await["method"], "shutdown");
+    client.closed().await;
+    assert!(socket.exists(), "namespace cleanup still needs the socket");
+    assert!(UnixStream::connect(&socket).await.is_err());
+    server.revoke();
+    server.shutdown().await.unwrap();
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
 async fn oversized_input_and_output_are_bounded_and_shutdown_revokes_idle_connections() {
     let f = Fixture::new().await;
     let mut server = f.server(Some(f.session.clone()), &["kv", "config"]).await;

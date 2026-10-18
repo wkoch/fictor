@@ -184,23 +184,58 @@ fn cli_init_and_unsupported_install_are_honest() {
 }
 
 #[test]
-fn doctor_reports_missing_runtime_without_modifying_config() {
+fn doctor_reports_development_runtime_status_without_modifying_config() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("data");
     fs::create_dir(&home).unwrap();
     Config::create_if_missing(&home).unwrap();
-    let config =
-        DEFAULT_CONFIG.replace("deno = \"\"", "deno = \"/nonexistent/fictor-test-runtime\"");
-    fs::write(home.join("config.toml"), config).unwrap();
     let original = fs::read(home.join("config.toml")).unwrap();
     let report = fictor::doctor::inspect_local(&home);
     assert!(
         report
             .iter()
-            .any(|check| check.name == "deno" && check.status == fictor::doctor::Status::Fail)
+            .any(|check| check.name == "node" && check.detail.contains("M0.9"))
     );
     assert!(report.iter().any(|check| check.name == "keyring/segredos"));
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn runtime_sources_match_the_spec_and_reject_legacy_executable_overrides() {
+    use fictor::config::RuntimeSource;
+    let config = Config::parse(DEFAULT_CONFIG).unwrap();
+    assert_eq!(
+        config.runtimes["node"],
+        RuntimeSource::Nodejs {
+            channel: "lts".into()
+        }
+    );
+    assert!(matches!(
+        config.runtimes["uv"],
+        RuntimeSource::GithubRelease { .. }
+    ));
+    for replacement in [
+        "source = \"nodejs\"\nchannel = \"current\"",
+        "source = \"nodejs\"\nchannel = \"lts\"\nbin = \"/tmp/node\"",
+        "source = \"unknown\"\nchannel = \"lts\"",
+    ] {
+        assert!(
+            Config::parse(
+                &DEFAULT_CONFIG.replace("source = \"nodejs\"\nchannel = \"lts\"", replacement)
+            )
+            .is_err()
+        );
+    }
+    assert!(Config::parse(&DEFAULT_CONFIG.replace(
+        "[runtimes.node]                  # fonte; instalação/ativação gerenciada entra no M0.9\nsource = \"nodejs\"\nchannel = \"lts\"",
+        "[runtimes]\nnode = \"/tmp/node\""
+    )).is_err());
+    assert!(
+        Config::parse(&format!(
+            "{DEFAULT_CONFIG}\n[sandbox.toolchains]\nmounts = [\"~/.rustup\"]\n"
+        ))
+        .is_err()
+    );
 }
 
 #[test]

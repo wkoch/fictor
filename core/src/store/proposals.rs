@@ -160,9 +160,13 @@ impl Store {
         if decision != update.decision.is_some() {
             return Err(StoreError::Invalid("invalid proposal decision"));
         }
-        // Only the checking stage may attach deterministic check/hash/package results.
+        // Receipt failures must retain their check/reason even before checking.
+        // Successful results, hashes and packages still require the checking stage.
+        let received_failure = expected == ProposalState::Received && next == ProposalState::Failed;
         if expected != ProposalState::Checking
-            && (update.checks.is_some() || update.hash.is_some() || update.packages.is_some())
+            && (update.hash.is_some()
+                || update.packages.is_some()
+                || (update.checks.is_some() && !received_failure))
         {
             return Err(StoreError::Invalid("invalid proposal results"));
         }

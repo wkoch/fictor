@@ -95,9 +95,15 @@ impl KernelServer {
     pub fn token(&self) -> &str {
         &self.state.token
     }
+    /// End the transport gracefully without removing its socket or revoking
+    /// the instance token. The supervisor revokes tokens after its grace period
+    /// and removes resources only after confirming the PID namespace has exited.
+    pub fn notify_shutdown(&self) {
+        let _ = self.stop.send(true);
+    }
     pub fn revoke(&self) {
         self.state.revoked.store(true, Ordering::Release);
-        let _ = self.stop.send(true);
+        self.notify_shutdown();
     }
     pub async fn shutdown(&mut self) -> Result<(), KernelError> {
         self.revoke();

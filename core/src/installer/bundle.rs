@@ -501,7 +501,7 @@ mod unix {
                     || (root
                         && matches!(
                             name.to_str(),
-                            Some("node_modules" | "vendor" | ".deno" | ".pydeps" | ".venv")
+                            Some("node_modules" | "vendor" | ".pydeps" | ".venv")
                         ))))
     }
     fn remove_directory(parent: &File, name: &OsStr) -> Result<(), BundleError> {
@@ -791,7 +791,6 @@ mod unix {
                 "__pycache__",
                 "node_modules",
                 "vendor",
-                ".deno",
                 ".pydeps",
                 ".venv",
             ] {
@@ -805,10 +804,30 @@ mod unix {
             directory(&temp.path().join("nested/vendor"));
             write(&temp.path().join("nested/vendor/file"), b"yes", 0o600);
             let scanned = inspect(temp.path(), &budget()).unwrap();
-            assert_eq!(scanned.ignored.len(), 8);
+            assert_eq!(scanned.ignored.len(), 7);
             assert_eq!(scanned.total_entries, 3);
             assert_eq!(scanned.total_bytes, 3);
             assert_eq!(scanned.files[0].path, Path::new("nested/vendor/file"));
+            // ADR-033 removed Deno: .deno is ordinary bundle content, not a cache exemption.
+            directory(&temp.path().join(".deno"));
+            write(&temp.path().join(".deno/file"), b"code", 0o600);
+            let with_deno = inspect(temp.path(), &budget()).unwrap();
+            assert_eq!(with_deno.ignored, scanned.ignored);
+            assert_eq!(with_deno.total_entries, scanned.total_entries + 2);
+            assert_eq!(with_deno.total_bytes, scanned.total_bytes + 4);
+            assert_eq!(with_deno.files[0].path, Path::new(".deno/file"));
+            assert_ne!(with_deno.bundle_hash, scanned.bundle_hash);
+            let mut limits = BundleProfile::ReceiptLocal.limits();
+            limits.entries = with_deno.total_entries - 1;
+            limit(inspect(temp.path(), &sized(limits)), "entries");
+            limits = BundleProfile::ReceiptLocal.limits();
+            limits.bytes = with_deno.total_bytes - 1;
+            limit(inspect(temp.path(), &sized(limits)), "bytes");
+            std::os::unix::fs::symlink("/never-read", temp.path().join(".deno/bad")).unwrap();
+            assert!(matches!(
+                inspect(temp.path(), &budget()),
+                Err(BundleError::Invalid(_))
+            ));
             for name in [
                 ".git",
                 "__pycache__",
