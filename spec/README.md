@@ -92,7 +92,7 @@ Ordem de leitura para implementar: README → 01 → 10 → o arquivo da fase/co
 
 - Múltiplos usuários, contas ou sincronização em nuvem.
 - App nativo mobile ou desktop (Tauri, Electron). A UI é só web.
-- macOS, Windows (inclusive WSL2) e Linux ARM64. Outras distros Linux x86-64 não são testadas.
+- Qualquer sistema operacional ou arquitetura além de Linux x86-64. Outras distros Linux x86-64 não são testadas.
 - Acesso remoto à UI (fora de localhost).
 - Distribuição de extensões via OCI e protocolo A2A.
 - Bancos especializados no core (vetorial, grafo, séries temporais). Extensões podem trazer os seus.

@@ -98,10 +98,6 @@ A partir da v0.1, o Fictor é desenvolvido de dentro do próprio Fictor, no Fedo
 
 Testes do core que criam sandboxes reais podem falhar dentro do Fictor por aninhamento de namespaces ([05-security.md](05-security.md#linux-bubblewrap)). Nesse caso, rodam no terminal ou na CI, e isso não bloqueia o marco.
 
-### Antes da v0.1
-
-O desenvolvimento acontece num Mac, que serve só como estação de edição. O core não compila para macOS. Build e testes do core só contam quando rodam em Linux x86-64: na máquina Fedora (por SSH) ou na CI. Testes unitários de TypeScript (shell, SDK, harness, extensões) podem rodar no Mac; integração com o core, só em Linux.
-
 ## Fase 1 — Auto-extensão
 
 Resultado: a IA cria extensões (tools, hooks, painéis) que o app passa a usar sem reiniciar.

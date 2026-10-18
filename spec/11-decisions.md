@@ -56,12 +56,10 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 - **Decisão.** Shell em `127.0.0.1` com cookie, Origin, CSRF e checagem de Host. Surfaces em `localhost` (host diferente), iframe sandboxed sem `allow-same-origin`, CSP sem rede.
 - **Consequências.** Extensões não tocam o DOM confiável nem a rede pelo navegador. Dados chegam às surfaces só por postMessage.
 
-## ADR-010 — Linux e macOS de primeira classe; Windows via WSL2
+## ADR-010 — Plataforma
 
 - **Status:** substituído pelo [ADR-030](#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic).
-- **Contexto.** O usuário alterna entre Fedora Atomic e macOS. Sandboxes nativas diferem por SO.
-- **Decisão.** Backends bubblewrap (Linux) e Seatbelt (macOS). Windows só via WSL2 na v1.
-- **Consequências.** Dois backends para manter e testar. Landlock e seccomp chegam na Fase 3.
+- **Decisão vigente.** Ver ADR-030.
 
 ## ADR-011 — Sem bancos especializados no core
 
@@ -77,9 +75,9 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-013 — Corte da v1.0 (resolve ARQ-001)
 
-- **Status:** gates por plataforma substituídos pelo [ADR-030](#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic); v0.1 redefinida pelo [ADR-031](#adr-031--v01-autossuficiente-e-fluxo-de-desenvolvimento).
+- **Status:** v0.1 redefinida pelo [ADR-031](#adr-031--v01-autossuficiente-e-fluxo-de-desenvolvimento).
 - **Contexto.** O roadmap tinha gates por fase, mas nenhuma release associada. Os requisitos R4 e R5 (padrões da internet só com auditoria) dependem da Fase 3.
-- **Decisão.** v0.1, v0.2 e v0.3 fecham as Fases 0, 1 e 2. A v1.0 exige as Fases 0–2 mais o núcleo da Fase 3 (importação de terceiros, auditoria, atualizações, Landlock e seccomp). Os demais itens da Fase 3 e a Fase 4 ficam para v1.x. Cada release exige os critérios nas duas máquinas reais (Fedora Atomic e macOS), CI verde e um teste por invariante. Detalhes em [10-roadmap.md](10-roadmap.md#releases).
+- **Decisão.** v0.1, v0.2 e v0.3 fecham as Fases 0, 1 e 2. A v1.0 exige as Fases 0–2 mais o núcleo da Fase 3 (importação de terceiros, auditoria, atualizações, Landlock e seccomp). Os demais itens da Fase 3 e a Fase 4 ficam para v1.x. Cada release exige os critérios na máquina Fedora COSMIC Atomic do usuário, CI verde e um teste por invariante. Detalhes em [10-roadmap.md](10-roadmap.md#releases).
 - **Consequências.** "v1.0" significa uso diário com extensões de terceiros auditadas. Ubuntu na CI não substitui o Fedora.
 
 ## ADR-014 — Mediação de dados e fluxo entre sessões (resolve ARQ-002)
@@ -125,15 +123,14 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 - **Decisão.** Lista de nomes e prefixos reservados no spec e no schema ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)). Colisão é erro bloqueante na validação, e o supervisor confere de novo no spawn. Não existe sobrescrita silenciosa.
 - **Consequências.** O ambiente de rede, de certificados e de carregamento é sempre o do core.
 
-## ADR-020 — Caminhos sensíveis e canal do kernel via TCP no Linux (resolve ARQ-009)
+## ADR-020 — Caminhos sensíveis e canal do kernel via TCP (resolve ARQ-009)
 
-- **Status:** partes sobre macOS revogadas pelo [ADR-030](#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic). O restante vale.
-- **Contexto.** Não há como listar todos os sockets de agentes. No Linux, montar um diretório somente leitura não impede `connect()` em sockets dentro dele. No macOS o Seatbelt já bloqueia sockets Unix não listados.
+- **Contexto.** Não há como listar todos os sockets de agentes. Montar um diretório somente leitura não impede `connect()` em sockets dentro dele.
 - **Decisão.**
   - Lista de caminhos sensíveis, mais descoberta (`SSH_AUTH_SOCK`, `gpgconf --list-dirs` sem iniciar agente, Docker, Podman, D-Bus). Montagem que é, contém ou está contida num caminho sensível é recusada. Sem `gpgconf`, usar os defaults e avisar.
-  - No Linux, o Kernel Protocol passa a usar TCP em `127.0.0.1:3129` dentro do namespace da instância, com `__sandbox-init` fazendo a ponte para o Unix socket (como já faz para o proxy). `FICTOR_KERNEL_SOCKET` vira `FICTOR_KERNEL_URL`.
+  - O Kernel Protocol usa TCP em `127.0.0.1:3129` dentro do namespace da instância, com `__sandbox-init` fazendo a ponte para o Unix socket (como já faz para o proxy). A variável é `FICTOR_KERNEL_URL`.
   - Na Fase 3, o seccomp nega `socket(AF_UNIX)` à carga de trabalho.
-- **Consequências.** Sockets fora da lista ficam inalcançáveis por estrutura no macOS agora, e no Linux a partir da Fase 3. Até lá é risco residual documentado. O sandbox Linux já implementado precisa trocar o bind de `/fx/kernel.sock` pela ponte TCP.
+- **Consequências.** Sockets fora da lista ficam inalcançáveis por estrutura a partir da Fase 3. Até lá é risco residual documentado. O sandbox já implementado precisa trocar o bind direto de `/fx/kernel.sock` para a carga de trabalho pela ponte TCP.
 
 ## ADR-021 — IPv6 na allowlist de rede (resolve ARQ-010)
 
@@ -159,15 +156,14 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-024 — Limites de recebimento e de bundle (resolve ARQ-013)
 
-- **Status:** a recusa de colisões por maiúsculas/minúsculas e NFC foi revogada pelo [ADR-030](#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic). O restante vale.
 - **Contexto.** Só a origem `ai` tinha teto de quantidade. Uma árvore local com muitos arquivos ou diretórios vazios podia esgotar memória ou tempo sem passar do teto em bytes.
 - **Decisão.**
   - Limites constantes de entradas, bytes, tamanho por arquivo, profundidade, tamanho de caminho e tempo, para três momentos: recebimento da origem `ai`, recebimento das demais origens e bundle após dependências.
   - O percurso é iterativo, conta enquanto avança e para no primeiro limite. A ordenação só ocorre depois.
   - Diretórios de dependências e de VCS são ignorados sem serem percorridos. Diretórios vazios são descartados.
-  - Nomes inválidos e colisões por maiúsculas/minúsculas ou NFC são recusados.
+  - Nomes que não sejam UTF-8 válido, ou que contenham caracteres de controle ou `\`, são recusados.
   - Tabela em [06-lifecycle.md](06-lifecycle.md#limites).
-- **Consequências.** Memória e tempo limitados em todas as origens. O hash e o store ficam iguais em Linux e macOS. Uma pasta local de desenvolvimento com `node_modules/` instala sem custo extra. A verificação de colisão por NFC exige normalização Unicode no core.
+- **Consequências.** Memória e tempo limitados em todas as origens. Uma pasta local de desenvolvimento com `node_modules/` instala sem custo extra.
 
 ## ADR-025 — Extensões globais só a partir da Fase 1 (resolve ARQ-014)
 
@@ -195,42 +191,38 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-028 — Ambiente de verificação para código não aprovado (resolve ARQ-017)
 
-- **Contexto.** O smoke e os testes rodam código ainda não aprovado. Conceder a ele os caminhos absolutos ou `~/` declarados permitiria ler ou alterar dados reais antes da decisão humana. O macOS não permite remontar esses caminhos com conteúdo sintético.
+- **Contexto.** O smoke e os testes rodam código ainda não aprovado. Conceder a ele os caminhos absolutos ou `~/` declarados permitiria ler ou alterar dados reais antes da decisão humana.
 - **Decisão.**
   - Toda execução anterior à aprovação usa um ambiente de verificação: `FICTOR_HOME` temporário, templates apontando para diretórios temporários, caminhos absolutos e `~/` não concedidos, sem rede, model proxy negando tudo e segredos substituídos por honeytokens ([06-lifecycle.md](06-lifecycle.md#ambiente-de-verificação)).
   - Autores não podem depender desses recursos em `initialize`, `tools/list` ou `resources/list`.
   - A revisão mostra os caminhos não concedidos.
 - **Consequências.** Bundles com caminhos absolutos passam pela verificação sem acesso aos dados reais. Uma extensão que leia esses caminhos já na inicialização falha no smoke e precisa ser corrigida pelo autor.
 
-## ADR-029 — Contenção de árvore de processos no macOS (resolve ARQ-018)
+## ADR-029 — Contenção da árvore de processos (resolve ARQ-018)
 
-- **Status:** revogado pelo [ADR-030](#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic). No Linux, o namespace de PID contém a árvore.
-- **Contexto.** No macOS não há namespace de PID. Com `spawn: true`, um descendente pode usar `setsid()`, trocar de grupo ou ficar órfão e sobreviver ao encerramento por grupo, ainda sob Seatbelt.
+- **Contexto.** Com `spawn: true`, um descendente pode chamar `setsid()`, trocar de grupo ou ficar órfão. Encerrar pelo grupo de processos não garante que a árvore inteira terminou.
 - **Decisão.**
-  - A pertença à instância é decidida pelo perfil Seatbelt herdado: mesmo UID, processo sob sandbox e perfil que permite escrever em `${tmp}/.instance`, verificado com `sandbox_check`.
-  - O encerramento revoga os tokens, sinaliza e varre até não sobrar membro, por até 10 s. Sem confirmação, a instância vira `cleanup_failed` e os recursos ficam retidos. O boot do core varre instâncias que sobraram.
-  - Fallback por ancestralidade se `sandbox_check` não estiver disponível.
-  - Detalhes em 05-security.md (seção removida pelo ADR-030) e [02-core.md](02-core.md#encerramento).
-- **Consequências.** A daemonização deixa de escapar, desde que `sandbox_check` funcione, o que precisa ser validado por teste adversarial a cada versão do macOS. No Linux nada muda: o namespace de PID já contém a árvore.
+  - A árvore da instância é o namespace de PID criado pelo bubblewrap, com `__sandbox-init` como PID 1. Quando o PID 1 morre, o kernel mata todos os processos do namespace.
+  - Encerrar a instância revoga os tokens, sinaliza a árvore e confirma pela saída do `bwrap`. Sem confirmação em 10 s, a instância vira `cleanup_failed` e os recursos ficam retidos.
+  - `--die-with-parent` cobre a morte do core; o boot seguinte limpa sockets e diretórios que sobraram ([02-core.md](02-core.md#encerramento)).
+- **Consequências.** Daemonização não escapa do encerramento. O critério 26 da Fase 0 verifica com fork duplo e `setsid()`.
 
 ## ADR-030 — Só Linux x86-64; alvo atual Fedora COSMIC Atomic
 
-- **Contexto.** O usuário decidiu que o Fictor roda só em Linux x86-64 e, por ora, só precisa funcionar no Fedora COSMIC Atomic. Manter macOS custava um segundo backend de sandbox, contenção de processos com API não documentada e regras de portabilidade.
+- **Contexto.** O Fictor é pessoal e roda na máquina do usuário, um desktop Fedora COSMIC Atomic x86-64. Uma única plataforma mantém um único backend de sandbox e um único conjunto de testes.
 - **Decisão.**
   - Plataforma suportada: Linux x86-64. Alvo validado e único gate: Fedora COSMIC Atomic, na versão estável corrente, na máquina do usuário. Outras distros Linux x86-64 podem funcionar, mas não são testadas nem bloqueiam release.
-  - Sem macOS, Windows/WSL2 nem Linux ARM64.
-  - O core falha na compilação fora de `target_os = "linux"` + `target_arch = "x86_64"`.
-  - Revogados: o backend Seatbelt, o transporte `unix://` do Kernel Protocol, a contenção por `sandbox_check` (ADR-029), as regras de macOS do ADR-020 e a recusa de colisões por maiúsculas/NFC do ADR-024.
+  - O core falha na compilação fora de `target_os = "linux"` + `target_arch = "x86_64"`. Não há código, testes nem CI para outros sistemas operacionais ou arquiteturas.
+  - O desenvolvimento acontece no próprio Fedora COSMIC Atomic.
   - Características do Fedora Atomic que viram requisitos: `/usr` imutável; `/home`, `/opt`, `/srv`, `/mnt`, `/root` e `/usr/local` são symlinks para `/var/...`; SELinux em modo enforcing; toolchains do usuário ficam em `$HOME` ou em pacotes sobrepostos com `rpm-ostree` ([05-security.md](05-security.md#linux-bubblewrap)).
-- **Consequências.** O implementador remove `sandbox/macos.rs`, a base Seatbelt, os testes e o job de macOS da CI. A CI passa a rodar Ubuntu 22.04 x86-64 e um container Fedora, mas o gate é a máquina do usuário.
+- **Consequências.** Código, testes e jobs de CI de outras plataformas saem do repositório. A CI roda Ubuntu 22.04 x86-64 e um container Fedora; o gate é a máquina do usuário.
 
 ## ADR-031 — v0.1 autossuficiente e fluxo de desenvolvimento
 
-- **Contexto.** O usuário quer chegar o mais cedo possível a uma versão que permita continuar desenvolvendo o Fictor de dentro do próprio Fictor no Linux. Até lá, o desenvolvimento acontece num Mac, onde o core não roda.
+- **Contexto.** O usuário quer chegar o mais cedo possível a uma versão que permita continuar desenvolvendo o Fictor de dentro do próprio Fictor.
 - **Decisão.**
   - **v0.1 = marco de autossuficiência.** Fase 0 completa, mais compactação no harness (antecipada da Fase 1), toolchains de desenvolvimento no sandbox, guarda de migração com backup e separação entre a instância de uso e as builds de teste ([10-roadmap.md](10-roadmap.md#marco-de-autossuficiência-v01)).
   - **Toolchains.** `[sandbox.toolchains]` monta, só leitura, caminhos de toolchains do usuário (rustup, cargo, deno) e define variáveis para extensões com `permissions.toolchains: true` ([04-extensions.md](04-extensions.md#permissões)). Caches graváveis ficam no workspace. Credenciais de registros continuam inacessíveis.
   - **O core não se substitui.** O Fictor compila builds novas do próprio core dentro do workspace. Instalar o binário e reiniciar o serviço é ação do usuário, fora do Fictor; nenhum sandbox tem escrita em `~/.local/bin`. Builds de teste usam `FICTOR_HOME` temporário.
   - **Push fica com o usuário.** O agente faz commits locais. `git push` acontece fora do Fictor, depois da revisão. Nenhuma credencial de git ou SSH entra no sandbox.
-  - **Até a v0.1, desenvolvimento no Mac.** O Mac é só estação de edição. Build e testes do core contam apenas quando rodam em Linux x86-64: na máquina Fedora (via SSH) ou na CI. TypeScript (shell, SDK, harness, extensões) pode ter testes unitários no Mac; a integração com o core é só em Linux.
 - **Consequências.** O caminho até usar o Fictor no dia a dia fica curto e explícito. A partir da v0.1, o Fictor desenvolve o Fictor, com o usuário controlando instalação, push e migrações.
