@@ -308,17 +308,13 @@ struct Environment {
 }
 impl Environment {
     async fn new(resolver: &DependencyResolver, script: String) -> Result<Self, DependencyError> {
-        // Installer registries have no wildcard contract in M0.5. Exact hosts
-        // and IP:port entries still pass through the normal proxy validation.
-        if resolver
-            .config
-            .installer
-            .registries
-            .iter()
-            .any(|registry| registry.contains('*'))
-        {
-            return Err(DependencyError::RegistryPolicy);
-        }
+        // Revalidate typed callers too, before opening the disposable home or
+        // starting any process. Package metadata never contributes authorities.
+        let nat64 = Nat64Prefixes::new(&resolver.config.egress.nat64_prefixes)
+            .map_err(|_| DependencyError::RegistryPolicy)?;
+        let registries =
+            super::registries::normalize(&resolver.config.installer.registries, &nat64)
+                .map_err(|_| DependencyError::RegistryPolicy)?;
         let root = Arc::new(
             tempfile::Builder::new()
                 .prefix("fx-deps-")
@@ -331,8 +327,7 @@ impl Environment {
         config.providers.clear();
         config.sandbox.home_ro_files.clear();
         config.egress.nat64_prefixes = resolver.config.egress.nat64_prefixes.clone();
-        let nat64 = Nat64Prefixes::new(&config.egress.nat64_prefixes)
-            .map_err(|_| DependencyError::Storage)?;
+        config.installer.registries = registries.clone();
         let store = Arc::new(
             Store::open(&home)
                 .await
@@ -364,12 +359,12 @@ impl Environment {
         fs::write(bootstrap.join("run"), script).map_err(|_| DependencyError::Storage)?;
         fs::set_permissions(bootstrap.join("run"), fs::Permissions::from_mode(0o555))
             .map_err(|_| DependencyError::Storage)?;
-        let manifest = Manifest::parse(&json!({
+        let manifest = Manifest::parse_with_nat64(&json!({
             "schema":1,"id":ID,"version":"0.1.0","description":"Core dependency installer bootstrap",
             "scope":"session","mcp":false,"kernel":["kv"],
             "runtime":{"kind":"binary","entry":"run","args":[candidate]},
-            "permissions":{"spawn":true,"net":{"allow":resolver.config.installer.registries}}
-        }).to_string()).map_err(|_| DependencyError::Storage)?;
+            "permissions":{"spawn":true,"net":{"allow":registries}}
+        }).to_string(), &nat64).map_err(|_| DependencyError::RegistryPolicy)?;
         let secrets = Arc::new(
             SecretStore::open(&home, BackendKind::File, Redactor::default())
                 .map_err(|_| DependencyError::Storage)?,
@@ -428,8 +423,11 @@ fn bootstrap(kind: DependencyKind) -> Result<String, DependencyError> {
             let npm = npm.to_str().ok_or(DependencyError::Runtime)?;
             // Node paths are separate flags; '$1' is a core-generated ext_data
             // path, never shell text from a manifest. No package child process.
+            // npm CLI flags override project .npmrc (npm 11 config reference,
+            // checked 2026-10-18). Candidate settings cannot bypass the proxy or
+            // turn off TLS verification; host user/global config is not loaded.
             Ok(format!(
-                "#!/bin/sh\nexec /usr/bin/node --permission --allow-fs-read=/usr --allow-fs-read=/tmp --allow-fs-read=\"$1\" --allow-fs-write=/tmp --allow-fs-write=\"$1\" -- '{}' ci --prefix \"$1\" --ignore-scripts --bin-links=false --audit=false --fund=false --update-notifier=false --fetch-retries=0 --cache=/tmp/npm-cache >/dev/null 2>&1\n",
+                "#!/bin/sh\numask 077\n: > /tmp/npm-userconfig\n: > /tmp/npm-globalconfig\nexec /usr/bin/node --permission --allow-fs-read=/usr --allow-fs-read=/tmp --allow-fs-read=\"$1\" --allow-fs-write=/tmp --allow-fs-write=\"$1\" -- '{}' ci --prefix \"$1\" --ignore-scripts --bin-links=false --audit=false --fund=false --update-notifier=false --fetch-retries=0 --cache=/tmp/npm-cache --userconfig=/tmp/npm-userconfig --globalconfig=/tmp/npm-globalconfig --proxy=\"${{HTTP_PROXY:?}}\" --https-proxy=\"${{HTTPS_PROXY:?}}\" --noproxy= --strict-ssl=true >/dev/null 2>&1\n",
                 npm.replace('\'', "'\\''")
             ))
         }

@@ -340,6 +340,7 @@ async fn denial_buckets_aggregate_per_instance_and_host_and_flush_on_shutdown() 
         assert_eq!(event.source, "core");
         assert_eq!(event.payload["ext_id"], "test-extension");
         assert_eq!(event.payload["host"], "blocked.invalid");
+        assert_eq!(event.payload["port"], 80);
         *counts
             .entry(event.payload["count"].as_u64().unwrap())
             .or_insert(0) += 1;
@@ -352,6 +353,47 @@ async fn denial_buckets_aggregate_per_instance_and_host_and_flush_on_shutdown() 
         4
     );
     assert!(!store.session(session).await.unwrap().flags.untrusted);
+}
+
+#[tokio::test]
+async fn denied_destinations_keep_ports_separate_without_recording_urls_or_credentials() {
+    let (_root, store, _) = fixture().await;
+    let proxy = EgressProxy::bind_tcp(store.clone(), vec![]).await.unwrap();
+    let token = proxy.register(identity("ports", None), &[]).unwrap();
+    for (method, destination) in [
+        (
+            "GET",
+            "http://blocked.invalid:18080/private-path?token=private-query",
+        ),
+        ("GET", "http://blocked.invalid:18080/other-private-path"),
+        ("CONNECT", "blocked.invalid:18443"),
+    ] {
+        let response = request(proxy.tcp_addr().unwrap(), format!("{method} {destination} HTTP/1.1\r\nHost: ignored\r\nProxy-Authorization: {}\r\nAuthorization: Bearer private-header\r\nConnection: close\r\n\r\n", token.basic_header())).await;
+        assert!(response.starts_with("HTTP/1.1 403"));
+    }
+    let response = request(proxy.tcp_addr().unwrap(), format!("GET http://private-user:private-password@blocked.invalid:18080/ HTTP/1.1\r\nHost: ignored\r\nProxy-Authorization: {}\r\nConnection: close\r\n\r\n", token.basic_header())).await;
+    assert!(response.starts_with("HTTP/1.1 400"));
+    proxy.shutdown().await.unwrap();
+    let events = store
+        .query_events(EventQuery {
+            session_id: Some("sys".into()),
+            kinds: vec!["net.denied".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut counts = BTreeMap::<u64, u64>::new();
+    for event in events {
+        assert_eq!(event.payload["host"], "blocked.invalid");
+        assert_eq!(event.payload.as_object().unwrap().len(), 4);
+        let payload = event.payload.to_string();
+        assert!(!payload.contains("private-"));
+        assert!(!payload.contains(token.expose()));
+        *counts
+            .entry(event.payload["port"].as_u64().unwrap())
+            .or_default() += event.payload["count"].as_u64().unwrap();
+    }
+    assert_eq!(counts, BTreeMap::from([(18080, 2), (18443, 1)]));
 }
 #[tokio::test]
 async fn unix_endpoint_is_private_authenticated_and_removed_at_shutdown() {

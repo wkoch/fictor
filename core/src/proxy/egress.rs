@@ -64,9 +64,10 @@ struct Registration {
 struct Denial {
     ext_id: String,
     host: String,
+    port: u16,
     count: u64,
 }
-type Buckets = HashMap<(String, String, u64), Denial>;
+type Buckets = HashMap<(String, String, u16, u64), Denial>;
 struct State {
     store: Arc<Store>,
     trusted: HashSet<String>,
@@ -110,14 +111,14 @@ impl State {
         let current = minute()?;
         let keys: Vec<_> = buckets
             .keys()
-            .filter(|key| all || key.2 != current)
+            .filter(|key| all || key.3 != current)
             .cloned()
             .collect();
         for key in keys {
             if let Some(bucket) = buckets.get(&key) {
                 let result = self.store.append(AppendEvent {
                     session_id: "sys".into(), parent_id: None, kind: "net.denied".into(), actor: "core".into(),
-                    payload: serde_json::json!({"ext_id":bucket.ext_id,"host":bucket.host,"count":bucket.count}),
+                    payload: serde_json::json!({"ext_id":bucket.ext_id,"host":bucket.host,"port":bucket.port,"count":bucket.count}),
                     blob_refs: vec![], provenance: Provenance::core(),
                 }).await;
                 if let Err(error) = result {
@@ -129,7 +130,12 @@ impl State {
         }
         Ok(())
     }
-    async fn deny(&self, identity: &ProxyIdentity, host: &str) -> Result<(), ProxyError> {
+    async fn deny(
+        &self,
+        identity: &ProxyIdentity,
+        host: &str,
+        port: u16,
+    ) -> Result<(), ProxyError> {
         // Persistence belongs to the timer/shutdown tasks, which are awaited to
         // completion. Canceling an HTTP request must never interrupt an audit commit.
         let mut buckets = self.denials.lock().await;
@@ -138,6 +144,7 @@ impl State {
         let key = (
             identity.instance_id.clone(),
             host.to_ascii_lowercase(),
+            port,
             minute()?,
         );
         if *self.shutdown.borrow() {
@@ -149,6 +156,7 @@ impl State {
         let bucket = buckets.entry(key).or_insert_with(|| Denial {
             ext_id: identity.ext_id.clone(),
             host: host.to_ascii_lowercase(),
+            port,
             count: 0,
         });
         bucket.count = bucket.count.saturating_add(1);
@@ -537,7 +545,9 @@ async fn handle(request: Request<Incoming>, state: Arc<State>) -> Response<Body>
     };
     let target = match registration.allowlist.authorize(host, port, kind) {
         Ok(target) => target,
-        Err(AllowlistError::Denied) => return deny(&state, &registration.identity, host).await,
+        Err(AllowlistError::Denied) => {
+            return deny(&state, &registration.identity, host, port).await;
+        }
         Err(_) => return response(StatusCode::BAD_REQUEST, "invalid destination host"),
     };
     let mut revoked = registration.revoked.subscribe();
@@ -548,8 +558,8 @@ async fn handle(request: Request<Incoming>, state: Arc<State>) -> Response<Body>
         result = forward(request,state.clone(),registration.clone(),target,connect) => result,
     }
 }
-async fn deny(state: &State, identity: &ProxyIdentity, host: &str) -> Response<Body> {
-    if state.deny(identity, host).await.is_err() {
+async fn deny(state: &State, identity: &ProxyIdentity, host: &str, port: u16) -> Response<Body> {
+    if state.deny(identity, host, port).await.is_err() {
         response(StatusCode::SERVICE_UNAVAILABLE, "audit unavailable")
     } else {
         response(StatusCode::FORBIDDEN, "egress denied")
@@ -578,7 +588,7 @@ async fn forward(
         .validate_resolved(&addresses.iter().map(SocketAddr::ip).collect::<Vec<_>>())
         .is_err()
     {
-        return deny(&state, &registration.identity, target.host()).await;
+        return deny(&state, &registration.identity, target.host(), target.port()).await;
     }
     let stream = match tokio::time::timeout(
         Duration::from_secs(10),

@@ -88,7 +88,7 @@ Definido pelo usuário em 2026-10-18:
   IP literal, localhost e destinos não públicos exigem host exato e porta explícita.
   IPv6 segue ADR-021; prefixos NAT64 configurados seguem RFC 6052/ADR-023 e o /48
   local é não público. `doctor` só sugere prefixos, sem mudar política.
-- Tokens revogados encerram túneis. Negações são agregadas por instância/host/minuto
+- Tokens revogados encerram túneis. Negações são agregadas por instância/host/porta/minuto
   UTC e descarregadas para `sys`; falha de auditoria fecha o proxy. Encerramento
   abrupto pode perder o bucket em memória, conforme risco registrado.
 - Providers HTTP só usam loopback literal autorizado. Model proxy reserva orçamento
@@ -472,3 +472,24 @@ constraints do journal e dos escopos de crash, recusa de escrita após perda de 
 backup/restauração de dados e imutabilidade dos eventos. Isso verifica o protocolo
 SQLite escolhido, sem simular uma perda física de energia. A existência das tabelas
 não encerra a promoção recuperável nem a supervisão de crash loops.
+
+## Registros de dependências — ADR-040
+
+`Config::parse` normaliza autoridades exatas e o resolver confere novamente a
+lista inteira antes de criar o ambiente descartável. Porta omitida permanece
+omitida; wildcard, URLs, IP/localhost sem porta e a rota interna de modelos são
+recusados. A allowlist usa a validação existente de DNS/IP/NAT64 do proxy, sem
+somar permissões da candidata nem destinos descobertos em redirects.
+
+Dois testes reais reproduziram uma configuração `.npmrc` da candidata removendo
+o proxy e outra desabilitando a validação TLS. O bootstrap agora fixa proxy,
+`noproxy`, `strict-ssl` e arquivos globais/usuário descartáveis em flags npm de
+maior prioridade. A configuração não executa scripts nem recebe credenciais do
+host. Testes npm/uv com servidores locais cobrem redirects por porta/alias,
+integridade, configuração hostil e recusa de certificado inválido.
+
+`net.denied` registra a porta numérica junto do host; o agrupamento conserva
+destinos com portas distintas. Esse detalhe interno cumpre o diagnóstico exigido
+pelo ADR sem registrar URL, query, userinfo ou cabeçalhos. Dependencies (19),
+local checker (14) e proxy (10) passaram no Toolbx Fedora 44 sobre Bazzite;
+logs locais `adr040-dependencies-local-final.log` e `m05-contracts-store-tests.log`.

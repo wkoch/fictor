@@ -154,7 +154,7 @@ pub enum ConfigError {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
+        let mut config: Self = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
         if config
             .runtimes
             .values()
@@ -175,8 +175,12 @@ impl Config {
                 "shell e surfaces precisam de portas distintas",
             ));
         }
-        crate::proxy::nat64::Nat64Prefixes::new(&config.egress.nat64_prefixes)
+        let nat64 = crate::proxy::nat64::Nat64Prefixes::new(&config.egress.nat64_prefixes)
             .map_err(|_| ConfigError::Invalid("egress.nat64_prefixes exige prefixos IPv6 canônicos /32, /40, /48, /56, /64 ou /96"))?;
+        config.installer.registries =
+            crate::installer::registries::normalize(&config.installer.registries, &nat64).map_err(
+                |_| ConfigError::Invalid("installer.registries exige autoridades exatas válidas"),
+            )?;
         for provider in config.providers.values() {
             crate::proxy::models::validate_provider(provider).map_err(|_| {
                 ConfigError::Invalid(

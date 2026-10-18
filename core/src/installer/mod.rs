@@ -8,6 +8,7 @@ pub mod lock;
 pub mod manifest;
 pub mod promotion;
 pub mod recovery;
+pub(crate) mod registries;
 
 pub use bundle::{
     BundleBudget, BundleFile, BundleProfile, Inspection, MAX_BUNDLE_BYTES, copy_local, inspect,
