@@ -1,7 +1,27 @@
 # Pendências para o arquiteto
 
-ARQ-020–024 abertas em 2026-10-18 durante a continuação do M0.5.
+ARQ-020–025 abertas em 2026-10-18 durante a continuação do M0.5.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-025 — Disponibilidade e estado de `fictor ext list`
+
+- **Status: aberta.**
+- **Referência:** `spec/02-core.md`, seção CLI, parágrafo inicial e comando
+  `fictor ext list`; `spec/06-lifecycle.md`, lock.
+- **Dúvida:** a tabela prevê `ext list` na Fase 0 para exibir extensões, versões
+  ativas e estado. O parágrafo inicial afirma que, sem servidor, só funcionam
+  `init`, `doctor`, `secrets`, `serve` e `ext rollback|enable|disable`, excluindo
+  `ext list`. A regra anterior trata de comandos que alteram estado, mas a lista
+  exclusiva também inclui `doctor`, de leitura. Não está claro se `ext list` pode
+  ler um snapshot validado do lock sem servidor, ou se exige estado vivo via
+  `admin.sock`, cujo contrato ainda não foi especificado.
+- **Necessário:** ADR esclarecendo a disponibilidade offline da listagem e se
+  “estado” significa a intenção `enabled` do lock ou também saúde dos processos.
+  Caso exija servidor, definir a requisição administrativa correspondente.
+- **Impacto:** a exposição de `ext list` pela CLI aguarda o ADR. Não foi criado
+  protocolo administrativo, comando offline divergente nem API sem consumidor.
+  As leituras existentes do lock por `tools.list` e `catalog.list` continuam
+  inalteradas.
 
 ## ARQ-020 — Recuperação da promoção entre filesystem, lock e evento
 
