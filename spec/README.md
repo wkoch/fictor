@@ -55,6 +55,7 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | [schemas/extension.schema.json](schemas/extension.schema.json) | JSON Schema do manifest `fictor.yaml`. |
 | [schemas/0001_init.sql](schemas/0001_init.sql) | Migração inicial do SQLite. |
 | [schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql) | Migração 0002: orçamento do model proxy e flags de workspace e de extensão. |
+| [schemas/0003_proposal_receipts.sql](schemas/0003_proposal_receipts.sql) | Migração 0003: propostas duráveis antes da identidade do manifest. |
 
 Ordem de leitura para implementar: README → 01 → 10 → o arquivo da fase/componente em andamento.
 

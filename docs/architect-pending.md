@@ -1,5 +1,20 @@
 # Pendências para o arquiteto
 
+Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
+
+## ARQ-019 — Recebimento inválido antes da identidade do manifest
+
+- **Status: resolvida em 2026-10-18 — [ADR-035](../spec/11-decisions.md#adr-035--propostas-duráveis-antes-da-identidade-resolve-arq-019).**
+- **Resolução:** proposta registrada antes de abrir a origem; `ext_id` e `version`
+  nulos em conjunto até validar o manifest; migração 0003 sem alterar migrações
+  anteriores. Falhas têm motivo estável e evento atômico. Recuperação encerra
+  tentativas interrompidas e limpa temporários sem seguir links nem inventar
+  registros para órfãos legados. Contrato em `spec/06-lifecycle.md` e
+  `spec/03-kernel-protocol.md`; critérios 35–37 da Fase 0.
+- **Entrega ao implementador:** copiar/aplicar a migração especificada, adaptar
+  leituras e transições de propostas, recebimento, auditoria, recuperação e testes.
+  O código desses itens permanece pendente em M0.5.
+
 Registradas em 2026-10-17 durante a implementação. As pendências ARQ-001–018
 foram resolvidas pelo arquiteto nos ADRs 013–029. Os ADRs 030/031 definem
 Linux x86-64, Fedora COSMIC Atomic e a prioridade da v0.1 autossuficiente.

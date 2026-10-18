@@ -120,7 +120,8 @@ reinício do serviço são ações do usuário, fora do sandbox.
   rename. A escrita ainda não está ligada à promoção.
 - `ext check` permite `binary`/`none`; Deno/npm/uv falham antes de executar até haver
   resolver. Checks aprovados continuam em quarentena. Falhas antes da identificação
-  do manifest e recuperação após interrupção ainda precisam de registro durável.
+  do manifest e recuperação após interrupção têm contrato no ADR-035 (ARQ-019 resolvida); migração
+  0003, adaptação do recebimento e recuperação ainda precisam ser implementadas.
 - Kernel `log` aguarda ligação ao sink do supervisor. Tools, hooks, UI, timers e
   aprovação aguardam seus marcos; nenhuma rota incompleta simula sucesso.
 
@@ -131,8 +132,10 @@ reinício do serviço são ações do usuário, fora do sandbox.
 2. Completar M0.5, incluindo aplicação/testes dos ADRs 025–029 e dos requisitos Atomic;
    resolvers, promoção, lock, ativação, recuperação e backoff.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
-4. Seguir M0.6–M0.10 e os **31 critérios da Fase 0**, incluindo autossuficiência,
+4. Seguir M0.6–M0.10 e os **37 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
 
 ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural não implica
-implementação nem release concluída; consulte [architect-pending.md](architect-pending.md).
+implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
+2026-10-18, com implementação pendente em M0.5; consulte
+[architect-pending.md](architect-pending.md).

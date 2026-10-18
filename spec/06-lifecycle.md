@@ -18,28 +18,70 @@ Um único pipeline para todo código que entra no store: escrito pela IA, instal
 
 ```text
 received ──► checking ──► checked ──► approved ──► promoted
-                 │            │
-                 ▼            ▼
-               failed      rejected
+    │             │            │
+    ▼             ▼            ▼
+  failed        failed      rejected
 ```
 
-- `failed`: erro objetivo nas checagens (schema inválido, smoke test falhou, teste falhou). Pode ser reenviada como proposta nova.
+- `received`: tentativa admitida e registrada; o recebimento ou a validação do manifest ainda pode estar incompleto.
+- `failed`: erro objetivo no recebimento ou nas checagens, ou interrupção recuperada no boot. É terminal; reenviar cria uma proposta nova.
 - `rejected`: decisão humana.
 - `approved` por `user` ou `auto:dev-profile`.
 
-Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`proposal.updated`).
+Criação e toda transição gravam a proposta e o evento `ext.*` na sessão `sys` na mesma transação da task única de escrita. O shell é notificado (`proposal.updated`) somente depois do commit. Os payloads estão em [03-kernel-protocol.md](03-kernel-protocol.md#gravados-pelo-core).
+
+### Identidade e persistência
+
+[ADR-035](11-decisions.md#adr-035--propostas-duráveis-antes-da-identidade-resolve-arq-019). A tentativa é identificada pelo `proposal_id`, independentemente da identidade da extensão:
+
+- `proposals.ext_id` e `proposals.version` são ambos `NULL` ou ambos preenchidos. Identidade ausente só é permitida em `received` e `failed`; strings vazias, nomes inventados e versões sentinela são proibidos. Nas representações JSON da proposta, ambos os campos são `null` quando ausentes.
+- Ao admitir a tentativa, gerar o ULID e o nonce e persistir `source`, `tainted`, estado `received` e timestamps, junto com `ext.proposed`, **antes de abrir, percorrer ou copiar a origem**. `source.kind` vem do canal de entrada; `tainted` vem das flags da sessão, nunca do bundle. Antes da identidade, `manifest`, `hash`, `update_of`, `packages` e `audit_blob` ficam nulos.
+- Ler e validar o manifest da cópia recebida. Somente depois da validação completa da etapa 2, vincular `ext_id`, `version`, `manifest` normalizado e `update_of` ao passar de `received` para `checking`, numa única transação. A identidade não pode ser substituída depois; alteração exige proposta nova. Registros legados já identificados em `received` mantêm a identidade.
+- Sem identidade validada, não resolver dependências, executar código, pedir aprovação nem promover. Identificar a extensão não concede permissões nem dispensa as demais checagens.
+- A migração [0003_proposal_receipts.sql](schemas/0003_proposal_receipts.sql) preserva todas as propostas existentes e o índice `proposals_state`. As migrações 0001/0002 e os eventos antigos não mudam. Backup e recusa de downgrade seguem [02-core.md](02-core.md#sqlite).
 
 ## Etapas
 
 ### 1. Recebimento
 
-- Percorrer a origem de forma iterativa e copiar para `quarantine/<proposal_id>/`.
+- Depois do registro durável, percorrer a origem de forma iterativa e copiar para um diretório novo e privado `quarantine/.receipt-<proposal_id>/`. Nunca reutilizar nem sobrescrever um destino existente.
 - **Ignorados**: não são percorridos, não contam nos limites e aparecem na lista de ignorados da proposta. São eles `.git/` em qualquer nível, `__pycache__/` em qualquer nível e, na raiz do bundle, `node_modules/`, `vendor/`, `.pydeps/` e `.venv/`. Dependências sempre vêm da etapa 3.
 - **Recusados** (proposta `failed`): symlinks; arquivos especiais; caminhos absolutos ou com `..`; nomes que não sejam UTF-8 válido ou que contenham caracteres de controle ou `\`.
 - Diretórios vazios não entram no bundle.
 - O percurso conta entradas e bytes enquanto avança e para no primeiro limite excedido ([Limites](#limites)). A ordenação para o hash só acontece depois, com o percurso já dentro dos limites; assim, memória e tempo ficam limitados pelos tetos.
 - Origens remotas (Fase 3): o core resolve a referência para um SHA de commit (`git ls-remote`) ou versão exata de pacote e baixa nessa versão. O download roda num sandbox com rede só para o host de origem.
-- Registrar a proposta (`proposals`), com `tainted = 1` se veio de sessão com U.
+- Depois da cópia e da validação do manifest, renomear o temporário para `quarantine/<proposal_id>/`, sem sobrescrever outro destino, e sincronizar o diretório pai antes de gravar a transição para `checking`. A recuperação abaixo cobre a janela entre filesystem e banco.
+
+#### Falhas antes da identidade
+
+Persistir `failed` e `ext.failed` na mesma transação, mantendo os metadados da tentativa e os checks já obtidos. Acrescentar um check `{name, passed: false, blocking: true, detail: reason}`, com os códigos abaixo; `reason` também vai no evento. Parar no primeiro erro, sem continuar a leitura para tentar descobrir a identidade.
+
+| Situação | `name` | `reason` |
+|---|---|---|
+| Teto excedido | `receipt` | Os códigos `limit:*` definidos em [Limites](#limites) |
+| Symlink, arquivo especial ou caminho/nome proibido, inclusive colisão de nomes | `receipt` | `receipt:symlink`, `receipt:special_file` ou `receipt:invalid_path` |
+| Origem mudou durante a cópia | `receipt` | `receipt:source_changed` |
+| Origem inacessível, erro de leitura, cópia, rename ou sincronização | `receipt` | `receipt:io` |
+| Manifest ausente | `manifest` | `manifest:missing` |
+| Manifest não é UTF-8/YAML válido, tem duplicatas ou construção YAML proibida | `manifest` | `manifest:invalid_yaml` |
+| Manifest viola schema ou regras semânticas | `manifest` | `manifest:invalid` (preservar `phase:global` no caso do ADR-025) |
+| Tentativa interrompida, recuperada no boot | `recovery` | `recovery:interrupted` |
+
+Os motivos são códigos do core. Não incluir caminhos absolutos, nomes inválidos, conteúdo de arquivos, YAML bruto, segredos nem mensagens arbitrárias de bibliotecas no check de falha ou no evento. A revisão mostra uma explicação produzida pelo core a partir do código. A CLI devolve o `proposal_id` junto do motivo depois do commit, inclusive quando não há identidade.
+
+Depois do commit de `failed`, remover a cópia temporária e, se ainda não houver identidade, o destino `quarantine/<proposal_id>/` eventualmente criado pelo rename, seguindo as regras de limpeza abaixo. A limpeza dos bytes não apaga a proposta nem seus eventos.
+
+Se a persistência inicial falhar, não iniciar o recebimento. Se a persistência de `failed` falhar, interromper o pipeline e reportar erro de persistência com o ID já alocado, sem afirmar que a falha foi auditada. O estado durável anterior será reconciliado no boot.
+
+#### Recuperação de recebimentos
+
+No boot, antes de admitir operações do instalador e sem outro worker ativo no mesmo `FICTOR_HOME`:
+
+1. Propostas `received` ou `checking` deixadas pela execução anterior passam a `failed`, com o check e evento `recovery:interrupted`, mesmo se não houver diretório. Preservar identidade e checks existentes. Não retomar a leitura da origem nem executar novamente dependências ou smoke. Reenvio é uma tentativa nova.
+2. Limpar `.receipt-<ULID>` após reconciliar a proposta correspondente. Limpar também `quarantine/<proposal_id>/` de propostas `failed` sem identidade, cobrindo a interrupção após o rename. Bundles de propostas identificadas que falharam ficam para revisão; `checked`, `approved`, `rejected` e `promoted` não são alteradas por esta recuperação.
+3. Um `.receipt-<ULID>` sem proposta correspondente, inclusive de versão anterior a este ADR, é temporário órfão: limpar e emitir diagnóstico, sem inventar proposta, origem ou identidade a partir de seus bytes. Outros diretórios desconhecidos não são apagados por esta regra.
+
+A limpeza atua somente nas entradas internas reconhecidas da quarentena, ancorada no diretório aberto pelo core, sem seguir symlinks nem atravessar pontos de montagem. Um symlink é removido como link, sem tocar o destino. Nunca remover a origem ou conteúdo do store. Falha de limpeza mantém o diagnóstico e permite nova tentativa no boot seguinte; não desfaz `failed`. Se a reconciliação no banco falhar, não admitir operações do instalador. Repetir a recuperação não duplica eventos de falha nem muda estados terminais. Nenhum processo sobrevivente pode usar os diretórios durante a limpeza; vale o encerramento confirmado do ADR-029.
 
 ### 2. Normalização
 
