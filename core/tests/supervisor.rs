@@ -798,24 +798,240 @@ async fn unexpected_parent_exit_also_removes_double_forked_setsid_descendants() 
 async fn killing_core_owner_also_ends_the_entire_sandbox_namespace() {
     let parent = tempfile::Builder::new()
         .prefix("fx-owner-")
+        // A failed namespace helper retains its fake resources for inspection;
+        // no destructor guesses whether its surviving children have exited.
+        .disable_cleanup(true)
         .tempdir_in("/tmp")
         .unwrap();
-    let ready = parent.path().join("ready");
-    let mut owner = Command::new(std::env::current_exe().unwrap())
+    let output = tokio::process::Command::new("/usr/bin/unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "--propagation",
+            "private",
+            "--kill-child=KILL",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "core_recovery_namespace", "--nocapture"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("FICTOR_TEST_RECOVERY_ROOT", parent.path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(30), output)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nretained: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        parent.path().display()
+    );
+    assert_eq!(
+        fs::read(parent.path().join("recovered")).unwrap(),
+        b"two boots verified"
+    );
+    fs::remove_dir_all(parent.path()).unwrap();
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreOwnerReady {
+    home: PathBuf,
+    workspace: PathBuf,
+    instance_id: String,
+    head: Option<String>,
+}
+
+#[tokio::test]
+async fn core_recovery_namespace() {
+    use fictor::{
+        instance_recovery::{InstanceState, ProcessHandle, StateRecord},
+        ownership::HomeLease,
+    };
+    use std::os::unix::{fs::FileTypeExt, process::ExitStatusExt};
+
+    let Some(parent) = std::env::var_os("FICTOR_TEST_RECOVERY_ROOT") else {
+        return; // Opt-in helper, never recursively launch a test from the suite.
+    };
+    let parent = PathBuf::from(parent).canonicalize().unwrap();
+    assert_eq!(
+        std::process::id(),
+        1,
+        "requires the wrapper's private PID namespace"
+    );
+    let observer = ProcessHandle::capture(1, false).unwrap();
+    assert!(observer.is_init());
+    let mut owner = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "core_owner_subprocess", "--nocapture"])
-        .env("FICTOR_TEST_OWNER_ROOT", parent.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("FICTOR_TEST_OWNER_ROOT", &parent)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .unwrap();
-    wait_file(&ready).await;
-    let workspace = PathBuf::from(fs::read_to_string(&ready).unwrap());
-    let namespace = fs::read_to_string(workspace.join("daemon.namespace")).unwrap();
-    assert!(!namespace_members(&namespace).is_empty());
-    owner.kill().unwrap(); // SIGKILL: no Rust destructors or async shutdown run.
-    assert!(!owner.wait().unwrap().success());
-    assert_namespace_ended(&workspace).await;
+    wait_file(&parent.join("ready")).await;
+    let ready: CoreOwnerReady =
+        serde_json::from_slice(&fs::read(parent.join("ready")).unwrap()).unwrap();
+    assert!(ready.home.starts_with(&parent) && ready.workspace.starts_with(&parent));
+    let instance = ready.home.join("run/instances").join(&ready.instance_id);
+    let state = fs::read(instance.join("state.json")).unwrap();
+    let record = StateRecord::parse(&state, &ready.instance_id).unwrap();
+    assert_eq!(record.state, InstanceState::Armed);
+    assert_eq!(record.owner.pid, owner.id().unwrap());
+    assert_eq!(record.observer_pidns, observer.namespace());
+    assert_eq!(
+        record.boot_id,
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+    );
+    let owner_handle = ProcessHandle::capture(record.owner.pid, false).unwrap();
+    assert_eq!(record.owner, owner_handle.identity());
+    let launcher = ProcessHandle::capture(record.launcher.unwrap().pid, false).unwrap();
+    let init = ProcessHandle::capture(record.init.unwrap().pid, true).unwrap();
+    assert_eq!(Some(launcher.identity()), record.launcher);
+    assert_eq!(Some(init.identity()), record.init);
+    assert_eq!(Some(init.namespace()), record.sandbox_pidns);
+    assert_ne!(init.namespace(), observer.namespace());
+    assert!(!launcher.is_exited().unwrap() && !init.is_exited().unwrap());
+    assert!(
+        fs::metadata(ready.workspace.join("daemon.activity"))
+            .unwrap()
+            .len()
+            > 0
+    );
+
+    let temporary = instance.join("tmp");
+    let kernel = ready
+        .home
+        .join("run/k")
+        .join(format!("{}.sock", ready.instance_id));
+    let admission = instance.join("admission.sock");
+    for socket in [&kernel, &admission] {
+        assert!(
+            fs::symlink_metadata(socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+    assert!(temporary.is_dir());
+    fs::write(temporary.join("boot-canary"), b"fake disposable data").unwrap();
+    let legacy = ready
+        .home
+        .join("run")
+        .join(format!("{}.pid", ready.instance_id));
+    let legacy_bytes = fs::read(&legacy).unwrap();
+    let proxy = ready.home.join("run/proxy.sock");
+    assert!(
+        fs::symlink_metadata(&proxy)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    let preserved = ready.workspace.join("preserve-after-boot");
+    fs::write(&preserved, b"fake workspace data").unwrap();
+    assert!(HomeLease::acquire(&ready.home).is_err());
+
+    // Kill only our unreaped Child. No destructor or graceful supervisor audit
+    // runs in the owner; every subsequent /proc lookup is within this namespace.
+    owner.start_kill().unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), owner.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit.signal(), Some(libc::SIGKILL));
+    assert!(owner_handle.is_exited().unwrap());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // PID 1 reaps only its fake, adopted children. Numeric PID lookup
+            // never authorizes a signal or the recovery's resource deletion.
+            let no_children = loop {
+                let mut status = 0;
+                // SAFETY: status is writable; waitpid(-1) observes only this
+                // private namespace init's own children, without signalling.
+                let reaped = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if reaped > 0 {
+                    continue;
+                }
+                if reaped < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ECHILD)
+                    );
+                    break true;
+                }
+                break false;
+            };
+            if launcher.is_exited().unwrap() && init.is_exited().unwrap() && no_children {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fs::read(instance.join("state.json")).unwrap(), state);
+    assert!(temporary.join("boot-canary").is_file() && kernel.exists() && admission.exists());
+
+    let lease = HomeLease::acquire(&ready.home).unwrap();
+    // Both calls use the real boot pipeline in the same observer namespace and
+    // kernel boot. No record, identity, timestamp or reboot ID is fabricated.
+    for _ in 0..2 {
+        fictor::initialize_owned(lease.clone()).await.unwrap();
+        assert!(
+            !instance.exists() && !temporary.exists() && !kernel.exists() && !admission.exists()
+        );
+        assert_eq!(fs::read(&preserved).unwrap(), b"fake workspace data");
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+        assert!(
+            fs::symlink_metadata(&proxy)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        let store = Store::open_with_lease(lease.clone()).await.unwrap();
+        assert_eq!(
+            store.session("sys".into()).await.unwrap().head_id,
+            ready.head
+        );
+        let events = store
+            .query_events(EventQuery {
+                kinds: vec!["ext.started".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["instance_id"], ready.instance_id);
+        let invented = store
+            .query_events(EventQuery {
+                kinds: vec![
+                    "ext.crashed".into(),
+                    "ext.crash_blocked".into(),
+                    "ext.cleanup_failed".into(),
+                    "ext.stopped".into(),
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(invented.is_empty());
+        store.shutdown().await.unwrap();
+    }
+    fs::write(parent.join("recovered"), b"two boots verified").unwrap();
 }
 
 #[tokio::test]
@@ -834,7 +1050,7 @@ async fn core_owner_subprocess() {
         true,
         false,
     );
-    let _instance = fixture
+    let instance = fixture
         .supervisor
         .spawn(
             &manifest,
@@ -846,7 +1062,18 @@ async fn core_owner_subprocess() {
         .await
         .unwrap();
     wait_file(&fixture.workspace.join("daemon.activity")).await;
-    fs::write(parent.join("ready"), fixture.workspace.to_str().unwrap()).unwrap();
+    let ready = CoreOwnerReady {
+        home: fixture.home.clone(),
+        workspace: fixture.workspace.clone(),
+        instance_id: instance.instance_id.clone(),
+        head: fixture.store.session("sys".into()).await.unwrap().head_id,
+    };
+    fs::write(
+        parent.join("ready.tmp"),
+        serde_json::to_vec(&ready).unwrap(),
+    )
+    .unwrap();
+    fs::rename(parent.join("ready.tmp"), parent.join("ready")).unwrap();
     std::future::pending::<()>().await;
 }
 

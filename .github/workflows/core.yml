@@ -109,7 +109,7 @@ jobs:
           --test install_online --test install_status_races --test instance_recovery
           --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
           --test manifest --test migrations --test model_tls --test models --test overrides --test ownership --test proposals
-          --test promotion --test promotion_journal --test proposal_recovery
+          --test promotion --test promotion_crash --test promotion_journal --test proposal_recovery
           --test proxy --test secrets_ownership --test store
           -- --skip doctor_reports_development_runtime_status_without_modifying_config
           --skip a_bind_alias_in_a_private_namespace_competes_for_the_same_inode
