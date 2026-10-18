@@ -1,7 +1,31 @@
 # Pendências para o arquiteto
 
-ARQ-020–025 abertas em 2026-10-18 durante a continuação do M0.5.
+ARQ-020–026 abertas em 2026-10-18 durante a continuação do M0.5.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-026 — Destinos de links dos arquivos de controle do core
+
+- **Status: aberta.**
+- **Referência:** I11; `spec/05-security.md`, perfil de sandbox e proveniência
+  (`config.get` como escrita do usuário, `trusted/public`); `spec/03-kernel-protocol.md`,
+  `config.get`; `core/src/sandbox/mod.rs`, `validate_grant`.
+- **Dúvida:** `config.get` lê `config.toml` e `AGENTS.md` globais aceitando links
+  para arquivos regulares. A proteção de montagens cobre a árvore canônica de
+  `FICTOR_HOME`, mas não acrescenta os destinos desses links fora dela. Se o
+  usuário apontar um arquivo de controle para um workspace ou `${ext_data}`
+  gravável por extensão, o conteúdo pode mudar sem escrita humana. Outra sessão
+  o recebe pela rota considerada `trusted/public`, sem as flags da sessão que
+  escreveu. O TOML também pode ser alterado para o próximo boot. Apenas exigir
+  alvo regular evita bloqueios de I/O; não prova essa premissa de autoria.
+- **Necessário:** ADR definindo a colocação permitida dos arquivos de controle
+  e o tratamento de links existentes. Esclarecer se os destinos canônicos entram
+  na proteção de montagens, se esses links são recusados ou se há outra mediação
+  que preserve I11, incluindo trocas de alvo e arquivos ainda não criados.
+- **Impacto:** uma nova política para esses destinos aguarda o ADR. A correção
+  independente de leitura recusa pipes/dispositivos sem abolir links regulares
+  já aceitos. Não foi criado fallback de proveniência nem grant que permita
+  escrita em `FICTOR_HOME`. Arquivos globais em destinos graváveis por extensões
+  não têm garantia de autoria humana estabelecida pelo contrato atual.
 
 ## ARQ-025 — Disponibilidade e estado de `fictor ext list`
 
