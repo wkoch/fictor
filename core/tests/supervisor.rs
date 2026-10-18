@@ -691,6 +691,103 @@ writeFileSync(`${process.env.FICTOR_WORKSPACE}/node-result`, 'denied');
 }
 
 #[tokio::test]
+async fn kernel_logs_from_node_share_the_extension_log_and_redact_instance_credentials() {
+    let fixture = Fixture::new().await;
+    fixture
+        .secrets
+        .set("fake_log", "fake-log-credential\nsecond-line")
+        .unwrap();
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(false, "exit 0");
+    fs::write(bundle.join("main.mjs"), r#"import net from 'node:net';
+const socket = net.createConnection(3129, '127.0.0.1');
+const send = (message) => socket.write(JSON.stringify({jsonrpc:'2.0', ...message}) + '\n');
+let buffered = '';
+socket.setEncoding('utf8');
+socket.on('connect', () => send({id:1, method:'kernel.hello', params:{protocol:1, token:process.env.FICTOR_KERNEL_TOKEN}}));
+socket.on('data', (chunk) => {
+  buffered += chunk;
+  for (;;) {
+    const index = buffered.indexOf('\n');
+    if (index < 0) break;
+    const reply = JSON.parse(buffered.slice(0, index));
+    buffered = buffered.slice(index + 1);
+    if (reply.error) throw new Error(reply.error.message);
+    if (reply.id === 1) {
+      send({method:'log', params:{level:'info', message:`structured event ${process.env.API_TOKEN}`, fields:{nested:[process.env.API_TOKEN], kernel:process.env.FICTOR_KERNEL_TOKEN, proxy:process.env.HTTP_PROXY, ext_id:'forged-destination'}}});
+      send({id:2, method:'config.get', params:{section:'ext'}});
+    }
+    if (reply.id === 2) {
+      process.stderr.write(`stderr only ${process.env.API_TOKEN}\n`);
+      process.exitCode = 7;
+      socket.end();
+    }
+  }
+});
+"#).unwrap();
+    let mut manifest = manifest(
+        json!({"net":{"allow":["example.test"]},"secrets":[{"name":"fake_log","env":"API_TOKEN"}]}),
+        true,
+        false,
+    );
+    manifest.runtime.kind = fictor::installer::manifest::RuntimeKind::Node;
+    manifest.runtime.entry = Some("main.mjs".into());
+    let mut instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), instance.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .code,
+        Some(7)
+    );
+    let log = fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap();
+    assert!(log.contains("structured event") && log.contains("stderr only"));
+    assert!(!log.contains("fake-log-credential") && !log.contains("second-line"));
+    assert!(log.matches("***").count() >= 4);
+    assert!(
+        !log.split(|c: char| !c.is_ascii_hexdigit())
+            .any(|part| part.len() >= 64)
+    );
+    assert!(
+        !fixture
+            .home
+            .join("logs/ext/forged-destination.log")
+            .exists()
+    );
+    let events = fixture
+        .store
+        .query_events(EventQuery {
+            session_id: Some("sys".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let crash = events
+        .iter()
+        .find(|event| event.kind == "ext.crashed")
+        .unwrap();
+    let tail = fixture
+        .store
+        .get_blob(crash.blob_refs[0].clone())
+        .await
+        .unwrap();
+    let tail = String::from_utf8(tail).unwrap();
+    assert!(tail.contains("stderr only"));
+    assert!(!tail.contains("structured event") && !tail.contains("fake-log-credential"));
+}
+
+#[tokio::test]
 async fn implicit_home_files_are_unreadable_to_harness_and_tools_clients() {
     let fixture = Fixture::new().await;
     let private = fixture.real_home.join(".gitconfig");

@@ -1,7 +1,9 @@
 //! Authenticated per-instance Kernel Protocol. Identity is trusted supervisor
 //! input, sealed at bind; request fields can never change it.
 mod dispatch;
+mod log;
 mod transport;
+pub use log::{LogFuture, LogLevel, LogRecord, LogSink};
 pub use transport::KernelServer;
 
 use crate::store::{Store, StoreError};
@@ -96,6 +98,8 @@ pub enum KernelError {
     Store(#[from] StoreError),
     #[error("kernel task unavailable")]
     Task,
+    #[error("kernel log unavailable")]
+    Log,
 }
 struct State {
     identity: KernelIdentity,
@@ -104,6 +108,7 @@ struct State {
     home: PathBuf,
     store: Arc<Store>,
     provider_ids: Vec<String>,
+    log: Option<Arc<dyn LogSink>>,
 }
 
 #[derive(Clone, Copy, Debug)]

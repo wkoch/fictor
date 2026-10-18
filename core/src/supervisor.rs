@@ -7,10 +7,10 @@ use crate::{
         bundle::{self, BundleBudget, BundleProfile},
         manifest::{KernelScope, Manifest, Role, RuntimeKind, Scope},
     },
-    kernel::{KernelIdentity, KernelServer},
+    kernel::{KernelError, KernelIdentity, KernelServer, LogFuture, LogRecord, LogSink},
     proxy::{EgressProxy, ProxyIdentity, ProxyToken, nat64::Nat64Prefixes},
     sandbox::{ProxyEndpoint, SandboxContext, SandboxPlan, SandboxProfile, Tier},
-    secrets::{RedactionStream, SecretStore},
+    secrets::{RedactionStream, Redactor, SecretStore},
     store::{AppendEvent, Provenance, Store},
 };
 use serde_json::json;
@@ -547,6 +547,7 @@ impl Supervisor {
                 "http://models.fictor.internal/p".into(),
             );
         }
+        let log = self.log(&manifest.id)?;
         // Smoke launches use a completely separate home and Store.
         let mut kernel = if !manifest.kernel.is_empty() {
             let scopes = manifest
@@ -559,7 +560,7 @@ impl Supervisor {
                         .ok_or(SupervisorError::Invalid)
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            let kernel = KernelServer::bind(
+            let kernel = KernelServer::bind_with_log(
                 &self.home,
                 KernelIdentity {
                     ext_id: manifest.id.clone(),
@@ -570,6 +571,10 @@ impl Supervisor {
                 },
                 self.store.clone(),
                 self.config.providers.keys().cloned().collect(),
+                Some(Arc::new(ExtensionLog {
+                    log: log.clone(),
+                    redactor: redactor.clone(),
+                })),
             )
             .await
             .map_err(|_| SupervisorError::Transport)?;
@@ -652,7 +657,6 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let log = self.log(&manifest.id)?;
         let stream = redactor.stream().map_err(|_| SupervisorError::Secret)?;
         let mut child = command.spawn().map_err(|_| SupervisorError::Process)?;
         let pid = child.id().ok_or(SupervisorError::Process)?;
@@ -1306,6 +1310,44 @@ fn executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+struct ExtensionLog {
+    log: Arc<Mutex<RotatingLog>>,
+    redactor: Redactor,
+}
+impl LogSink for ExtensionLog {
+    fn write(&self, record: LogRecord) -> LogFuture {
+        let log = self.log.clone();
+        let redactor = self.redactor.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                // Ordinary diagnostic text in the same file as stderr. Debug
+                // escaping keeps messages on one line and matches the escaped
+                // secret representations already registered by Redactor.
+                let line = match record.fields {
+                    Some(fields) => format!(
+                        "[{}] {:?} {:?}\n",
+                        record.level.as_str(),
+                        record.message,
+                        fields
+                    ),
+                    None => format!("[{}] {:?}\n", record.level.as_str(), record.message),
+                };
+                // Snapshot at delivery: secrets added after process startup
+                // must also be masked in subsequent structured notifications.
+                let mut stream = redactor.stream().map_err(|_| KernelError::Log)?;
+                let mut bytes = stream.push(line.as_bytes());
+                bytes.extend(stream.finish());
+                log.lock()
+                    .map_err(|_| KernelError::Log)?
+                    .write(&bytes)
+                    .map_err(|_| KernelError::Log)
+            })
+            .await
+            .map_err(|_| KernelError::Task)?
+        })
+    }
+}
+
 struct RotatingLog {
     path: PathBuf,
     file: File,
@@ -1412,6 +1454,47 @@ mod tests {
             LOG_LIMIT - 2
         );
         assert_eq!(fs::read(&path).unwrap(), b"next");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    #[tokio::test]
+    async fn kernel_logs_share_rotation_and_mask_late_multiline_and_nested_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("extension.log");
+        let log = Arc::new(Mutex::new(RotatingLog::open(path.clone()).unwrap()));
+        log.lock()
+            .unwrap()
+            .write(&vec![b'a'; LOG_LIMIT as usize - 2])
+            .unwrap();
+        let redactor = Redactor::default();
+        let sink = ExtensionLog {
+            log,
+            redactor: redactor.clone(),
+        };
+        // Registration after sink construction must still cover future records,
+        // including Debug's control-character escapes in nested fields and keys.
+        let secret = "fake-kernel-credential\n\u{1}\\é";
+        redactor.register(secret).unwrap();
+        let mut fields = serde_json::Map::new();
+        fields.insert(secret.into(), json!({"nested":[secret]}));
+        sink.write(LogRecord {
+            level: crate::kernel::LogLevel::Warn,
+            message: format!("before {secret} after"),
+            fields: Some(fields),
+        })
+        .await
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("[warn]"));
+        assert!(text.contains("***"));
+        assert!(!text.contains("fake-kernel-credential"));
+        assert_eq!(text.lines().count(), 1);
+        assert_eq!(
+            fs::metadata(path.with_extension("log.1")).unwrap().len(),
+            LOG_LIMIT - 2
+        );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
