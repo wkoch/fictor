@@ -180,6 +180,29 @@ struct Client {
     disabled: Arc<AtomicBool>,
     verification: Arc<Mutex<()>>,
 }
+
+/// A terminal catalog failure belongs to the process owner. The owner stops
+/// the namespace and records the change while retaining its instance resources.
+#[derive(Clone)]
+pub(crate) struct CatalogInvalidation {
+    invalidated: Arc<AtomicBool>,
+    stop: watch::Sender<bool>,
+}
+impl CatalogInvalidation {
+    pub(crate) fn new(stop: watch::Sender<bool>) -> Self {
+        Self {
+            invalidated: Arc::new(AtomicBool::new(false)),
+            stop,
+        }
+    }
+    pub(crate) fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
+    pub(crate) fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+        self.stop.send_replace(true);
+    }
+}
 // The architect's phase-0 contract still requires roots, deprecated by SEP-2577.
 #[allow(deprecated)]
 impl ClientHandler for Client {
@@ -238,6 +261,21 @@ impl McpConnection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::connect_monitored(reader, writer, workspace, pin, audit, None).await
+    }
+
+    pub(crate) async fn connect_monitored<R, W>(
+        reader: R,
+        writer: W,
+        workspace: Option<&Path>,
+        pin: Option<PinnedCatalog>,
+        audit: AuditIdentity,
+        invalidation: Option<CatalogInvalidation>,
+    ) -> Result<Self, GatewayError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let root = workspace.map(root_uri).transpose()?;
         let (changed, mut changes) = watch::channel(0u64);
         let generation = Arc::new(AtomicU64::new(0));
@@ -265,7 +303,13 @@ impl McpConnection {
         if let Some(pin) = &pin
             && catalog.hash() != pin.hash()
         {
-            audit.changed().await?;
+            if let Some(invalidation) = &invalidation {
+                invalidation.invalidate();
+            }
+            service.cancellation_token().cancel();
+            if invalidation.is_none() {
+                audit.changed().await?;
+            }
             return Err(GatewayError::ToolsChanged);
         }
         let pinned = pin.is_some();
@@ -295,8 +339,13 @@ impl McpConnection {
                 };
                 if !matches {
                     blocked.store(true, Ordering::Release);
-                    let _ = audit.changed().await;
+                    if let Some(invalidation) = &invalidation {
+                        invalidation.invalidate();
+                    }
                     cancel.cancel();
+                    if invalidation.is_none() {
+                        let _ = audit.changed().await;
+                    }
                     break;
                 }
                 let stable = {

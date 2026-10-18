@@ -2,7 +2,7 @@
 //! inferred here: the installer supplies a validated bundle and explicit identity.
 use crate::{
     config::Config,
-    gateway::{AuditIdentity, McpConnection, PinnedCatalog},
+    gateway::{AuditIdentity, CatalogInvalidation, McpConnection, PinnedCatalog},
     installer::{
         bundle::{self, BundleBudget, BundleProfile},
         manifest::{KernelScope, Manifest, Role, RuntimeKind, Scope},
@@ -93,6 +93,8 @@ pub struct ManagedInstance {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     connection: Option<McpConnection>,
+    pinned_hash: Option<String>,
+    catalog_invalidation: CatalogInvalidation,
     audit: AuditIdentity,
     workspace: Option<PathBuf>,
     stop: watch::Sender<bool>,
@@ -728,6 +730,7 @@ impl Supervisor {
             startup_error.get_or_insert(SupervisorError::Process);
         }
         let (stop, stop_receiver) = watch::channel(false);
+        let catalog_invalidation = CatalogInvalidation::new(stop.clone());
         let (exit_sender, exit) = watch::channel(None);
         let (ready, started) = oneshot::channel();
         let audit = AuditIdentity {
@@ -743,6 +746,8 @@ impl Supervisor {
             stdin,
             stdout,
             connection: None,
+            pinned_hash: None,
+            catalog_invalidation: catalog_invalidation.clone(),
             audit: audit.clone(),
             workspace,
             stop,
@@ -777,6 +782,7 @@ impl Supervisor {
                     registration: &registration,
                     audit: &audit,
                     reservation: &mut reservation,
+                    catalog_invalidation: &catalog_invalidation,
                 },
             )
             .await;
@@ -792,6 +798,20 @@ impl Supervisor {
                 .unwrap_or_else(|| b"[stderr capture unavailable]\n".to_vec());
             let kernel_failed = if let Some(kernel) = &mut kernel {
                 kernel.shutdown().await.is_err()
+            } else {
+                false
+            };
+            // Re-read after namespace/transport shutdown: invalidation can race
+            // a manual stop. This task owns both the audit and instance paths.
+            let catalog_failed = if catalog_invalidation.is_invalidated() {
+                audit_event(
+                    &audit,
+                    "ext.tools_changed",
+                    json!({"ext_id":audit.ext_id,"key":audit.key,"instance_id":id}),
+                    vec![],
+                )
+                .await
+                .is_err()
             } else {
                 false
             };
@@ -838,6 +858,7 @@ impl Supervisor {
                 && !kernel_failed
                 && !process_failed
                 && !blob_failed
+                && !catalog_failed
             {
                 Ok(outcome)
             } else {
@@ -889,20 +910,36 @@ impl ManagedInstance {
         &mut self,
         pin: Option<PinnedCatalog>,
     ) -> Result<&McpConnection, SupervisorError> {
+        let pinned_hash = pin.as_ref().map(|pin| pin.hash().to_owned());
+        if self.connection.is_some() && pinned_hash.is_some() && pinned_hash != self.pinned_hash {
+            // Discovery cannot be upgraded into a pinned connection, nor can a
+            // live connection switch its approved catalog without a new spawn.
+            self.catalog_invalidation.invalidate();
+            let _ = self.shutdown().await;
+            return Err(SupervisorError::Mcp);
+        }
         if self.connection.is_none() {
             let stdout = self.stdout.take().ok_or(SupervisorError::Mcp)?;
             let stdin = self.stdin.take().ok_or(SupervisorError::Mcp)?;
-            self.connection = Some(
-                McpConnection::connect(
-                    stdout,
-                    stdin,
-                    self.workspace.as_deref(),
-                    pin,
-                    self.audit.clone(),
-                )
-                .await
-                .map_err(|_| SupervisorError::Mcp)?,
-            );
+            let connection = McpConnection::connect_monitored(
+                stdout,
+                stdin,
+                self.workspace.as_deref(),
+                pin,
+                self.audit.clone(),
+                Some(self.catalog_invalidation.clone()),
+            )
+            .await;
+            match connection {
+                Ok(connection) => {
+                    self.connection = Some(connection);
+                    self.pinned_hash = pinned_hash;
+                }
+                Err(_) => {
+                    let _ = self.shutdown().await;
+                    return Err(SupervisorError::Mcp);
+                }
+            }
         }
         self.connection.as_ref().ok_or(SupervisorError::Mcp)
     }
@@ -956,6 +993,7 @@ struct CleanupContext<'a> {
     registration: &'a Registration,
     audit: &'a AuditIdentity,
     reservation: &'a mut Option<Reservation>,
+    catalog_invalidation: &'a CatalogInvalidation,
 }
 
 async fn supervise(
@@ -970,6 +1008,7 @@ async fn supervise(
         registration,
         audit,
         reservation,
+        catalog_invalidation,
     } = cleanup;
     let (status, crashed) = if !started {
         let _ = registration.proxy.revoke(&registration.token);
@@ -1001,21 +1040,42 @@ async fn supervise(
                 // Graceful notice closes traffic while retaining the socket and
                 // token registration until revocation after the grace period.
                 if let Some(kernel) = kernel { kernel.notify_shutdown(); }
-                let shutdown = async {
-                    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-                        Ok(status) => status,
-                        Err(_) => {
-                            let _ = registration.proxy.revoke(&registration.token);
-                            if let Some(kernel) = &kernel { kernel.revoke(); }
-                            signal_group(guard.pid, libc::SIGTERM);
-                            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                                Ok(status) => status,
-                                Err(_) => { signal_group(guard.pid, libc::SIGKILL); child.wait().await }
+                let completed = {
+                    let shutdown = async {
+                        match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+                            Ok(status) => status,
+                            Err(_) => {
+                                let _ = registration.proxy.revoke(&registration.token);
+                                if let Some(kernel) = &kernel { kernel.revoke(); }
+                                signal_group(guard.pid, libc::SIGTERM);
+                                match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                                    Ok(status) => status,
+                                    Err(_) => { signal_group(guard.pid, libc::SIGKILL); child.wait().await }
+                                }
                             }
                         }
-                    }
+                    };
+                    tokio::pin!(shutdown);
+                    let terminal_catalog = async {
+                        while !catalog_invalidation.is_invalidated() {
+                            if stop.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                        // A failed security pin revokes access immediately, even
+                        // when it races the grace period of a manual shutdown.
+                        let _ = registration.proxy.revoke(&registration.token);
+                        if let Some(kernel) = &kernel { kernel.revoke(); }
+                    };
+                    let shutdown = async {
+                        tokio::select! {
+                            status = &mut shutdown => status,
+                            _ = terminal_catalog => shutdown.await,
+                        }
+                    };
+                    tokio::time::timeout(Duration::from_secs(10), shutdown).await
                 };
-                let status = match tokio::time::timeout(Duration::from_secs(10), shutdown).await {
+                let status = match completed {
                     Ok(status) => status,
                     Err(_) => {
                         let _ = registration.proxy.revoke(&registration.token);
@@ -1662,6 +1722,8 @@ mod tests {
             stdin: None,
             stdout: None,
             connection: None,
+            pinned_hash: None,
+            catalog_invalidation: CatalogInvalidation::new(stop.clone()),
             audit: AuditIdentity {
                 store,
                 ext_id: "fake".into(),
