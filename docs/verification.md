@@ -1,5 +1,68 @@
 # Verificação da implementação
 
+## Catálogo e correções de integração no Bazzite — 2026-10-18
+
+Código validado: `b629fe03c8fead863a915979cf61d7faf6c0f340`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Mesmas versões
+de ferramentas e imagem registradas no diagnóstico seguinte. Dependências em
+cache no workspace; Cargo usou `--locked --offline`. Nada foi instalado no host
+ou globalmente no `$HOME` nesta continuação.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **301 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+Foram acrescentados 16 testes desde os 285 registrados abaixo. A suíte final
+incluiu sandbox real, o model proxy com streaming de 256 MiB, npm/uv reais e a
+CLI real, sempre com dados falsos e endpoints locais, sem rede externa nem chaves
+reais. Os casos novos cobrem:
+
+- `catalog.list`: contrato da resposta, escopo, própria sessão e parâmetros
+  exatos; versões ativas/habilitadas e extensões globais declarativas; metadados
+  Agent Skills e comandos, caminhos absolutos, sem executar código ou interpretar
+  o corpo. Symlinks, FIFO, conteúdo gravável, identidade inválida, overrides
+  indefinidos e declarações da Fase 1 são recusados. O limite conta JSON escapado;
+  metadados opcionais acima de 16 MiB continuam usando os limites do bundle.
+- npm: pacote físico sem entrada no hidden lock impede `checked`, inclusive sem
+  `package.json`. Bundled/scoped/nested legítimos passam; fixtures comuns não
+  entram no inventário. Python aceita headers de identidade válidos sem diferença
+  de case, com whitespace ou continuação, e recusa duplicatas de identidade.
+  `dependencies` passou com 12 testes e `local_checker` com 14 no Toolbx real.
+- Supervisor: sessão inexistente/arquivada e workspace divergente são recusados
+  antes de efeitos, inclusive sem canal kernel; alias canonicalizado é aceito
+  com processo real. O alvo `supervisor` passou com 19 testes.
+- Capturas: reabrir o store durante streaming não remove temporários vivos;
+  duas capturas mantêm leases independentes até a última liberação. Limpeza de
+  órfãos continua preservando blobs publicados. Os três testes de captura e os
+  15 testes de `models` passaram também na rodada isolada.
+
+A primeira rodada completa revelou uma falha intermitente em `extension_control`
+(300 passaram, 1 falhou): `Admission/WouldBlock` em uma segunda operação do mesmo
+teste. Reproduzida em 7/30 rodadas paralelas, desapareceu em 20/20 rodadas seriais
+e em 20/20 paralelas sem os dois casos que iniciam a CLI. Conforme
+[flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html), descritores herdados
+por fork compartilham o lock até o fechamento. A correção serializa somente os
+fixtures desse alvo e conserva as assertions e a produção; não adiciona retries.
+Depois dela, 30/30 rodadas paralelas do alvo passaram, seguidas da suíte completa
+acima. A regressão de captura também foi executada antes da correção e falhou.
+
+Logs locais: `.fictor/logs/m05-catalog-{fmt,clippy,test-final,release,trail-build,trail-check}.log`,
+`m05-catalog-test.log` (primeira rodada), `m05-control-{isolation,serialized}.log`
+e `m05-live-capture-{before,after,models,clippy}.log`. O commit validado está também
+em `m05-catalog-code-head.log`. Não há workspace TypeScript/`vp` nesta base.
+`kernel_catalog` entrou na seleção Fedora sem namespaces; a CI remota não foi
+executada nesta entrega.
+
+**Este diagnóstico no Bazzite não satisfaz o gate de release no COSMIC Atomic.**
+M0.5 continua parcial nas partes que dependem das ARQ-020–024; não houve ativação
+de extensões, implementação de contratos indefinidos ou avanço à Fase 1.
+
 ## Continuação do M0.5 no Bazzite — 2026-10-18
 
 Código validado: `d8b8401879add2324409981b44683999ead3ecdc`.

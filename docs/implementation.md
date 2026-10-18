@@ -16,7 +16,7 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, resolvers npm/uv, smoke, materialização imutável de propostas aprovadas, `tools.list`, logs e controles offline no lock. `ext check` mantém quarentena. Ativação, aplicação de overrides, limpeza de instâncias no boot e backoff aguardam decisões ARQ-020–024; integração first-party pendente. |
+| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, resolvers npm/uv, smoke, materialização imutável de propostas aprovadas, `tools.list`, `catalog.list`, logs e controles offline no lock. `ext check` mantém quarentena. Ativação, aplicação de overrides, limpeza de instâncias no boot e backoff aguardam decisões ARQ-020–024; integração first-party pendente. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
@@ -182,6 +182,51 @@ reinício do serviço são ações do usuário, fora do sandbox.
   removê-la. No-op preserva bytes e inode. O servidor futuro deve compartilhar a
   admissão e implementar o caminho administrativo. Não há reset de crash loop
   implícito nesses comandos (ARQ-023).
+
+## Catálogo e correções de integração — 2026-10-18
+
+- `catalog.list` exige escopo, parâmetros exatos e a própria sessão existente.
+  Lê somente versões ativas habilitadas, compartilhando com `tools.list` a
+  validação de identidade do manifest e a recusa de overrides indefinidos.
+  Retorna skills e comandos com caminhos absolutos; surfaces e hooks da Fase 1
+  ficam vazios, e declarações dessa fase são recusadas.
+- Skills usam o diretório configurado ou `skills/`, com subdiretórios imediatos
+  contendo `SKILL.md`. O frontmatter segue o [Agent Skills](https://agentskills.io/specification)
+  e seu validador de referência, consultados em 2026-10-18. Somente nome e descrição
+  entram no catálogo; corpo Markdown e prompts não são interpretados nem executados.
+  Metadados opcionais, inclusive `allowed-tools`, não concedem permissões.
+  A leitura usa descritores, recusa symlinks, tipos especiais e arquivos graváveis,
+  e preserva os limites por bundle do ADR-024. A resposta conta JSON escapado
+  cumulativamente antes de reter entradas, respeitando os 16 MiB do protocolo.
+- O inventário npm agora exige correspondência entre raízes físicas de pacotes
+  e o [hidden lockfile](https://docs.npmjs.com/cli/v11/configuring-npm/package-lock-json/#hidden-lockfiles).
+  Tarballs com `node_modules` aninhado não declarado são recusados antes do smoke.
+  Pacotes bundled, scoped e aninhados legítimos continuam aceitos; um
+  `package.json` comum dentro de fixtures não cria um pacote no inventário.
+- A identidade Python segue os headers de [Core Metadata](https://packaging.python.org/en/latest/specifications/core-metadata/):
+  nomes dos campos sem distinção de case, whitespace e continuação de linha.
+  `Name` e `Version` continuam obrigatórios, únicos e sem whitespace no valor
+  final. Testes da CLI reproduzem a falha anterior e verificam ambas as correções.
+- Antes de criar dados, grants ou processos, o supervisor exige sessão ativa,
+  não sistêmica, cujo workspace persistido coincida com o caminho canonicalizado.
+  Isso vale também para processos MCP sem canal kernel e para a sessão isolada
+  de smoke. Sessão inexistente, arquivada ou workspace divergente são recusados.
+- Capturas de streaming mantêm `flock` compartilhado em um descritor independente
+  do diretório privado de blobs. A limpeza de boot exige bloqueio exclusivo sem
+  espera; abrir outra `Store` com captura ativa falha antes de remover temporários.
+  O lease dura até persistência e fsync, ou até descartar o temporário, e não cria
+  formato persistido novo. Duas capturas simultâneas conservam leases independentes.
+  O teste de reabertura falhava antes da correção; capturas, órfãos e streaming
+  completo são verificados em testes automatizados.
+- Fixtures de controle offline são serializados dentro do próprio alvo de teste.
+  Isso impede que o fork de outra CLI retenha temporariamente descritores de
+  leases de um teste vizinho. O teste de exclusão e as assertions continuam
+  exigindo a recusa; não há retry nem alteração do runtime de produção.
+
+O gerenciador lazy/idle permanece sem integração: os consumidores `tools.call`,
+hooks e `session.input` ainda não existem nesta base; aplicar overrides e definir
+reinício/crash loop depende das ARQ-021/023. Não há timers ou caminhos alternativos
+que contornem esses contratos pendentes.
 
 ## Próxima sequência no Fedora
 

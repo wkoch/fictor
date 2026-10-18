@@ -138,7 +138,7 @@ A CI também inclui um container Fedora 44 para build e testes que não criam
 sandboxes reais. A versão corresponde à [release estável do COSMIC Atomic](https://fedoraproject.org/atomic-desktops/cosmic/download/)
 consultada em 2026-10-17. O gate de release exige todos os critérios de aceitação
 na máquina Fedora COSMIC Atomic do usuário, com data, versão do SO e commit
-registrados. Build, Clippy e 285 testes passaram no Toolbx Fedora 44 sobre Bazzite;
+registrados. Build, Clippy e 301 testes passaram no Toolbx Fedora 44 sobre Bazzite;
 esse diagnóstico não substitui o gate no COSMIC Atomic nem a execução da CI.
 
 Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md) e
