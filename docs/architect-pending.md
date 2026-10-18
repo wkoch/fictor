@@ -1,7 +1,34 @@
 # Pendências para o arquiteto
 
-ARQ-027 aberta em 2026-10-18. ARQ-020–026 resolvidas pelos ADRs 036–042.
+ARQ-027/028 abertas em 2026-10-18. ARQ-020–026 resolvidas pelos ADRs 036–042.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-028 — Grants sobre mounts internos e fontes de pseudo-filesystems
+
+- **Status: aberta.**
+- **Referência:** I2/I4/I11; `spec/05-security.md`, regras comuns, origem
+  protegida dos controles e perfil bubblewrap; `core/src/sandbox/mod.rs`,
+  `validate_grant`; `core/src/sandbox/linux.rs`, ordem dos mounts.
+- **Dúvida:** o perfil gera proc/dev privados e caminhos internos em `/fx`, mas
+  grants explícitos são aplicados depois e não há contrato reservando esses
+  destinos. A revisão estática encontrou um grant host `/proc` que não é recusado
+  pelas verificações de prefixos/sensíveis e é renderizado sobre o proc gerado.
+  Além de substituir a árvore privada de processos, uma fonte procfs montada
+  sob outro nome pode oferecer magic links para raízes/FDs do processo do host.
+  Identidade dev/ino e coordenadas de bind/submount não demonstram separação
+  dessas referências dinâmicas da árvore privada do core.
+- **Necessário:** ADR definindo destinos internos que não podem ser sobrepostos,
+  ancestrais/descendentes abrangidos e tratamento de fontes procfs/pseudo-FS
+  (inclusive aliases) em grants. Fixar a recusa ou prova exigida antes do spawn,
+  a relação com mounts implícitos legítimos e critérios com dados falsos, sem
+  conceder acesso aos processos/arquivos do host para fazer o teste passar.
+- **Implementação atual:** novos controles por descritor e prova de binds comuns
+  não alteram essa política. A atestação anterior ao workload deve detectar troca
+  das fontes aprovadas; não transforma uma fonte inadequada em segura.
+  Não foi executada tentativa de leitura de segredos ou memória do core.
+- **Impacto:** a conformidade do perfil geral e o gate de M0.5 permanecem abertos.
+  A parte afetada aguarda ADR, conforme a regra 4 de AGENTS.md; as demais entregas
+  podem avançar sem ampliar grants ou modificar o spec.
 
 ## ARQ-027 — Correlação de IDs no limite de mensagem do Kernel Protocol
 
