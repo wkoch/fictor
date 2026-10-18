@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod home;
 pub mod installer;
 pub mod kernel;
+pub mod ownership;
 pub mod proxy;
 pub mod sandbox;
 pub mod secrets;
@@ -18,10 +19,20 @@ use std::path::Path;
 
 /// Bootstrap only trusted core data. Bundle installation belongs to M0.5.
 pub async fn initialize(home: &Path) -> Result<(), InitError> {
+    let owner = ownership::HomeLease::create_for_init(home)?;
+    initialize_owned(owner).await
+}
+
+/// Reuse a caller's owner through initialization and subsequent offline work.
+pub async fn initialize_owned(
+    owner: std::sync::Arc<ownership::HomeLease>,
+) -> Result<(), InitError> {
+    owner.verify()?;
+    let home = owner.home();
     home::prepare(home)?;
     config::Config::create_if_missing(home)?;
     let lease = std::sync::Arc::new(installer::lease::InstallerLease::acquire(home)?);
-    let store = store::Store::open(home).await?;
+    let store = store::Store::open_with_lease(owner.clone()).await?;
     let store = std::sync::Arc::new(store);
     let report = installer::recovery::recover(home, store.clone(), lease).await?;
     for diagnostic in report.diagnostics {
@@ -41,6 +52,8 @@ pub async fn initialize(home: &Path) -> Result<(), InitError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
+    #[error(transparent)]
+    Ownership(#[from] ownership::OwnershipError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

@@ -34,7 +34,14 @@ async fn test_supervisor(
     proxy_name: &str,
 ) -> Arc<Supervisor> {
     let config = Arc::new(Config::load(home).unwrap());
-    let secret = Arc::new(SecretStore::open(home, BackendKind::File, Redactor::default()).unwrap());
+    let secret = Arc::new(
+        SecretStore::open_with_lease(
+            store.owner().clone(),
+            BackendKind::File,
+            Redactor::default(),
+        )
+        .unwrap(),
+    );
     let proxy = EgressProxy::bind_unix_with_nat64(
         home.join("run").join(proxy_name),
         store.clone(),

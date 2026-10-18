@@ -53,6 +53,8 @@ impl Writer {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error(transparent)]
+    Ownership(#[from] crate::ownership::OwnershipError),
     #[error("erro no SQLite: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error("erro de arquivo: {0}")]
@@ -82,19 +84,44 @@ pub enum StoreError {
 pub struct Store {
     writer: mpsc::Sender<Job>,
     task: tokio::task::JoinHandle<()>,
-    readers: Arc<Vec<Mutex<Connection>>>,
+    readers: Arc<Readers>,
     next_reader: AtomicUsize,
     blobs: blobs::BlobStore,
+    owner: Arc<crate::ownership::HomeLease>,
+}
+
+struct Readers {
+    connections: Vec<Mutex<Connection>>,
+    // Close every SQLite reader before relinquishing ownership, including
+    // readers still held by a cancelled asynchronous caller's blocking job.
+    _owner: Arc<crate::ownership::HomeLease>,
 }
 
 impl Store {
+    pub fn owner(&self) -> &Arc<crate::ownership::HomeLease> {
+        &self.owner
+    }
+
     pub async fn open(home: &Path) -> Result<Self, StoreError> {
+        let owner = crate::ownership::HomeLease::acquire(home)?;
+        Self::open_with_lease(owner).await
+    }
+
+    pub async fn open_with_lease(
+        owner: Arc<crate::ownership::HomeLease>,
+    ) -> Result<Self, StoreError> {
+        let writer_lease = owner.claim_writer()?;
+        let home = owner.home();
         let path = home.join("fictor.db");
-        let blobs = blobs::BlobStore::new(home.join("blobs"));
+        let blobs = blobs::BlobStore::owned(home.join("blobs"), owner.clone());
         let writer_blobs = blobs.clone();
+        let reader_owner = owner.clone();
         let (writer, mut queue) = mpsc::channel::<Job>(64);
         let (ready, result) = oneshot::channel();
         let task = tokio::task::spawn_blocking(move || {
+            // Declared before the writer state: close SQLite before allowing
+            // another writer, even when the opening future was cancelled.
+            let _writer_lease = writer_lease;
             let setup = (|| -> Result<_, StoreError> {
                 let db = open_writer(&path)?;
                 writer_blobs.cleanup_captures()?;
@@ -124,7 +151,10 @@ impl Store {
                         last_id,
                         blobs: writer_blobs,
                     },
-                    readers,
+                    Readers {
+                        connections: readers,
+                        _owner: reader_owner,
+                    },
                 ))
             })();
             let mut state = match setup {
@@ -133,6 +163,7 @@ impl Store {
                     state
                 }
                 Err(error) => {
+                    drop(_writer_lease);
                     let _ = ready.send(Err(error));
                     return;
                 }
@@ -148,6 +179,7 @@ impl Store {
             readers,
             next_reader: AtomicUsize::new(0),
             blobs,
+            owner,
         })
     }
 
@@ -180,9 +212,11 @@ impl Store {
         operation: impl FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
         let pool = Arc::clone(&self.readers);
-        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % pool.len();
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % pool.connections.len();
         tokio::task::spawn_blocking(move || {
-            let connection = pool[index].lock().map_err(|_| StoreError::Closed)?;
+            let connection = pool.connections[index]
+                .lock()
+                .map_err(|_| StoreError::Closed)?;
             operation(&connection)
         })
         .await
@@ -240,4 +274,58 @@ pub fn now_ms() -> Result<i64, StoreError> {
         .map_err(|_| StoreError::Clock)?
         .as_millis();
     i64::try_from(millis).map_err(|_| StoreError::Clock)
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::ownership::{HomeLease, OwnershipError};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn a_cancelled_reader_retains_ownership_until_its_connection_closes() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(Store::open(home.path()).await.unwrap());
+        let (started, entered) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let reader_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            reader_store
+                .read(move |db| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(db.query_row("SELECT count(*) FROM sessions", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?)
+                })
+                .await
+        });
+        entered.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        Arc::try_unwrap(store)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        assert!(matches!(
+            HomeLease::acquire(home.path()),
+            Err(OwnershipError::Busy)
+        ));
+        release.send(()).unwrap();
+        let owner = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match HomeLease::acquire(home.path()) {
+                    Ok(owner) => break owner,
+                    Err(OwnershipError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(owner);
+    }
 }

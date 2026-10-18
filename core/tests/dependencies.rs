@@ -966,8 +966,14 @@ async fn local_pipeline_persists_installed_packages_and_smokes_the_final_bundle(
     config.installer.registries = vec![registry.address.to_string()];
     let config = Arc::new(config);
     let store = Arc::new(Store::open(&home).await.unwrap());
-    let secrets =
-        Arc::new(SecretStore::open(&home, BackendKind::File, Redactor::default()).unwrap());
+    let secrets = Arc::new(
+        SecretStore::open_with_lease(
+            store.owner().clone(),
+            BackendKind::File,
+            Redactor::default(),
+        )
+        .unwrap(),
+    );
     let proxy = Arc::new(
         EgressProxy::bind_unix_with_nat64(
             home.join("run/test-proxy.sock"),

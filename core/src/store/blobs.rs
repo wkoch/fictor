@@ -14,10 +14,13 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Clone)]
 pub struct BlobStore {
     root: PathBuf,
+    _owner: Option<std::sync::Arc<crate::ownership::HomeLease>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
+    #[error("posse do diretório de dados inválida")]
+    Ownership,
     #[error("hash de blob inválido")]
     InvalidHash,
     #[error("blob excede o limite de tamanho")]
@@ -30,16 +33,39 @@ pub enum BlobError {
 
 impl BlobStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, _owner: None }
+    }
+
+    pub(super) fn owned(root: PathBuf, owner: std::sync::Arc<crate::ownership::HomeLease>) -> Self {
+        Self {
+            root,
+            _owner: Some(owner),
+        }
     }
 
     pub(super) fn home(&self) -> Result<&std::path::Path, super::StoreError> {
+        self.verify_owner()?;
         self.root
             .parent()
             .ok_or(super::StoreError::Invalid("diretório de blobs sem raiz"))
     }
 
+    fn verify_owner(&self) -> Result<(), BlobError> {
+        if let Some(owner) = &self._owner {
+            owner.verify().map_err(|_| BlobError::Ownership)?;
+        }
+        Ok(())
+    }
+
+    fn effective_root(&self) -> PathBuf {
+        match &self._owner {
+            Some(owner) => owner.anchored_path().join("blobs"),
+            None => self.root.clone(),
+        }
+    }
+
     fn path(&self, hash: &str) -> Result<PathBuf, BlobError> {
+        self.verify_owner()?;
         let hex = hash.strip_prefix("sha256:").ok_or(BlobError::InvalidHash)?;
         if hex.len() != 64
             || !hex
@@ -48,10 +74,11 @@ impl BlobStore {
         {
             return Err(BlobError::InvalidHash);
         }
-        Ok(self.root.join(&hex[..2]).join(&hex[2..]))
+        Ok(self.effective_root().join(&hex[..2]).join(&hex[2..]))
     }
 
     pub fn put(&self, data: &[u8]) -> Result<String, BlobError> {
+        self.verify_owner()?;
         if data.len() > MAX_BLOB_BYTES {
             return Err(BlobError::TooLarge);
         }
@@ -149,6 +176,8 @@ pub struct Capture {
     length: usize,
     // Drop the temporary before releasing startup cleanup's exclusion lease.
     _cleanup_guard: fs::File,
+    // NamedTempFile's cleanup must finish before releasing global ownership.
+    _owner: Option<std::sync::Arc<crate::ownership::HomeLease>>,
 }
 impl Capture {
     pub fn len(&self) -> usize {
@@ -158,6 +187,9 @@ impl Capture {
         self.length == 0
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), BlobError> {
+        if let Some(owner) = &self._owner {
+            owner.verify().map_err(|_| BlobError::Ownership)?;
+        }
         if bytes.len() > MAX_BLOB_BYTES.saturating_sub(self.length) {
             return Err(BlobError::TooLarge);
         }
@@ -183,13 +215,15 @@ impl Capture {
 }
 impl BlobStore {
     fn capture_lock(&self, operation: libc::c_int) -> Result<fs::File, BlobError> {
-        crate::home::private_dir(&self.root)?;
+        self.verify_owner()?;
+        let root = self.effective_root();
+        crate::home::private_dir(&root)?;
         // Independent opens are essential: dup/try_clone would share a flock
         // identity and allow one capture to convert or release another's lock.
         let directory = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.root)?;
+            .open(&root)?;
         let metadata = directory.metadata()?;
         // SAFETY: geteuid takes no arguments and dereferences no pointers.
         if !metadata.is_dir()
@@ -214,21 +248,26 @@ impl BlobStore {
         let cleanup_guard = self.capture_lock(libc::LOCK_SH)?;
         let temporary = tempfile::Builder::new()
             .prefix(".model-capture-")
-            .tempfile_in(&self.root)?;
+            .tempfile_in(self.effective_root())?;
         Ok(Capture {
             temporary,
             digest: Sha256::new(),
             length: 0,
             _cleanup_guard: cleanup_guard,
+            _owner: self._owner.clone(),
         })
     }
     pub fn finish_capture(&self, capture: Capture) -> Result<String, BlobError> {
-        let Capture {
-            temporary,
-            digest,
-            length: _,
-            _cleanup_guard,
-        } = capture;
+        self.verify_owner()?;
+        if let Some(owner) = &capture._owner {
+            owner.verify().map_err(|_| BlobError::Ownership)?;
+        }
+        // Local bindings drop in reverse declaration order: keep the pinned
+        // home FD and cleanup lock alive until NamedTempFile cleanup finishes.
+        let _owner = capture._owner;
+        let _cleanup_guard = capture._cleanup_guard;
+        let temporary = capture.temporary;
+        let digest = capture.digest;
         temporary.as_file().sync_all()?;
         let digest = digest.finalize();
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -247,7 +286,7 @@ impl BlobStore {
     }
     pub fn cleanup_captures(&self) -> Result<(), BlobError> {
         let _cleanup_guard = self.capture_lock(libc::LOCK_EX)?;
-        for entry in fs::read_dir(&self.root)? {
+        for entry in fs::read_dir(self.effective_root())? {
             let entry = entry?;
             if entry
                 .file_name()
@@ -265,6 +304,34 @@ impl BlobStore {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    #[test]
+    fn owned_cleanup_refuses_a_replaced_home_without_removing_foreign_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let original = root.path().join("original");
+        crate::home::prepare(&home).unwrap();
+        let owner = crate::ownership::HomeLease::acquire(&home).unwrap();
+        let blobs = BlobStore::owned(home.join("blobs"), owner);
+        let name = ".model-capture-orphan";
+        fs::write(home.join("blobs").join(name), b"owned-orphan").unwrap();
+        fs::rename(&home, &original).unwrap();
+        crate::home::prepare(&home).unwrap();
+        fs::write(home.join("blobs").join(name), b"foreign-orphan-canary").unwrap();
+        assert!(matches!(
+            blobs.cleanup_captures(),
+            Err(BlobError::Ownership)
+        ));
+        assert_eq!(
+            fs::read(home.join("blobs").join(name)).unwrap(),
+            b"foreign-orphan-canary"
+        );
+        assert_eq!(
+            fs::read(original.join("blobs").join(name)).unwrap(),
+            b"owned-orphan"
+        );
+    }
+
     #[test]
     fn limited_blob_reads_preserve_full_store_access_and_hash_verification() {
         let root = tempfile::tempdir().unwrap();
@@ -338,10 +405,10 @@ mod capture_tests {
         capture.append(b"second").unwrap();
         let hash = first.finish_capture(capture).await.unwrap();
         assert_eq!(blobs.get(&hash).unwrap(), b"firstsecond");
+        first.shutdown().await.unwrap();
         let second = super::super::Store::open(home.path()).await.unwrap();
         assert!(!orphan.exists());
         drop(second);
-        drop(first);
     }
 
     #[test]

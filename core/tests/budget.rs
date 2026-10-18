@@ -362,7 +362,7 @@ async fn global_instances_use_only_the_shared_day_counter_and_sys_is_not_a_sessi
 async fn version_one_upgrade_adds_budget_tables_without_changing_historical_events() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("legacy");
-    std::fs::create_dir(&home).unwrap();
+    fictor::home::private_dir(&home).unwrap();
     let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     {
         let connection = Connection::open(home.join("fictor.db")).unwrap();

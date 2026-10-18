@@ -48,9 +48,15 @@ impl Fixture {
         let mut config = Config::create_if_missing(&home).unwrap();
         config.providers.clear();
         config.sandbox.home_ro_files.clear();
-        let secrets =
-            Arc::new(SecretStore::open(&home, BackendKind::File, Redactor::default()).unwrap());
         let store = Arc::new(Store::open(&home).await.unwrap());
+        let secrets = Arc::new(
+            SecretStore::open_with_lease(
+                store.owner().clone(),
+                BackendKind::File,
+                Redactor::default(),
+            )
+            .unwrap(),
+        );
         let proxy = EgressProxy::bind_unix(home.join("run/proxy.sock"), store.clone(), vec![])
             .await
             .unwrap();

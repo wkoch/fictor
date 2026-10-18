@@ -97,6 +97,7 @@ struct FileBackend {
     home: PathBuf,
     values: Mutex<BTreeMap<String, String>>,
     redactor: Redactor,
+    owner: Option<Arc<crate::ownership::HomeLease>>,
 }
 
 impl FileBackend {
@@ -109,17 +110,41 @@ impl FileBackend {
             home,
             values: Mutex::new(BTreeMap::new()),
             redactor,
+            owner: None,
+        };
+        backend.reload()?;
+        Ok(backend)
+    }
+
+    fn new_owned(
+        owner: Arc<crate::ownership::HomeLease>,
+        redactor: Redactor,
+    ) -> Result<Self, SecretError> {
+        owner.verify().map_err(|_| SecretError::FileIo)?;
+        let backend = Self {
+            home: owner.home().to_path_buf(),
+            values: Mutex::new(BTreeMap::new()),
+            redactor,
+            owner: Some(owner),
         };
         backend.reload()?;
         Ok(backend)
     }
 
     fn path(&self) -> PathBuf {
-        self.home.join("secrets.toml")
+        self.effective_home().join("secrets.toml")
+    }
+
+    fn effective_home(&self) -> PathBuf {
+        match &self.owner {
+            Some(owner) => owner.anchored_path(),
+            None => self.home.clone(),
+        }
     }
 
     fn read_file(&self) -> Result<BTreeMap<String, String>, SecretError> {
         use std::os::unix::fs::OpenOptionsExt;
+        self.verify_owner()?;
         let path = self.path();
         // SAFETY: geteuid takes no arguments and has no memory preconditions.
         let owner = unsafe { libc::geteuid() };
@@ -180,13 +205,29 @@ impl FileBackend {
         }
     }
 
+    fn verify_owner(&self) -> Result<(), SecretError> {
+        if let Some(owner) = &self.owner {
+            owner.verify().map_err(|_| SecretError::FileIo)?;
+        }
+        Ok(())
+    }
+
     fn mutate(
         &self,
         change: impl FnOnce(&mut BTreeMap<String, String>) -> Result<(), SecretError>,
     ) -> Result<(), SecretError> {
         use std::os::unix::fs::PermissionsExt;
         let mut cached = self.values.lock().map_err(|_| SecretError::FileIo)?;
-        let directory = self.lock_directory()?;
+        let _shared = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.lock_secrets().map_err(|_| SecretError::FileIo))
+            .transpose()?;
+        let directory = if self.owner.is_none() {
+            Some(self.lock_directory()?)
+        } else {
+            None
+        };
         let mut values = self.read_file()?;
         self.register(&values)?;
         change(&mut values)?;
@@ -195,8 +236,9 @@ impl FileBackend {
             secrets: values,
         };
         let text = toml::to_string(&document).map_err(|_| SecretError::InvalidFormat)?;
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(&self.home).map_err(|_| SecretError::FileIo)?;
+        self.verify_owner()?;
+        let mut temporary = tempfile::NamedTempFile::new_in(self.effective_home())
+            .map_err(|_| SecretError::FileIo)?;
         temporary
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -213,10 +255,15 @@ impl FileBackend {
         {
             return Err(SecretError::InsecureFile);
         }
+        self.verify_owner()?;
         temporary
             .persist(self.path())
             .map_err(|_| SecretError::FileIo)?;
-        directory.sync_all().map_err(|_| SecretError::FileIo)?;
+        if let Some(owner) = &self.owner {
+            owner.sync_directory().map_err(|_| SecretError::FileIo)?;
+        } else if let Some(directory) = &directory {
+            directory.sync_all().map_err(|_| SecretError::FileIo)?;
+        }
         // Refresh from the actual committed bytes, retaining masks for old values.
         let reloaded = self.read_file()?;
         self.register(&reloaded)?;
@@ -417,6 +464,7 @@ fn validate_name(name: &str) -> Result<(), SecretError> {
 pub struct SecretStore {
     backend: Arc<dyn SecretBackend>,
     redactor: Redactor,
+    owner: Option<Arc<crate::ownership::HomeLease>>,
 }
 
 impl Default for SecretStore {
@@ -431,6 +479,7 @@ impl SecretStore {
         Self {
             backend: Arc::new(NativeBackend::default()),
             redactor: Redactor::default(),
+            owner: None,
         }
     }
 
@@ -448,7 +497,30 @@ impl SecretStore {
         // A temporarily unavailable native store must not prevent the server from
         // starting: individual model calls report secret-unavailable as HTTP 503.
         // FileBackend::new has already validated and loaded its selected file.
-        Ok(Self { backend, redactor })
+        Ok(Self {
+            backend,
+            redactor,
+            owner: None,
+        })
+    }
+
+    /// Join the core's existing exclusive home ownership. Retain it across
+    /// credential operations instead of flocking the same inode a second time.
+    pub fn open_with_lease(
+        owner: Arc<crate::ownership::HomeLease>,
+        backend: BackendKind,
+        redactor: Redactor,
+    ) -> Result<Self, SecretError> {
+        owner.verify().map_err(|_| SecretError::FileIo)?;
+        let backend: Arc<dyn SecretBackend> = match backend {
+            BackendKind::Keyring => Arc::new(NativeBackend::default()),
+            BackendKind::File => Arc::new(FileBackend::new_owned(owner.clone(), redactor.clone())?),
+        };
+        Ok(Self {
+            backend,
+            redactor,
+            owner: Some(owner),
+        })
     }
 
     /// Used after an administrative credential change; never changes backends.
@@ -482,12 +554,18 @@ impl SecretStore {
         if value.is_empty() {
             return Err(SecretError::InvalidValue);
         }
+        if let Some(owner) = &self.owner {
+            owner.verify().map_err(|_| SecretError::FileIo)?;
+        }
         self.redactor.register(value)?;
         self.backend.set(name, value)
     }
 
     pub fn remove(&self, name: &str) -> Result<(), SecretError> {
         validate_name(name)?;
+        if let Some(owner) = &self.owner {
+            owner.verify().map_err(|_| SecretError::FileIo)?;
+        }
         // Retain the old value in the redactor: in-flight logs may still contain it.
         self.backend.remove(name)
     }
@@ -737,6 +815,7 @@ mod tests {
         let store = SecretStore {
             backend: backend.clone(),
             redactor: Redactor::default(),
+            owner: None,
         };
         (store, backend)
     }

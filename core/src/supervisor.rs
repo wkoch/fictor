@@ -274,18 +274,18 @@ impl Supervisor {
         config.egress.nat64_prefixes = self.config.egress.nat64_prefixes.clone();
         config.providers.clear();
         config.sandbox.home_ro_files.clear();
-        let secrets = Arc::new(
-            SecretStore::open(
-                &home,
-                crate::secrets::BackendKind::File,
-                self.secrets.redactor(),
-            )
-            .map_err(|_| SupervisorError::Secret)?,
-        );
         let store = Arc::new(
             Store::open(&home)
                 .await
                 .map_err(|_| SupervisorError::Audit)?,
+        );
+        let secrets = Arc::new(
+            SecretStore::open_with_lease(
+                store.owner().clone(),
+                crate::secrets::BackendKind::File,
+                self.secrets.redactor(),
+            )
+            .map_err(|_| SupervisorError::Secret)?,
         );
         let proxy = EgressProxy::bind_unix_with_nat64(
             home.join("run/proxy.sock"),

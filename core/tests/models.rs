@@ -87,12 +87,15 @@ async fn setup(
 async fn setup_options(
     store: Arc<Store>,
     session: &str,
-    home: &std::path::Path,
+    _home: &std::path::Path,
     url: String,
     limit: u64,
     options: ModelOptions,
 ) -> (EgressProxy, ProxyToken) {
-    let secrets = Arc::new(SecretStore::open(home, BackendKind::File, Default::default()).unwrap());
+    let secrets = Arc::new(
+        SecretStore::open_with_lease(store.owner().clone(), BackendKind::File, Default::default())
+            .unwrap(),
+    );
     if options.secret_available {
         secrets.set("test_key", "fake-core-key").unwrap();
     }

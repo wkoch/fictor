@@ -298,6 +298,11 @@ fn cli_terminal_persistence_error_reports_id_without_claiming_audited_failure() 
 #[tokio::test]
 async fn future_schema_is_refused() {
     let dir = tempdir().unwrap();
+    fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let db = Connection::open(dir.path().join("fictor.db")).unwrap();
     db.pragma_update(None, "user_version", 999).unwrap();
     drop(db);

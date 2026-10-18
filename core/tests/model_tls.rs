@@ -71,8 +71,10 @@ async fn untrusted_provider_certificate_fails_before_credentials_or_body_leave_t
         );
     });
 
-    let secrets =
-        Arc::new(SecretStore::open(&home, BackendKind::File, Default::default()).unwrap());
+    let secrets = Arc::new(
+        SecretStore::open_with_lease(store.owner().clone(), BackendKind::File, Default::default())
+            .unwrap(),
+    );
     secrets
         .set("tls_test_key", "fake-tls-core-credential")
         .unwrap();

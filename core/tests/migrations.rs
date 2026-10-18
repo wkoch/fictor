@@ -37,6 +37,7 @@ fn snapshot(db: &Connection, table: &str) -> Vec<Vec<Value>> {
 #[tokio::test]
 async fn version_three_preserves_every_legacy_proposal_column_and_append_only_events() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let db = legacy(root.path());
     db.pragma_update(None, "journal_mode", "WAL").unwrap();
     db.execute("INSERT INTO events(id,session_id,kind,actor,payload,trust,sensitivity,source,flags,text,created_at) VALUES('01ARZ3NDEKTSV4RRFFQ69G5FAV','sys','ext.proposed','core','{\"legacy\":true}','trusted','public','legacy',0,'history',1)", []).unwrap();
@@ -113,6 +114,7 @@ async fn version_three_preserves_every_legacy_proposal_column_and_append_only_ev
 #[tokio::test]
 async fn database_enforces_joint_identity_and_restricts_unidentified_states() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root.path()).await.unwrap();
     store.shutdown().await.unwrap();
     let db = Connection::open(root.path().join("fictor.db")).unwrap();
@@ -136,6 +138,7 @@ async fn database_enforces_joint_identity_and_restricts_unidentified_states() {
 #[tokio::test]
 async fn failed_backup_prevents_schema_upgrade_and_symlink_backup_targets_are_not_followed() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let db = legacy(root.path());
     let target = root.path().join("fictor.db.bak-2");
     fs::create_dir(&target).unwrap();
@@ -167,6 +170,7 @@ async fn failed_backup_prevents_schema_upgrade_and_symlink_backup_targets_are_no
 #[tokio::test]
 async fn future_schema_is_untouched_and_backups_are_pruned_only_during_upgrade() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let path = root.path().join("fictor.db");
     let db = Connection::open(&path).unwrap();
     db.pragma_update(None, "user_version", 99).unwrap();
@@ -236,6 +240,7 @@ fn future_wal_fixture_process() {
 #[tokio::test]
 async fn future_schema_in_crashed_wal_is_refused_without_checkpoint_or_wal_removal() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "future_wal_fixture_process"])
         .env_clear()
@@ -273,6 +278,7 @@ fn version_three(home: &Path) -> Connection {
 #[tokio::test]
 async fn promotion_and_crash_schemas_preserve_receipts_and_enforce_their_constraints() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let db = version_three(root.path());
     db.pragma_update(None, "journal_mode", "WAL").unwrap();
     db.execute("INSERT INTO proposals(id,source,state,nonce,created_at,updated_at) VALUES('receipt','{}','received','private-nonce',1,1)", []).unwrap();
@@ -358,6 +364,7 @@ async fn promotion_and_crash_schemas_preserve_receipts_and_enforce_their_constra
 #[tokio::test]
 async fn failure_in_migration_five_rolls_back_migration_four_too() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let db = version_three(root.path());
     db.execute_batch("CREATE TABLE extension_crash_recovery(existing TEXT)")
         .unwrap();
@@ -400,6 +407,7 @@ async fn writer_refuses_jobs_after_full_durability_is_lost_and_reopen_restores_i
         atomic::{AtomicBool, Ordering},
     };
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root.path()).await.unwrap();
     store
         .write(|db| {

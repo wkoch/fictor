@@ -107,11 +107,13 @@ async fn main() -> anyhow::Result<()> {
             command: ExtCommand::Check { path },
         } => {
             use std::sync::Arc;
+            let owner = fictor::ownership::HomeLease::acquire(&home)?;
+            let home = owner.home().to_path_buf();
             let config = Arc::new(fictor::config::Config::load(&home)?);
             let nat64 = fictor::proxy::nat64::Nat64Prefixes::new(&config.egress.nat64_prefixes)?;
-            let store = Arc::new(fictor::store::Store::open(&home).await?);
-            let secrets = Arc::new(fictor::secrets::SecretStore::open(
-                &home,
+            let store = Arc::new(fictor::store::Store::open_with_lease(owner).await?);
+            let secrets = Arc::new(fictor::secrets::SecretStore::open_with_lease(
+                store.owner().clone(),
                 config.secrets.backend,
                 redactor,
             )?);
@@ -170,9 +172,14 @@ async fn main() -> anyhow::Result<()> {
             command: ExtCommand::Disable { id },
         } => set_extension_enabled(&home, &id, false)?,
         Command::Secrets { command } => {
-            let config = fictor::config::Config::load(&home)?;
-            let secrets =
-                fictor::secrets::SecretStore::open(&home, config.secrets.backend, redactor)?;
+            let owner = fictor::ownership::HomeLease::acquire(&home)?;
+            let home = owner.home();
+            let config = fictor::config::Config::load(home)?;
+            let secrets = fictor::secrets::SecretStore::open_with_lease(
+                owner,
+                config.secrets.backend,
+                redactor,
+            )?;
             match command {
                 SecretCommand::Set { name } => {
                     if name.is_empty()
@@ -205,7 +212,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn set_extension_enabled(home: &std::path::Path, id: &str, enabled: bool) -> anyhow::Result<()> {
-    let change = fictor::installer::control::set_enabled(home, id, enabled)?;
+    let owner = fictor::ownership::HomeLease::acquire(home)?;
+    let change = fictor::installer::control::set_enabled(owner.home(), id, enabled)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

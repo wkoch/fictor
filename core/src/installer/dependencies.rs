@@ -366,8 +366,12 @@ impl Environment {
             "permissions":{"spawn":true,"net":{"allow":registries}}
         }).to_string(), &nat64).map_err(|_| DependencyError::RegistryPolicy)?;
         let secrets = Arc::new(
-            SecretStore::open(&home, BackendKind::File, Redactor::default())
-                .map_err(|_| DependencyError::Storage)?,
+            SecretStore::open_with_lease(
+                store.owner().clone(),
+                BackendKind::File,
+                Redactor::default(),
+            )
+            .map_err(|_| DependencyError::Storage)?,
         );
         let proxy = Arc::new(
             EgressProxy::bind_unix_with_nat64(
