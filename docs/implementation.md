@@ -295,6 +295,21 @@ gravável por extensão. A política para esses destinos e sua interação com g
 e proveniência aguardam ADR; não foi criada exceção a I11 nem alegada proteção
 de origem que a checagem de tipo não oferece.
 
+## Prazos de chamadas MCP — 2026-10-18
+
+- `McpConnection::call` mantém um único prazo, contado desde a entrada e limitado
+  a 600 segundos. Validação, espera por espaço na fila do SDK e resposta usam o
+  mesmo orçamento. O timer do SDK foi substituído porque começava depois da fila
+  e podia aguardar indefinidamente a escrita da notificação de cancelamento.
+- Cancelar antes de obter um handle da requisição não emite notificação MCP.
+  Depois de obter o ID, a tentativa de `notifications/cancelled` usa no máximo
+  100 ms do prazo restante. Se ele já venceu, o core faz um único poll para
+  enfileirar a notificação, sem esperar sua escrita. Entrega é best effort quando
+  o transporte está bloqueado; não há retry nem task separada de cancelamento.
+- O receptor de cancelamento aguarda valor verdadeiro ou o fechamento do canal;
+  atualizações com valor falso não cancelam a chamada. Testes com escrita
+  controlada e fila saturada reproduzem os bloqueios sem serviços externos.
+
 ## Próxima sequência no Fedora
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;

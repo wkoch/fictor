@@ -1,5 +1,55 @@
 # Verificação da implementação
 
+## Prazos MCP com fila e escrita bloqueadas no Bazzite — 2026-10-18
+
+Código validado: `df71e27d2ca584ff62f7d5d710d2502ffd02b286`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Mesma imagem
+e versões das ferramentas registradas abaixo. Cargo usou `--locked --offline`
+e caches do workspace. Nada foi instalado no host ou globalmente no `$HOME`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **324 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+Três regressões novas reproduziram bloqueios no caminho de chamadas MCP:
+
+- Com a escrita da requisição e da notificação bloqueadas, o timeout do SDK
+  ficava esperando a confirmação do cancelamento. O watchdog de um segundo
+  falhou antes da correção. Agora a chamada retorna `Timeout`; ao liberar o
+  transporte, o servidor recebe a chamada e um cancelamento com o mesmo ID.
+- Cancelamento explícito de uma chamada em andamento também ficava preso no
+  ACK da notificação. A reprodução anterior falhou no mesmo watchdog. Agora
+  retorna `Cancelled` após uma tentativa limitada; liberar a escrita confirma
+  a notificação correspondente, sem segundo timer de cancelamento do SDK.
+- Com as 1024 vagas da fila ocupadas, a chamada continuava pendente mesmo após
+  cancelamento. O teste também inicia uma chamada com prazo positivo nessa
+  condição, aguarda seu vencimento e confirma `Timeout`, sem emissão tardia
+  de `tools/call` ou cancelamento ao drenar a fila.
+
+Os sete unitários do gateway passaram, preservando os testes de catálogo, de
+cancelamento anterior ao envio e de timeout com transporte livre. A revisão
+do roadmap não identificou outra entrega funcional de M0.5 liberada dos ADRs
+pendentes. O [mapa de invariantes](invariants.md) relaciona I1–I11 a 26 referências
+de testes e registra os limites dessa cobertura, incluindo fluxos ainda ausentes.
+
+Logs de execução direta: `.fictor/logs/m05-mcp-deadline-{fmt,clippy,test,release,trail-build,trail-check}.log`,
+`m05-mcp-deadline-code-head.log` e `gateway-backpressure-after-direct.log`.
+`gateway-backpressure-before-transcript.log` é uma reconstrução das saídas
+capturadas das reproduções anteriores à correção, não um log de execução direta.
+Os testes usaram dados falsos e serviços locais, sem chaves reais nem rede externa,
+incluindo sandbox real e npm/uv no Toolbx. Não há workspace TypeScript/`vp`
+nesta base. A CI remota não foi executada.
+
+**Este diagnóstico no Bazzite não satisfaz o gate de release no COSMIC Atomic.**
+M0.5 permanece parcial nas partes dependentes das ARQ-020–026. Não houve ativação,
+mudança de formatos persistidos ou implementação de contratos bloqueados.
+
 ## Cancelamento e arquivos de controle no Bazzite — 2026-10-18
 
 Código validado: `447e42bf6b3741f340e15c5e95398107477d79c9`.

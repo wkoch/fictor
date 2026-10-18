@@ -6,12 +6,12 @@ continuam em [README do spec](../spec/README.md#invariantes),
 Esta matriz seleciona testes existentes e delimita o que suas asserções cobrem;
 não substitui o spec nem declara uma invariante inteira comprovada por um teste.
 
-O [diagnóstico registrado](verification.md#cancelamento-e-arquivos-de-controle-no-bazzite--2026-10-18)
-teve **321 testes passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
+O [diagnóstico registrado](verification.md#prazos-mcp-com-fila-e-escrita-bloqueadas-no-bazzite--2026-10-18)
+teve **324 testes passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
 44.20261012.0 x86-64**, com dados falsos e serviços locais. O código validado está
 identificado naquele registro. **A execução no Fedora COSMIC Atomic do usuário
-e os jobs remotos de CI continuam pendentes.** Não foi executada nova suíte para
-esta revisão documental.
+e os jobs remotos de CI continuam pendentes.** Esta matriz referencia a execução
+registrada e não acrescenta testes ao código.
 
 “Parcial” indica uma fronteira implementada e testada, com partes da invariante
 ainda não exercitáveis. “Suportado no código atual” descreve a proteção concreta
