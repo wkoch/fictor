@@ -310,6 +310,33 @@ de origem que a checagem de tipo não oferece.
   atualizações com valor falso não cancelam a chamada. Testes com escrita
   controlada e fila saturada reproduzem os bloqueios sem serviços externos.
 
+## Provas de isolamento no supervisor — 2026-10-18
+
+- O cenário local do critério 5 usa uma extensão nativa compilada no teste e um
+  provider HTTP em loopback. A credencial falsa aleatória fica só no SecretStore
+  e no model proxy; não entra no binário, argumentos ou ambiente do probe. O
+  upstream confirma sua injeção; o cliente recebe somente o payload público.
+  Observações de ambiente, árvores de fixture (`workspace`, `${ext_data}`, tmp),
+  descritores regulares e memória própria são procuradas pelo host. Há controles
+  distintos, incluindo canário criado em heap durante a execução e arquivo
+  desvinculado mantido em FD igual ou maior que 128. Os dumps são limitados e
+  falham em erro inesperado ou limite excedido; não observam todos os arquivos
+  do host nem todos os runtimes. Mapas VVAR e sem permissão de leitura são
+  contabilizados explicitamente.
+- O cenário local do critério 16 inicia duas instâncias simultâneas do mesmo
+  `ext_id`, com sessões diferentes. Cada uma grava a mesma chave KV e o mesmo
+  nome de arquivo, com canários distintos. B vê estado inicial vazio e não lê
+  o caminho real de A; após B encerrar, A conserva seus valores e não lê o
+  caminho real de B. As chamadas KV passam pelo Kernel TCP do próprio sandbox;
+  a única concessão de filesystem é `${ext_data}` da instância.
+- O teste de cancelamento da recuperação estaciona o writer por canal e confirma
+  a entrada nessa barreira antes de cancelar o chamador. O bloqueio SQLite usado
+  anteriormente podia devolver `DatabaseBusy` imediatamente durante a promoção
+  de leitura para escrita, liberando legitimamente o lease antes da asserção.
+  Agora a verificação ocorre com trabalho realmente pendente; a barreira é
+  liberada antes das asserções e também pelo Drop do sender em caso de unwind.
+  A implementação produtiva de recuperação e lease não mudou.
+
 ## Próxima sequência no Fedora
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;

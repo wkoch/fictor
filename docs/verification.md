@@ -1,5 +1,75 @@
 # Verificação da implementação
 
+## Provas de isolamento no Bazzite — 2026-10-18
+
+Código validado: `6f39449cf4bd91824ce6c9b918b6e6bb98c7899e`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Mesma imagem
+e versões das ferramentas registradas abaixo. Cargo usou `--locked --offline`
+e caches do workspace. Nada foi instalado no host ou globalmente no `$HOME`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **326 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+Dois testes de integração cobrem cenários já previstos na Fase 0:
+
+- **Critério 5 / I4:** uma extensão nativa faz uma requisição ao provider HTTP
+  local por meio do model proxy. O upstream confirma a chave falsa aleatória
+  injetada pelo core; a extensão recebe somente o payload público. O host procura
+  a chave nas observações de ambiente, arquivos de fixture legíveis, descritores
+  regulares e memória do processo. Controles distintos comprovam cada captura,
+  incluindo um canário criado em heap durante a execução e um arquivo
+  desvinculado mantido em FD 128. Na execução dirigida final, foram capturadas
+  21 regiões e 2.871.296 bytes de memória, seis arquivos e um FD regular;
+  três caminhos privados existentes no host ficaram inacessíveis. Dois mapas
+  VVAR e uma região sem leitura foram contabilizados. O probe falha em erro
+  inesperado ou limite excedido, sem varrer os próprios dumps. Essa fixture não
+  atesta todos os runtimes, instantes, codificações ou arquivos do host.
+- **Critério 16:** duas instâncias simultâneas da mesma extensão, em sessões
+  diferentes, gravam a mesma chave KV e o mesmo nome de arquivo com valores
+  distintos. As chamadas passam pelo Kernel TCP real de cada sandbox. B começa
+  sem os dados de A e não lê seu caminho absoluto; depois de B sair, A conserva
+  ambos os valores e também não lê os dados de B. A única concessão de
+  filesystem é `${ext_data}` da instância. O alvo `supervisor` passou com 29 testes.
+
+A primeira suíte completa teve 325 testes passando e uma falha no teste existente
+de cancelamento da recuperação. Um diagnóstico manteve `BEGIN IMMEDIATE` sem
+`ROLLBACK` e observou `DatabaseBusy`, proposta ainda `received` e lease novamente
+disponível: o bloqueio SQLite não garantia trabalho pendente. O teste agora usa
+uma barreira confirmada no writer, com liberação antes das asserções e durante
+unwind. `proposal_recovery` passou com sete testes e a suíte completa foi repetida
+após essa correção. A implementação produtiva não foi alterada nesta rodada.
+
+A revisão adicional do instalador, do gateway e das fronteiras de autenticação,
+escopo e linhagem do Kernel não demonstrou outro defeito nesse recorte. A
+**ARQ-027** registra separadamente uma requisição válida no limite de 16 MiB que
+recebe erro com `id: null`, perdendo a correlação com seu ID conhecido. A reprodução
+local falhou na asserção de correlação; o teste temporário foi removido. Teto de
+ID ou encerramento de transporte exigem ADR, conforme `AGENTS.md`; nenhum desses
+contratos foi implementado nem o limite de mensagem foi relaxado.
+
+Logs diretos: `.fictor/logs/m05-isolation-{fmt,clippy,test,release,trail-build,trail-check}.log`,
+`m05-isolation-code-head.log`, `i4-provider-secret-probe-direct.log` e
+`m05-recovery-sqlite-diagnostic.log`. A primeira suíte e seu commit foram preservados
+em `m05-isolation-test-before.log` e `m05-isolation-code-head-before.log`.
+`kernel-large-id-before-transcript.log` é um transcript reconstruído das saídas
+capturadas, identificado como tal. Os 26 links de testes do
+[mapa de invariantes](invariants.md) foram conferidos por identificador e linha.
+
+Os testes usaram dados falsos e serviços locais, sem chaves reais nem rede externa,
+incluindo sandbox real e npm/uv no Toolbx. Não há workspace TypeScript/`vp`
+nesta base. A CI remota não foi executada.
+
+**Este diagnóstico no Bazzite não satisfaz o gate de release no COSMIC Atomic.**
+M0.5 permanece parcial nas partes dependentes das ARQ-020–027; não houve ativação,
+alteração de formatos persistidos ou avanço para os marcos seguintes.
+
 ## Prazos MCP com fila e escrita bloqueadas no Bazzite — 2026-10-18
 
 Código validado: `df71e27d2ca584ff62f7d5d710d2502ffd02b286`.
