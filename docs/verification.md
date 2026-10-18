@@ -1,5 +1,47 @@
 # Verificação da implementação
 
+## Integração na main — 2026-10-18
+
+Código validado: `de9a82f47008a1c1a1a212f104592b6cb2e809f3`.
+Merge local de `codex/m05-proposal-receipts` com os quatro commits de arquitetura
+que já estavam na `main`. A branch de implementação foi removida após confirmar
+que seu histórico estava integralmente alcançável pela `main`.
+
+O conteúdo de `spec/` permaneceu idêntico a `a753e69`, último commit do Arquiteto:
+as mudanças normativas da branch eram as mesmas já presentes no ADR-035 da main.
+O código em `core/` e `dev/` permaneceu idêntico ao da branch em `59a9d11`.
+Os conflitos documentais foram conciliados preservando os diagnósticos e as
+resoluções arquiteturais; ARQ-020–026 estão resolvidas, e ARQ-027 continua aberta.
+Os contratos dos ADRs 036–042 ainda exigem implementação e testes.
+
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**, com as mesmas
+ferramentas e imagem registradas abaixo. Cargo usou `--locked --offline` e caches
+do workspace. Nenhuma instalação no host ou global no `$HOME`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **326 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| Conferência do roadmap e da matriz | 75 critérios ativos: 56 + 10 + 4 + 5; 26 referências exatas de testes conferidas. |
+| `git diff --check` | Passou. |
+
+Logs: `.fictor/logs/main-integration-{fmt,clippy,test,release,trail-build,trail-check}.log`
+e `main-integration-code-head.log`. O hash de `AGENTS.md` confirmou a preservação
+da alteração local preexistente; ela e o cache `.trail/` ficaram fora dos commits.
+O [fluxo de Git](implementation.md#fluxo-de-git) registra a orientação do usuário:
+trabalho integrável diretamente na `main`, operações Git pelo agente principal
+e edição da arquitetura pelo Arquiteto. O [caminho até a v1.0](release-path.md)
+foi alinhado ao roadmap integrado.
+
+A suíte usou dados falsos e endpoints locais, sem chaves reais nem rede externa,
+incluindo sandbox real e npm/uv. Não há workspace TypeScript/`vp` nesta base.
+A CI remota não foi executada e o gate no Fedora COSMIC Atomic permanece pendente.
+Esta integração não declara M0.5 ou qualquer release concluídos.
+
 ## Provas de isolamento no Bazzite — 2026-10-18
 
 Código validado: `6f39449cf4bd91824ce6c9b918b6e6bb98c7899e`.

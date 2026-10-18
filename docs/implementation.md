@@ -11,6 +11,7 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 [verificação](verification.md) distingue esses ambientes. O
 [mapa de invariantes](invariants.md) relaciona I1–I11 aos testes existentes e às
 lacunas de cobertura funcional e de release.
+O [caminho até a v1.0](release-path.md) reúne as etapas restantes e os gates.
 
 Após a integração com a `main`, os ADRs 036–042 estão disponíveis: ARQ-020–026
 estão resolvidas no spec, com implementação e testes ainda pendentes. A ARQ-027
@@ -63,7 +64,7 @@ Definido pelo usuário em 2026-10-18:
 - Implementações destinadas ao projeto são feitas e commitadas diretamente na `main`.
 - Branches ficam reservadas a testes exploratórios descartáveis, sem entrega
   planejada de volta à `main`.
-- O agente principal coordena commits, merges e demais operações Git do projeto.
+- Somente o agente principal executa commits, merges e demais operações Git do projeto.
   Agentes delegados editam arquivos e reportam resultados para integração.
 - O Arquiteto edita somente os arquivos de arquitetura. O implementador integra
   e versiona essas edições, preservando a autoria das decisões normativas.

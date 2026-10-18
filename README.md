@@ -144,3 +144,6 @@ esse diagnóstico não substitui o gate no COSMIC Atomic nem a execução da CI.
 Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md),
 a [cobertura das invariantes](docs/invariants.md) e as
 [pendências do arquiteto](docs/architect-pending.md).
+O [caminho até a v1.0](docs/release-path.md) distingue o escopo restante e os gates.
+As entregas seguem diretamente na `main`, conforme o
+[fluxo de Git](docs/implementation.md#fluxo-de-git).
