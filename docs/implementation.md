@@ -15,9 +15,12 @@ O [caminho até a v1.0](release-path.md) reúne as etapas restantes e os gates.
 
 Os ADRs 036–044 estão disponíveis e ARQ-020–028 estão resolvidas no spec. O produto
 já aplica as migrações 0004/0005, FULL no writer, registros exatos de dependências,
-snapshots de overrides e leitura protegida dos controles. Promoção recuperável,
-posse/recuperação de instâncias, crash loop e listagem administrativa continuam
-pendentes. As ARQ-027/028 foram decididas nos ADRs 043/044; sua implementação e seus testes continuam pendentes. Os registros anteriores abaixo descrevem os
+snapshots de overrides, leitura protegida dos controles, IDs limitados do Kernel,
+posse exclusiva do home e plano único de montagens com classificação de origens.
+Promoção recuperável, barreira durável/recuperação de instâncias, proteção do
+bootstrap antes do init, crash loop e listagem administrativa continuam pendentes.
+Os ADRs 043/044 estão implementados parcialmente; o SDK ainda pertence ao M0.8.
+Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
 
 | Marco | Estado | Entrega e restante |
@@ -26,13 +29,41 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações e origem dos controles disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, posse/recuperação de instâncias, crash loop, listagem administrativa, contratos de IDs/montagens dos ADRs 043/044 e integração first-party. |
+| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações, controles protegidos, IDs do Kernel, posse exclusiva e plano de montagens disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, barreira/recuperação de instâncias, proteção pré-init do bootstrap, crash loop, listagem administrativa e integração first-party. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
 | M0.9 | Toolbx e guarda de migração preparados; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS e backup/recusa de downgrade disponíveis. Gerenciador de runtimes, login, rollback e unidade systemd de usuário pendentes. |
 | M0.10 | Não implementado | Aceitação completa e roteiro de autossuficiência no Fedora COSMIC Atomic. |
 | Fases 1–3 | Não iniciadas | Aguardam todos os critérios da Fase 0; corte v1.0 no roadmap. |
+
+## Posse exclusiva e contratos de transporte/montagens (2026-10-18)
+
+O core adquire `flock(LOCK_EX | LOCK_NB)` no próprio inode do home canônico,
+privado e do usuário, antes de preparar seus descendentes ou abrir o writer.
+O FD é CLOEXEC e vive em `Arc<HomeLease>`; writer, pool de leitura, capturas,
+segredos e trabalhos independentes conservam a posse até terminarem. Uma mesma
+posse não abre dois writers simultâneos. Os backends de segredos compartilham
+um mutex da posse, sem tentar adquirir novamente o flock do mesmo diretório.
+CLI ocupada falha antes de mutar; encaminhamento pelo admin ainda depende do
+canal administrativo. Isso não implementa nem substitui o journal/barreira e a
+confirmação de saída do ADR-038.
+
+O Kernel mantém Number IDs como tokens JSON validados (`serde_json/raw_value`,
+sem dependência nova) e String IDs como escalares UTF-8 limitados a 256 bytes.
+A correlação precede autenticação/dispatch; batches não executam membros.
+Respostas são serializadas com limite antes da transmissão e o fallback
+`TOO_LARGE` conserva o ID. Falha de entrega não desfaz nem repete efeitos.
+
+Um plano do core reúne reservas, aliases, modos e funções das montagens. Leituras
+redundantes exigem identidade/subárvore comprovada; não removem o RW implícito de
+ext_data. Fontes originais são resolvidas sem magic links. A lista fechada de
+filesystems cruza nome exato de mount, fstatfs e statx da mesma FD, incluindo
+submounts. Btrfs pode informar dispositivo de subvolume diferente do superbloco;
+essa distinção é preservada sem confundir dispositivo com mount ID. Overlay
+continua limitado às bases fixas/exceções nominais do ADR-044. A atestação final
+confere objeto, topologia, filesystem e aliases. Ainda falta garantir o bootstrap
+e suas bibliotecas antes da execução do init; sua própria atestação não basta.
 
 ## Migração para Linux x86-64 (2026-10-17)
 

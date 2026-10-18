@@ -31,6 +31,7 @@ Resolução do spec não significa implementação concluída.
   podem avançar sem ampliar grants ou modificar o spec.
 - **Resolução:** Plano único reserva destinos internos, protege bootstrap antes do init e confere a árvore final. Imports ordinários restritos a ext2/3/4, btrfs, xfs e tmpfs; overlay só nas bases RO fixas do sistema/Toolbx e bootstrap já coberto. Recusar magic links na resolução original e pseudoFS/aliases/submounts inadequados. /tmp e aliases de roteamento conservam filhos de dados autorizados e disjuntos.
 - **Entrega ao implementador:** Aplicar a política ao perfil, renderer e prova/barreira existentes, inclusive recursos implícitos e smoke; não ampliar grants nem confiar só na atestação de um init já substituído. Critérios 61–65; implementação e gate continuam pendentes.
+- **Progresso em 2026-10-18:** plano único, reservas/equivalências, resolução original sem magic links, classificação por FD e atestação de filesystem/aliases implementados. Matrizes reais usam árvores fictícias e namespaces próprios. Proteção do bootstrap e bibliotecas antes de executar init, integração da barreira durável e gate de release continuam pendentes; a atestação pelo próprio init não fecha essa lacuna.
 
 ## ARQ-027 — Correlação de IDs no limite de mensagem do Kernel Protocol
 
@@ -61,6 +62,7 @@ Resolução do spec não significa implementação concluída.
   `.fictor/logs/kernel-large-id-before-transcript.log`.
 - **Resolução:** ID String até 256 bytes UTF-8 decodificados ou Number de token até 256 bytes, com eco sem arredondamento; Null distinto de ausência. Excesso encerra antes de hello/dispatch. Resposta grande usa TOO_LARGE com o mesmo ID; falha de entrega não troca ID, desfaz efeitos nem autoriza retry. Um objeto por frame, sem batches; 16 MiB exclui LF.
 - **Entrega ao implementador:** Aplicar admissão e writer do Kernel, mantendo MCP/admin/WS separados; SDK futuro conclui pendências e não repete chamadas. Critérios 57–60; implementação e testes do produto pendentes.
+- **Progresso em 2026-10-18:** admissão, parser estrito e writer limitado implementados em `869ce81`, com testes de IDs/UTF-8/números opacos, batches, correlação de erros, efeitos e falha de entrega. SDK ainda não existe nesta fase; suas obrigações permanecem para M0.8. Gate de release continua pendente.
 
 ## ARQ-026 — Destinos de links dos arquivos de controle do core
 

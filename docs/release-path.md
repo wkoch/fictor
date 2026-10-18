@@ -1,7 +1,7 @@
 # Caminho até a v1.0
 
 Atualizado em 2026-10-18, após as entregas dos contratos do M0.5 na `main`
-(`28981ed`) e a resolução arquitetural das ARQ-027/028 nos ADRs 043/044. O projeto está no **M0.5 parcial**, ainda antes do agente funcional
+e a aplicação parcial dos ADRs 043/044. O projeto está no **M0.5 parcial**, ainda antes do agente funcional
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
@@ -22,15 +22,15 @@ diferentes e não enumeram cada item de implementação.
 ## Próxima sequência
 
 1. Implementar os contratos dos [ADRs 036–042](../spec/11-decisions.md): promoção
-   recuperável com aprovação persistida, posse/recuperação de instâncias, crash
+   recuperável com aprovação persistida, barreira/recuperação de instâncias, crash
    loop e listagem administrativa. Migrações/FULL, autoridades exatas, overrides
-   efetivos e leitura protegida dos controles já têm entregas no produto; falta
+   efetivos, posse exclusiva e leitura protegida dos controles já têm entregas no produto; falta
    integrar os fluxos completos. ARQ-020–026 estão resolvidas no spec; o M0.5
    permanece parcial.
-2. Implementar e testar [ADR-043](../spec/11-decisions.md#adr-043--ids-limitados-e-respostas-correlacionadas-no-kernel-protocol-resolve-arq-027)
-   (IDs e resposta correlacionada) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
-   (destinos internos e origens de montagens). ARQ-027/028 resolvidas; critérios
-   57–65 ainda não foram aceitos no produto.
+2. Concluir [ADR-043](../spec/11-decisions.md#adr-043--ids-limitados-e-respostas-correlacionadas-no-kernel-protocol-resolve-arq-027)
+   (obrigações futuras do SDK; transporte do Kernel implementado) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
+   (proteção de bootstrap/bibliotecas antes do init; plano e origens já implementados).
+   ARQ-027/028 resolvidas; o gate dos critérios 57–65 continua pendente.
 3. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
@@ -41,9 +41,9 @@ sem decompor e medir as entregas restantes.
 
 ## Evidência e release
 
-A base tem diagnóstico de **369 testes passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **408 testes passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 369 critérios de produto aceitos.
+Esse resultado não representa 408 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates

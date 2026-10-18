@@ -1,5 +1,72 @@
 # Verificação da implementação
 
+## Posse exclusiva, Kernel e origens — 2026-10-18
+
+Código validado: `598c10c436a1d2ec097796a17681598a778e0655`, na `main`.
+Integração dos ADRs (`4e9ce5e`), Kernel (`869ce81`), posse/blobs/segredos
+(`1545b38`), plano/origens (`70c199d`), literal do teste (`d651b06`) e
+encerramento do fixture de dependências (`598c10c`).
+
+Execução na máquina do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**, kernel
+`7.2.9-ogc3.1.fc44.x86_64`. Rust/Cargo 1.99.0, Node 24.18.0 LTS/npm 11.16.0,
+uv 0.12.24/Python 3.14.8, bubblewrap 0.12.0 e util-linux 2.41.5.
+Nada instalado no host; caches no workspace, Cargo fixado/offline, somente
+dados falsos e servidores locais nos testes. A imagem ativa do Toolbx permanece
+`65e9e051ef66b1905fbe70de87d8f9f6ebe52662e90a424d5ed2457299a45b2b`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **408 passaram, 0 falharam, 0 ignorados, em 32 alvos.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente; sem passe semântico remoto. |
+| Documentação | 342 links locais e 28 referências exatas de testes válidos. |
+
+Cobertura nova:
+
+- [Kernel](../core/tests/kernel.rs): IDs vazios/Null/UTF-8, escapes e surrogates,
+  tokens numéricos de precisão arbitrária dentro do teto lexical, duplicatas,
+  batches sem efeitos, fronteiras de frame/ID e fallback correlacionado. Forks
+  e auditoria permanecem após resposta excessiva ou cliente desconectado;
+  não há replay/rollback adivinhado. Units do writer cobrem falhas de entrega.
+- [Posse](../core/tests/ownership.rs): aliases normais e bind em namespace privado
+  concorrem pelo mesmo inode; CLI ocupada não altera config/banco; homes inseguros
+  não são reparados; um dono compartilhado continua limitado a um writer;
+  cancelamento e capturas retêm o lock. Units conferem CLOEXEC e reader cancelado.
+- [Blobs](../core/tests/blob_ownership.rs): duas regressões falharam antes do fix
+  e passaram depois. Troca do home recusa publicação/append/finalização e a
+  limpeza de temporários não remove arquivos homônimos do diretório substituto.
+  I/O e temporários de blobs/segredos usam o FD do home possuído.
+- [Segredos](../core/tests/secrets_ownership.rs): dois backends compartilham o
+  mutex da posse sem deadlock nem updates perdidos, conservam o lock até o último
+  usuário e recusam home substituído. Construção nativa continua lazy, sem
+  consultar keyring real. O helper de deadlock tem prazo e seu término é aguardado.
+- [Origens](../core/tests/mount_origins.rs) e [plano](../core/tests/mount_plan.rs):
+  matrizes reais em namespaces privados, tmpfs, procfs próprio e overlay fictício;
+  reservas, aliases, equivalência por FD, diretórios internos vazios e proteção da
+  preparação host contra ancestrais/bind aliases. Units distinguem nomes exatos,
+  magic compartilhado e tipos desconhecidos. O positivo no checkout Btrfs cobre
+  dispositivos de subvolume diferentes do superbloco, conservando mount ID,
+  identidade e classificação da mesma FD. Helpers procfs observam somente seu
+  namespace e arquivos fictícios; não acessam root/fd/mem/environ de processos externos.
+
+A primeira execução completa encontrou um fixture chamando a CLI offline com
+Store/proxy ainda vivos. O fixture agora encerra proxy e writer antes da chamada,
+depois reabre o banco para conferir o resultado; a trava de produção foi mantida.
+
+Logs locais: `.fictor/logs/m05-next-final-{fmt,clippy,test,release,tools,trail-build,trail-check,docs}.log`
+e `m05-next-final-code-head.log`; dirigidas em `m05-next-*` e `adr043-*`/`adr044-*`.
+Os logs são evidência local, não artefatos versionados nem execução remota da CI.
+
+**M0.5 continua parcial.** Faltam bootstrap/bibliotecas protegidos antes do init,
+journal/barreira/recuperação de instâncias, promoção recuperável com aprovação,
+crash loop e canal/listagem administrativos. SDK permanece M0.8. A atestação
+executada pelo init não fecha o critério 64. O workflow Fedora está em adaptação;
+nenhum job remoto foi executado nesta revisão. **CI remota e gate no Fedora
+COSMIC Atomic continuam pendentes.**
+
 ## Resoluções arquiteturais dos ADRs 043/044 — 2026-10-18
 
 Base inspecionada: `e459a27040e5655a5b6a46d8c87b56aacdfefe65`, main. ARQ-027/028
