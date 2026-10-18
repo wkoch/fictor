@@ -32,7 +32,7 @@ async fn init_is_idempotent_and_preserves_configuration() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        5
     );
     assert_eq!(
         db.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
@@ -131,13 +131,26 @@ async fn migrations_match_spec_and_protect_events() {
         include_str!("../migrations/0003_proposal_receipts.sql"),
         include_str!("../../spec/schemas/0003_proposal_receipts.sql")
     );
+    assert_eq!(
+        include_str!("../migrations/0004_promotion_journal.sql"),
+        include_str!("../../spec/schemas/0004_promotion_journal.sql")
+    );
+    assert_eq!(
+        include_str!("../migrations/0005_crash_recovery.sql"),
+        include_str!("../../spec/schemas/0005_crash_recovery.sql")
+    );
     let dir = tempdir().unwrap();
+    fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     fictor::initialize(dir.path()).await.unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     store.write(|db| {
         assert_eq!(db.pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))?, 1);
         assert_eq!(db.pragma_query_value(None, "busy_timeout", |r| r.get::<_, i64>(0))?, 5000);
-        assert_eq!(db.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))?, 1);
+        assert_eq!(db.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))?, 2);
         db.execute("INSERT INTO events (id, session_id, kind, actor, payload, trust, sensitivity, text, created_at) VALUES ('test', 'sys', 'test', 'core', '{}', 'trusted', 'public', 'bootstrap', 0)", [])?;
         assert!(db.execute("UPDATE events SET text='changed' WHERE id='test'", []).is_err());
         assert!(db.execute("DELETE FROM events WHERE id='test'", []).is_err());

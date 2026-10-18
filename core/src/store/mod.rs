@@ -166,7 +166,9 @@ impl Store {
         let (reply, result) = oneshot::channel();
         self.writer
             .send(Box::new(move |connection| {
-                let _ = reply.send(operation(connection));
+                let result =
+                    migrations::confirm_full(&connection.db).and_then(|()| operation(connection));
+                let _ = reply.send(result);
             }))
             .await
             .map_err(|_| StoreError::Closed)?;

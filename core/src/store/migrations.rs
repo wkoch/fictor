@@ -9,11 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 3;
-const MIGRATIONS: [&str; 3] = [
+const SCHEMA_VERSION: i64 = 5;
+const MIGRATIONS: [&str; 5] = [
     include_str!("../../migrations/0001_init.sql"),
     include_str!("../../migrations/0002_flow_budget.sql"),
     include_str!("../../migrations/0003_proposal_receipts.sql"),
+    include_str!("../../migrations/0004_promotion_journal.sql"),
+    include_str!("../../migrations/0005_crash_recovery.sql"),
 ];
 
 pub(super) fn open_writer(path: &Path) -> Result<Connection, StoreError> {
@@ -54,10 +56,13 @@ pub(super) fn open_writer(path: &Path) -> Result<Connection, StoreError> {
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    // Set and confirm FULL before even journal-mode initialization can write.
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    confirm_full(&connection)?;
     connection.busy_timeout(Duration::from_millis(5000))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    confirm_full(&connection)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         if version < (index + 1) as i64 {
@@ -71,6 +76,16 @@ pub(super) fn open_writer(path: &Path) -> Result<Connection, StoreError> {
     )?;
     transaction.commit()?;
     Ok(connection)
+}
+
+pub(super) fn confirm_full(connection: &Connection) -> Result<(), StoreError> {
+    let synchronous: i64 = connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+    if synchronous != 2 {
+        return Err(StoreError::Invalid(
+            "durabilidade SQLite FULL não confirmada",
+        ));
+    }
+    Ok(())
 }
 
 fn lock(file: &File) -> Result<(), io::Error> {
@@ -97,6 +112,8 @@ fn backup(source: &Connection, path: &Path, version: i64) -> Result<(), StoreErr
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     {
         let mut destination = Connection::open(temporary.path())?;
+        destination.pragma_update(None, "synchronous", "FULL")?;
+        confirm_full(&destination)?;
         // SQLite's backup API includes committed WAL content; copying the main
         // file alone would silently lose those transactions.
         Backup::new(source, &mut destination)?.run_to_completion(

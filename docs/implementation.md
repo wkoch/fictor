@@ -20,7 +20,7 @@ foram produzidos, sem substituir este estado atual.
 
 | Marco | Estado | Entrega e restante |
 |---|---|---|
-| M0.1 | Base implementada | Crate único, CLI `init`/`doctor`/`secrets`, TOML, FICTOR_HOME privado, migrações 0001–0003 e sessão `sys`. `init --first-party` aguarda instalador. |
+| M0.1 | Base implementada | Crate único, CLI `init`/`doctor`/`secrets`, TOML, FICTOR_HOME privado, migrações 0001–0005 e sessão `sys`. `init --first-party` aguarda instalador. |
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
@@ -441,7 +441,8 @@ ARQ-020–024 resolvidas pelos ADRs 036–040: promoção recuperável, override
 humanos, posse/recuperação de instâncias, crash loops e fronteira dos registros de dependências. Migrações normativas
 0004/0005, schema de overrides e critérios 38–46 estão no spec. Este registro
 foi incorporado à `main` junto ao código do implementador. As migrações 0004/0005
-e esses novos contratos ainda não estão implementados no produto.
+já são aplicadas pelo produto; o journal de promoção e a recuperação de crash loops
+ainda precisam de seus fluxos funcionais.
 
 ARQ-025 resolvida pelo ADR-041: `ext list` consulta configuração online/offline
 sem afirmar saúde; leitura coordenada com o journal e canal administrativo mínimo
@@ -451,3 +452,23 @@ ARQ-026 resolvida pelo ADR-042: origem protegida dos arquivos de controle,
 validação por descritor e recusa de aliases que exponham a árvore privada.
 Erros de `config.get`, ausência e tratamento do legado estão definidos; critérios
 51–56 aguardam implementação e testes. Nenhum reparo de dados do usuário é automático.
+
+## Base durável dos ADRs 036/039
+
+O runner aplica as migrações literais 0004/0005 na mesma transação e preserva
+recibos, nonces e eventos anteriores. O backup privado inclui o WAL e conserva o
+schema anterior; falha de backup ou de qualquer migração impede a atualização.
+Versões futuras continuam recusadas antes de abrir conexão de escrita.
+
+Cada conexão de escrita do produto confirma `synchronous=FULL` antes da primeira
+transação, inclusive a conexão de destino da API de backup. A task do writer
+confirma novamente o valor antes de executar cada operação; uma mudança inesperada
+recusa a operação, sem reparo silencioso. O comentário histórico de 0001 permanece
+literalmente igual ao spec; os pragmas atuais são responsabilidade do runner.
+
+Os testes dirigidos de migrações, bootstrap e orçamento passaram: **28 testes
+no Toolbx Fedora 44 sobre Bazzite**. Cobrem rollback conjunto de 0004/0005,
+constraints do journal e dos escopos de crash, recusa de escrita após perda de FULL,
+backup/restauração de dados e imutabilidade dos eventos. Isso verifica o protocolo
+SQLite escolhido, sem simular uma perda física de energia. A existência das tabelas
+não encerra a promoção recuperável nem a supervisão de crash loops.
