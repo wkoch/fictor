@@ -835,7 +835,7 @@ mod tests {
             ("proc", 0x9fa0),
             ("sysfs", 0x6265_6572),
             ("devpts", 0x1cd1),
-            ("cgroup", 0x27e0_eb),
+            ("cgroup", 0x0027_e0eb),
             ("cgroup2", 0x6367_7270),
             ("fuse", 0x6573_5546),
             ("fuseblk", 0x6573_5546),
