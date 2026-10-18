@@ -327,9 +327,12 @@ implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
 2026-10-18, com recebimento e recuperação implementados em M0.5; consulte
 [architect-pending.md](architect-pending.md).
 
-ARQ-020–024 registram lacunas de segurança/persistência encontradas nesta
-continuação. As partes afetadas aguardam ADR; `spec/` permanece sob autoria do
-arquiteto.
+ARQ-020–027 registram lacunas de segurança, persistência e protocolo encontradas
+nas continuações do M0.5. As partes afetadas aguardam ADR; `spec/` permanece sob
+autoria do arquiteto. A ARQ-027 registra o ID JSON-RPC que cabe na requisição, mas
+não no envelope de erro correlacionado: o fallback atual troca o ID por `null`.
+Definir um teto de ID ou um encerramento de transporte exige decisão de protocolo;
+o limite de 16 MiB não foi relaxado e essa parte não foi alterada sem ADR.
 
 ## Recebimento durável — ADR-035
 

@@ -1,7 +1,35 @@
 # Pendências para o arquiteto
 
-ARQ-020–026 abertas em 2026-10-18 durante a continuação do M0.5.
+ARQ-020–027 abertas em 2026-10-18 durante a continuação do M0.5.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-027 — Correlação de IDs no limite de mensagem do Kernel Protocol
+
+- **Status: aberta.**
+- **Referência:** `spec/03-kernel-protocol.md`, transporte (JSON-RPC 2.0 e mensagem
+  máxima de 16 MiB); [JSON-RPC 2.0, seções 4 e 5](https://www.jsonrpc.org/specification),
+  consultado em 2026-10-18; `core/src/kernel/transport.rs`, `write_value`.
+- **Dúvida:** o limite atual admite uma requisição cujo ID ocupa quase todo o
+  frame, mas o envelope de erro com esse mesmo ID pode exceder 16 MiB. JSON-RPC
+  exige repetir o ID conhecido. No socket real, após `kernel.hello` válido,
+  `{"jsonrpc":"2.0","id":"<x repetido 16.777.177 vezes>","method":"x"}`
+  mede 16.777.215 bytes; com LF, cabe exatamente em 16.777.216 bytes. O erro
+  `METHOD_NOT_FOUND` correlacionado excede o limite em 39 bytes, e o fallback
+  `TOO_LARGE` correlacionado em 32 bytes, antes do LF. `write_value` então envia
+  o fallback de 74 bytes com `id: null`, embora o ID original tenha sido detectado.
+  Não é possível preservar o ID e o erro obrigatório dentro do limite para todos
+  os IDs hoje admitidos.
+- **Necessário:** ADR definindo um limite/formato de ID que reserve espaço para
+  o envelope de erro, ou a semântica de falha de transporte quando a resposta
+  correlacionada não couber. Definir validação antes do dispatch, resposta ou
+  encerramento permitido e o tratamento de efeitos já admitidos. A decisão deve
+  preservar o limite de 16 MiB e esclarecer a compatibilidade com JSON-RPC.
+- **Impacto:** o cliente pode continuar aguardando uma requisição que recebeu
+  erro com outro ID. O comportamento foi reproduzido com credenciais falsas e
+  socket local no Toolbx Fedora 44/Bazzite; a asserção de correlação falhou.
+  Não foi criado teto de ID, aumentado o frame nem alterado o protocolo sem ADR.
+  O teste temporário de investigação foi removido; transcript em
+  `.fictor/logs/kernel-large-id-before-transcript.log`.
 
 ## ARQ-026 — Destinos de links dos arquivos de controle do core
 
