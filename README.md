@@ -14,7 +14,7 @@ identifica o esqueleto atual; o gate de release ainda não foi cumprido.
 ## Executar a base atual
 
 O desenvolvimento usa o Toolbx Fedora 44 definido em `dev/Containerfile`, com
-Rust, Cargo, Clippy, rustfmt, GCC, Git, Node 24 LTS, npm e bubblewrap. Nada é
+Rust, Cargo, Clippy, rustfmt, GCC, Git, Node 24 LTS, npm, uv e bubblewrap. Nada é
 instalado na base imutável ou como ferramenta global no `$HOME`. As dependências
 Rust são fixadas em `core/Cargo.lock`. A compilação exige Linux x86-64.
 
@@ -79,15 +79,28 @@ Para verificar um bundle local sem ativá-lo:
 ```
 
 O comando recebe uma cópia em quarentena, valida o manifest e grava a proposta e
-as checagens em SQLite. Bundles `binary`, `none` e Node sem dependências a instalar
-podem chegar a `checked`; os resolvers npm/uv ainda estão pendentes e falham
-explicitamente quando necessários.
+as checagens em SQLite. No Toolbx, dependências Node usam `npm ci --ignore-scripts`
+com `package-lock.json`; Python usa uv com `requirements.lock`, hashes obrigatórios
+e builds desativados. A resolução roda em sandbox com estado descartável e rede
+limitada aos registros exatos de `[installer] registries`. Nenhum host é acrescentado
+a partir de lockfiles ou redirecionamentos; wildcards aguardam decisão arquitetural.
 O smoke de processos usa sandbox, estado descartável, nenhuma rede/modelo e
 honeytokens. Grants absolutos/`~/` não são concedidos ao código em verificação.
 O resultado imprime hashes, diretórios ignorados e checagens, incluindo as permissões
 pedidas e os caminhos omitidos no smoke. Cancelar o chamador não interrompe o worker
 de verificação do core; isso não cobre morte ou reinício do processo.
 Não há promoção ou ativação por esse comando.
+
+Com o core parado, os controles offline editam somente `enabled` no lock:
+
+```sh
+./target/debug/fictor ext disable <id>
+./target/debug/fictor ext enable <id>
+```
+
+Eles preservam versões e dados, exigem exclusividade do instalador e recusam
+qualquer endpoint administrativo existente. O caminho administrativo com servidor
+ativo aguarda M0.7.
 
 Toda tentativa recebe um ID durável antes de abrir a origem. Recusas anteriores
 ao manifest válido ficam como `failed`, com identidade nula e motivo estável;
@@ -125,7 +138,7 @@ A CI também inclui um container Fedora 44 para build e testes que não criam
 sandboxes reais. A versão corresponde à [release estável do COSMIC Atomic](https://fedoraproject.org/atomic-desktops/cosmic/download/)
 consultada em 2026-10-17. O gate de release exige todos os critérios de aceitação
 na máquina Fedora COSMIC Atomic do usuário, com data, versão do SO e commit
-registrados. Build, Clippy e 250 testes passaram no Toolbx Fedora 44 sobre Bazzite;
+registrados. Build, Clippy e 285 testes passaram no Toolbx Fedora 44 sobre Bazzite;
 esse diagnóstico não substitui o gate no COSMIC Atomic nem a execução da CI.
 
 Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md) e

@@ -1,6 +1,6 @@
 # Pendências para o arquiteto
 
-ARQ-020–023 abertas em 2026-10-18 durante a continuação do M0.5.
+ARQ-020–024 abertas em 2026-10-18 durante a continuação do M0.5.
 Resolução do spec não significa implementação concluída.
 
 ## ARQ-020 — Recuperação da promoção entre filesystem, lock e evento
@@ -73,6 +73,25 @@ Resolução do spec não significa implementação concluída.
 - **Impacto:** restart/backoff e bloqueio durável de crash loop aguardam o ADR.
   Monitoramento, auditoria de crash, cauda de stderr e contenção/encerramento da
   árvore continuam funcionando; não é simulada uma reabilitação humana.
+
+## ARQ-024 — Sintaxe e fronteira dos registros de dependências
+
+- **Status: aberta.**
+- **Referência:** `spec/06-lifecycle.md`, etapa 3;
+  `spec/02-core.md`, configuração `[installer] registries`;
+  `spec/04-extensions.md`, sintaxe de `net.allow`.
+- **Dúvida:** os defaults de `registries` são hosts exatos. Não está definido se
+  essa lista aceita também wildcards ou todas as formas de `net.allow`, nem como
+  tratar hosts de artefatos/redirects que um lockfile indique fora dos registros.
+  Herdar regras amplas ou acrescentar destinos automaticamente ampliaria a rede
+  do instalador sem uma decisão explícita.
+- **Necessário:** ADR com gramática, normalização e política para destinos de
+  metadados, artefatos e redirecionamentos, incluindo portas e registros locais de
+  teste. Toda requisição continua passando pelo proxy e sua validação de IPs.
+- **Impacto:** a implementação inicial limita-se a entradas exatas já validadas
+  pelo proxy; wildcards são recusados até o ADR. Não adiciona hosts a partir do
+  lockfile nem de respostas/redirects. Defaults normativos e registros HTTP locais
+  explicitamente configurados continuam dentro desse recorte.
 
 ## ARQ-019 — Recebimento inválido antes da identidade do manifest
 

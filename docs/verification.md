@@ -1,5 +1,72 @@
 # Verificação da implementação
 
+## Continuação do M0.5 no Bazzite — 2026-10-18
+
+Código validado: `d8b8401879add2324409981b44683999ead3ecdc`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Dependências
+Cargo em cache; lint, testes e release usaram `--locked --offline`. As versões das
+ferramentas estão registradas abaixo. Nenhum pacote ou ferramenta global foi
+instalado no host.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **285 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+| Imagem `dev/Containerfile` com uv | Reconstruída; versões verificadas em container temporário sem rede nem montagens. |
+
+Foram acrescentados 35 testes desde o diagnóstico de 250 abaixo. A suíte incluiu
+sandbox real, npm/uv reais contra registros HTTP locais e o binário real da CLI:
+
+- Resolução npm sem scripts ou symlinks `.bin`; hashes adulterados, destinos fora
+  da allowlist e wildcards recusados. uv instala wheel com hash e recusa requisitos
+  sem hash e builds de fontes. O inventário vem dos metadados efetivamente instalados.
+- Pipeline npm → importação do pacote em MCP → `checked`, também pela CLI
+  `ext check`: pacotes e hash final persistidos, origem intacta e sem ativação.
+  Oito testes em `dependencies`; seis cenários de execução requerem o Toolbx real.
+  Neste ambiente esses seis rodaram. O ramo de recusa fora do Toolbx não foi
+  exercitado aqui; o teste de planejamento é independente desse bootstrap.
+- Materialização exige aprovação humana, checks completos, manifest e hash
+  iguais; publica arquivos/diretórios imutáveis. Repetição, alteração da quarentena,
+  symlinks, colisão e saída gravável são cobertos sem alterar o último lock.
+- `tools.list` lê o pin sem executar processos, respeita sessão/escopo,
+  classificações e visibilidade, recusa estado inválido e aplica limite cumulativo
+  de JSON escapado. Notificações `log` autenticadas compartilham redator e rotação;
+  testes incluem TCP 3129 real, segredo multiline/Unicode e falha do sink.
+- `ext enable/disable` pela CLI preserva todos os outros metadados e versões.
+  No-op conserva bytes e inode; lease ocupado, lock inválido, temporário existente,
+  symlink em `run` e qualquer entrada administrativa impedem a operação.
+- Falha de auditoria após spawn e cancelamento durante o handshake mantêm os
+  recursos externos até o reap confirmado do bwrap. A janela é sincronizada pela
+  task de escrita, com processo real; a falha de escrita do PID também é coberta.
+
+uv 0.12.24 foi instalado somente no Toolbx em uso. A imagem reproduzível
+`localhost/fictor-dev:44` foi reconstruída de `dev/Containerfile` e tem ID
+`1271d4c2dee09ae465bf835da93c4fa173174177cf5c57bc7c484ea162389654`.
+Versões verificadas: Rust/Cargo 1.99.0, Node 24.18.0 LTS, npm 11.16.0,
+uv 0.12.24, Python 3.14.8 e bubblewrap 0.12.0. A suíte rodou no Toolbx já em uso;
+a reconstrução da imagem e sua checagem de versões foram verificações separadas.
+
+Todos os testes usaram dados falsos e endpoints locais, sem chaves reais ou rede
+externa. Nenhum workspace TypeScript/`vp` existe nesta base. Logs completos locais:
+`.fictor/logs/m05-continuation-{fmt,clippy,test,release,trail-build,trail-check}.log`,
+`m05-container-build.log` e `m05-container-versions.log`.
+
+CI: `kernel_tools`, `promotion` e `extension_control` entraram na seleção Fedora
+sem namespaces. Planejamento e recusa de execução de dependências fora do Toolbx
+têm filtros explícitos separados. No Ubuntu nativo, casos de Node verificam
+indisponibilidade do bootstrap quando aplicável; a execução real de npm/uv desta
+entrega foi no Toolbx. A CI remota continua sem execução registrada.
+
+**Estes resultados são diagnóstico no Bazzite e não satisfazem o gate no COSMIC Atomic.**
+M0.5 ainda depende das ARQ-020–024 para ativação/recuperação de promoção, overrides,
+limpeza geral de instâncias no boot, crash loop e sintaxe de registros. Integração
+first-party e gerenciador de runtimes continuam nos marcos definidos no roadmap.
+
 ## Implementação do ADR-035 no Bazzite — 2026-10-18
 
 Código validado: `225e3e96a090916abdf0f2c2901e26fca695dbb6`.
@@ -187,8 +254,10 @@ acima; **a execução no COSMIC Atomic e na CI continua pendente**.
 ## Limites e próximos gates
 
 - `serve`, política/aprovações, shell e harness ainda não estão integrados.
-- M0.5 parcial: resolvers, promoção/ativação, hot swap, limpeza de instâncias e
-  backoff de crashes pendentes. Kernel `log` ainda precisa do sink do supervisor.
+- M0.5 parcial: ativação/recuperação de promoção, overrides, limpeza de instâncias e
+  backoff de crashes pendentes, conforme ARQ-020–024. Resolução, materialização e
+  sink de log têm implementação e diagnóstico registrados acima; hot swap segue
+  o corte de fases do roadmap.
 - ARQ-001–018 foram resolvidas arquiteturalmente. Isso não representa conclusão
   das adaptações ou dos critérios de aceitação dos ADRs 025–031.
 - O encerramento do ADR-029 exige confirmar a saída do bwrap antes de liberar

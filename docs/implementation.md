@@ -16,7 +16,7 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Recebimento durável e recuperação implementados; instalador parcial | Manifest, supervisor/smoke, gateway MCP, Kernel Protocol, propostas auditadas com CAS/nonce e lock atômico. ADR-035 aplicado. `ext check` mantém quarentena. Faltam resolvers, promoção/ativação, backoff, sink de log e integração first-party. |
+| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, resolvers npm/uv, smoke, materialização imutável de propostas aprovadas, `tools.list`, logs e controles offline no lock. `ext check` mantém quarentena. Ativação, aplicação de overrides, limpeza de instâncias no boot e backoff aguardam decisões ARQ-020–024; integração first-party pendente. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
@@ -129,16 +129,68 @@ reinício do serviço são ações do usuário, fora do sandbox.
   chamador não cancela o worker do core. Falhas antes da identidade e recuperação
   após morte do processo seguem o ADR-035: tentativa durável antes da origem,
   identidade vinculada após validar, falhas estáveis e limpeza após o commit.
-- Kernel `log` aguarda ligação ao sink do supervisor. Tools, hooks, UI, timers e
+- Kernel `log` usa o sink do supervisor. `tools.list` lê definições fixadas no lock,
+  respeita a sessão e filtra hooks/tools ocultas. `tools.call`, hooks, UI, timers e
   aprovação aguardam seus marcos; nenhuma rota incompleta simula sucesso.
+
+## Continuação do M0.5 — 2026-10-18
+
+- O resolver usa uma home descartável com banco, configuração, workspace e proxy
+  próprios. Um bootstrap fixo do core roda pelo supervisor normal; a candidata é
+  copiada para `${ext_data}` gravável. Nenhuma quarentena, credencial ou dado real
+  é montado no processo de instalação. O proxy permite apenas registros exatos
+  configurados; wildcards são recusados até o ADR da ARQ-024.
+- npm roda `ci --ignore-scripts --bin-links=false`, sem audit/fund, com cache em
+  `/tmp` e retries de fetch desativados. O Node restringe filesystem e subprocessos.
+  uv exige hashes e recusa builds, configuração externa e download de Python.
+  `requirements.lock` é obrigatório para dependências Python; não há export
+  automático de `uv.lock`. Node/npm, uv e Python fixos em `/usr` são bootstrap de
+  desenvolvimento no Toolbx, até o gerenciador de runtimes de M0.9.
+- O orçamento de 600 s cobre resolução e inspeção final. Só as árvores
+  `node_modules`/`.pydeps` inspecionadas voltam à quarentena; manifest, código e
+  lockfiles originais devem conservar bytes e modos. Hash final e inventário real
+  de pacotes são persistidos com os checks. Sem resolver configurado, a API
+  interna recusa dependências; a CLI `ext check` configura o resolver explicitamente.
+  O prazo envolve também inicialização e handshake de lançamento. Jobs bloqueantes
+  e a task de setup mantêm a posse dos temporários e do lease mesmo após timeout.
+  Saída livre de npm/uv é descartada para não persistir credenciais embutidas em
+  URLs/configurações de pacotes; os checks usam motivos estáticos do core.
+- A materialização aceita apenas propostas `approved` por humano, com checks
+  completos. Copia, verifica hash e manifest e congela arquivos 0444/0555 e
+  diretórios 0555. Linux exige escrita na raiz para mover entre pais; por isso a
+  cópia já verificada passa por staging privado no pai do store, congela a raiz
+  e publica a chave final por rename no mesmo pai com `RENAME_NOREPLACE`.
+  Colisões só são reutilizadas se hash completo, manifest e modos coincidirem.
+  Essa API preserva lock, proposta, eventos, processos e quarentena original.
+  Falha após entrar no store retém os bytes; recuperação/ativação aguarda ARQ-020.
+- O registro lê manifest imutável e catálogo da versão ativa habilitada. Usa
+  classificação nominal, senão `default`, senão restritiva; annotations MCP não
+  concedem classificação. A resposta é contada como JSON UTF-8 escapado durante
+  a acumulação, com teto do Kernel Protocol de 16 MiB. Estado inválido e overrides
+  não vazios falham explicitamente (ARQ-021), sem catálogo parcial.
+- Notificações `log` só são aceitas após autenticação e não têm resposta. Nível,
+  mensagem e objeto de campos são validados. O destino usa identidade vinculada
+  pelo supervisor, redator atualizado a cada entrega e rotação de 10 MiB no mesmo
+  arquivo do stderr. Logs estruturados não entram na cauda de stderr dos crashes.
+- O supervisor reserva o arquivo de PID antes do spawn e entrega falhas posteriores
+  ao worker dono do processo. A resposta de erro de lançamento aguarda o reap e a
+  limpeza; cancelamento durante a auditoria não libera os recursos. Um owner opaco
+  permite que o resolver retenha home e lease sem alterar grants ou entradas do
+  processo. Falha de confirmação conserva recursos conforme ADR-029.
+- `ext enable/disable` com o core parado altera somente `enabled`. O lease cobre
+  leitura e escrita atômica; qualquer entrada `admin.sock` recusa a operação sem
+  removê-la. No-op preserva bytes e inode. O servidor futuro deve compartilhar a
+  admissão e implementar o caminho administrativo. Não há reset de crash loop
+  implícito nesses comandos (ARQ-023).
 
 ## Próxima sequência no Fedora
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;
    os diagnósticos no Bazzite constam em [verification.md](verification.md).
 2. Completar M0.5, incluindo aplicação/testes dos ADRs 025–029 e dos requisitos Atomic;
-   resolvers, promoção, lock, ativação, sink de log e backoff. Recebimentos já têm
-   recuperação; limpeza de diretórios de instância no boot continua pendente.
+   ativação e recuperação da promoção, aplicação dos overrides, limpeza de
+   instâncias e backoff dependem das decisões ARQ-020–024. Recebimento, resolução,
+   materialização, listagem e logs já têm implementações e testes.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
 4. Seguir M0.6–M0.10 e os **37 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
@@ -147,6 +199,10 @@ ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural n
 implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
 2026-10-18, com recebimento e recuperação implementados em M0.5; consulte
 [architect-pending.md](architect-pending.md).
+
+ARQ-020–024 registram lacunas de segurança/persistência encontradas nesta
+continuação. As partes afetadas aguardam ADR; `spec/` permanece sob autoria do
+arquiteto.
 
 ## Recebimento durável — ADR-035
 
@@ -185,7 +241,8 @@ implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
 - `dev/Containerfile` parte de `registry.fedoraproject.org/fedora-toolbox:44`.
   Usa os pacotes Fedora `nodejs24-bin`/`nodejs24-npm-bin`, pois os nomes genéricos
   selecionam Node 22 nessa imagem. Rust, GCC, Git, bubblewrap e ripgrep ficam no
-  container. Caches Cargo/npm ficam em `.fictor/`; nenhum pacote foi instalado no host.
+  container. uv também faz parte da imagem; a base fornece Python 3. Caches
+  Cargo/npm ficam em `.fictor/`; nenhum pacote foi instalado no host.
 - Configuração segue fontes tipadas `nodejs`/`github-release`. Deno e configurações
   antigas de toolchains foram removidos (ADRs 033/034). Até M0.9, runtimes de
   desenvolvimento vêm de caminhos fixos em `/usr/bin`, somente dentro do Toolbx;
