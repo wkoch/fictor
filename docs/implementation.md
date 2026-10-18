@@ -265,6 +265,34 @@ contradição e pede esclarecer intenção no lock versus saúde de processos e 
 caminho administrativo, se necessário. Nenhum comando offline ou protocolo novo
 foi presumido.
 
+## Cancelamento e arquivos de controle — 2026-10-18
+
+- O handshake MCP tem um guard local armado antes de retirar os pipes da
+  instância. Cancelar o future, mesmo conservando `ManagedInstance`, solicita
+  encerramento à task dona. O guard só é desarmado após publicar a conexão e
+  seu pin. Não há segunda task de cleanup, tentativa automática de reconexão ou
+  liberação de recursos antes do reap. O encerramento é voluntário e gera
+  `ext.stopped`, sem inventar mudança de catálogo ou crash.
+- Uma chamada MCP com cancelamento já ativo, ou sem o dono do canal de
+  cancelamento, retorna `Cancelled` antes de enviar `tools/call`. O servidor não
+  recebe uma operação seguida de uma tentativa tardia de desfazê-la. Chamadas
+  efetivamente enviadas continuam recebendo `notifications/cancelled` com o ID
+  correspondente, conforme a [referência MCP de cancelamento](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation),
+  consultado em 2026-10-18; uma notificação não referencia chamada nunca emitida.
+- Leituras de configuração disparadas pelo Kernel exigem arquivo regular antes
+  de abrir, usam `O_NONBLOCK|O_CLOEXEC` e conferem novamente o descritor. Isso
+  impede que FIFO, dispositivo ou diretório prendam um worker bloqueante, inclusive
+  quando acessados por link. Links para arquivos regulares continuam funcionando;
+  limites de bytes, UTF-8, ausência opcional de instruções e filtro da própria
+  tabela de extensão permanecem. O parser TOML é compartilhado, sem cópia de sua
+  regra no Kernel.
+
+A ARQ-026 registra separadamente a proteção dos destinos de links dos arquivos
+globais. Exigir arquivo regular não garante autoria humana se o destino for
+gravável por extensão. A política para esses destinos e sua interação com grants
+e proveniência aguardam ADR; não foi criada exceção a I11 nem alegada proteção
+de origem que a checagem de tipo não oferece.
+
 ## Próxima sequência no Fedora
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;

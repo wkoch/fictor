@@ -1,5 +1,60 @@
 # Verificação da implementação
 
+## Cancelamento e arquivos de controle no Bazzite — 2026-10-18
+
+Código validado: `447e42bf6b3741f340e15c5e95398107477d79c9`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Mesma imagem
+e versões das ferramentas já registradas abaixo. Cargo usou `--locked --offline`
+e caches do workspace. Nada foi instalado no host ou globalmente no `$HOME`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **321 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+Cinco testes novos cobrem três falhas reproduzidas antes das correções:
+
+- Cancelar o future de conexão MCP, mantendo `ManagedInstance` vivo, deixava o
+  processo com pipes consumidos e canais ativos. Os dois casos (descoberta e
+  pin explícito) falharam esperando reap antes da correção. Agora verificam saída
+  do namespace, remoção de PID/socket, revogação do proxy, retenção do owner até
+  `wait` e exatamente um `ext.stopped`, sem crash ou mudança de catálogo falsa.
+  O alvo `supervisor` passou com 27 testes reais.
+- Uma chamada já cancelada ainda enviava `tools/call`. A regressão observou essa
+  requisição antes da barreira ordenada `resources/list`. Agora não há chamada
+  nem notificação de cancelamento para uma operação nunca emitida, inclusive
+  quando o dono do canal foi descartado. O mesmo teste confirma cancelamento
+  de uma chamada em andamento com o ID correto. Os quatro unitários do gateway
+  passaram, incluindo o timeout que continua enviando cancelamento MCP.
+- FIFO em leitura de configuração podia prender o worker e o encerramento do
+  runtime. A reprodução isolada precisou terminar o filho após cinco segundos,
+  sem pendurar o Cargo. Agora pipes diretos/indiretos, dispositivos e diretórios
+  são recusados; links para arquivos regulares continuam recarregando instruções
+  e somente a tabela da própria extensão. `kernel_read_limits` passou com seis
+  testes, `kernel_catalog` com cinco e `bootstrap` com 13.
+
+A revisão adicional de smoke e resolução não identificou outro defeito concreto:
+foram inspecionados grants omitidos, estado/credenciais descartáveis, prazos,
+retenção de owner/lease e criação dos destinos. Não foram adicionados testes
+redundantes nem código nessa frente. A nova ARQ-026 separa da correção de I/O a
+política pendente para links de arquivos globais apontando a destinos graváveis
+por extensões; tipo regular não estabelece autoria humana.
+
+Logs locais: `.fictor/logs/m05-io-cancellation-{fmt,clippy,test,release,trail-build,trail-check}.log`
+e `m05-io-cancellation-code-head.log`; regressão do gateway em
+`m05-cancel-{before,after,clippy}.log`. A suíte usou dados falsos e endpoints locais,
+sem chaves reais nem rede externa, incluindo sandbox real e npm/uv no Toolbx.
+Não há workspace TypeScript/`vp` nesta base. A CI remota não foi executada.
+
+**Este diagnóstico no Bazzite não satisfaz o gate de release no COSMIC Atomic.**
+M0.5 continua parcial nas partes dependentes das ARQ-020–026; não houve ativação,
+mudança de formatos persistidos ou implementação de contratos bloqueados.
+
 ## Limites de leitura e integridade do M0.5 no Bazzite — 2026-10-18
 
 Código validado: `0ec1e418d2d5883cc4138219121f161dc105d8b4`.
