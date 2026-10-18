@@ -56,6 +56,9 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | [schemas/0001_init.sql](schemas/0001_init.sql) | Migração inicial do SQLite. |
 | [schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql) | Migração 0002: orçamento do model proxy e flags de workspace e de extensão. |
 | [schemas/0003_proposal_receipts.sql](schemas/0003_proposal_receipts.sql) | Migração 0003: propostas duráveis antes da identidade do manifest. |
+| [schemas/overrides.schema.json](schemas/overrides.schema.json) | Patch humano de permissões e classificação, sem defaults implícitos. |
+| [schemas/0004_promotion_journal.sql](schemas/0004_promotion_journal.sql) | Migração 0004: base da revisão, overrides aprovados e journal de promoção. |
+| [schemas/0005_crash_recovery.sql](schemas/0005_crash_recovery.sql) | Migração 0005: contagem, espera e bloqueio de crashes por versão/sessão. |
 
 Ordem de leitura para implementar: README → 01 → 10 → o arquivo da fase/componente em andamento.
 

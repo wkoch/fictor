@@ -60,9 +60,10 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `ext.list` | — | Extensões e estado. |
 | `proposal.list` | `{state?}` | Propostas. |
 | `proposal.get` | `{proposal_id}` | Detalhe: checagens, diff, pacotes, relatório, `nonce`. |
-| `proposal.decide` | `{proposal_id, nonce, decision: "approve" \| "reject", overrides?}` | Decide proposta. |
+| `proposal.decide` | `{proposal_id, nonce, decision: "approve" \| "reject", overrides?}` | Decide proposta; `overrides` segue [o schema](schemas/overrides.schema.json) e o [contrato de aplicação](06-lifecycle.md#overrides-humanos). |
 | `ext.rollback` | `{ext_id, to?}` | Rollback. |
 | `ext.set_enabled` | `{ext_id, enabled}` | Liga ou desliga. |
+| `ext.reset_crashes` | `{ext_id, key?, session_id?}` | Reset humano auditado da recuperação; seleção e semântica de [02-core.md](02-core.md#reabilitação-humana). Não habilita nem executa a extensão. |
 | `ext.reset_state` | `{ext_id}` | Limpa kv, `${ext_data}` global e marca d'água (Fase 1). Exige confirmação no modal. |
 | `update.check` | — | Verifica atualizações de runtimes, extensões e core. Servidor responde `update.candidates`. |
 | `update.apply` | `{items: string[] \| "all_passing", nonce}` | Aplica os itens escolhidos, ou todos os que passaram nas checagens sem ampliar permissões. |
@@ -146,9 +147,12 @@ Página `#/extensions`, parte da UI confiável.
   - árvore de arquivos e diff contra a versão ativa (ou conteúdo completo, se nova);
   - pacotes, com os novos destacados;
   - relatório do auditor (Fase 3) e gate de evals (Fase 2);
-  - editor de overrides: restringir permissões e ajustar classificação de tools;
+  - editor de overrides: restringir permissões e ajustar classificação de tools pelo [contrato normativo](06-lifecycle.md#overrides-humanos), mostrando o resultado efetivo;
   - Aprovar / Rejeitar.
+- **Recuperação**: listar esperas/bloqueios por chave e sessão, separadamente de `enabled`. A ação humana `ext.reset_crashes` mostra a seleção afetada e limpa somente a recuperação; não reinicia chamadas nem altera o estado da extensão.
 - **Atualizações**: página `#/updates`, parte da UI confiável. Mostra runtimes (versão atual e candidata, checksum, resultado do smoke das extensões afetadas), extensões (inclusive propostas com `update_of`) e o aviso de release nova do core, que só se instala pela CLI. Tem o botão "Atualizar tudo", a lista de lotes anteriores com rollback, e um badge na barra quando a checagem automática encontra novidades.
+
+O editor distingue valor herdado de valor explícito, inclusive `false`; objetos estruturais vazios não apagam campos irmãos. Listas presentes substituem as anteriores, `[]` retira suas entradas, e `env: {}` retira as variáveis declaradas. `null` é inválido. Mostra o efeito do patch comum `default` e do nominal, valida inclusive nomes com patch `{}` e informa as bases implícitas do sandbox que continuam disponíveis. Ocultar do catálogo não é negar todas as chamadas por nome. A decisão congela o objeto exato com a aprovação; alterações posteriores de overrides exigem nova versão do manifest e nova revisão, preservando a identidade de versões já aprovadas. A UI não oferece ajustes que violem a prova de restrição nem apresenta erro como aprovação parcial.
 
 ## Host de MCP Apps
 
@@ -158,7 +162,7 @@ O shell implementa o lado host do padrão MCP Apps. Registrar no código a vers�
 - **Canal**: postMessage com JSON-RPC. Mensagens são aceitas só se `event.source === iframe.contentWindow`. Como a origem do iframe é opaca, respostas usam `targetOrigin "*"` e nunca carregam dados de outra extensão ou sessão.
 - **Requisições app → host suportadas**:
   - handshake de inicialização do MCP Apps;
-  - `tools/call`: só tools da própria extensão com `ui_callable: true`, via `app.request` → `tools.call` do core com origem `ui` (mesma política);
+  - `tools/call`: só tools da própria extensão com `ui_callable: true` efetivo, via `app.request` → `tools.call` do core com origem `ui` (mesma política);
   - `resources/read`: só resources da própria extensão;
   - abrir link: o shell mostra a URL completa e pede confirmação antes de `window.open(url, "_blank", "noopener")`;
   - enviar mensagem ao chat: vira `ui.event` para o harness da sessão, com actor `ext:<id>@ui`, exibido como "[app <id>]".

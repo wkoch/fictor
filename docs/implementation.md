@@ -102,7 +102,7 @@ reinício do serviço são ações do usuário, fora do sandbox.
 - Supervisor revalida manifest/ambiente no spawn e registra valores na máscara antes
   de iniciar. Runtime nativo dentro do store só pode ser o executável do próprio bundle.
   Logs rotacionam em 10 MiB; crash tem cauda em blob. Encerramento revoga tokens e deve
-  confirmar saída do bwrap antes de liberar recursos (ADR-029); sem confirmação em
+  confirmar término do launcher e PID 1 antes de liberar recursos (ADRs 029/038); sem confirmação em
   10 s, reter recursos e reportar `cleanup_failed`. O algoritmo de encerramento ainda
   precisa ser alinhado integralmente ao ADR-029; hoje usa PGID e prazo de retorno.
   Validação adversarial pendente.
@@ -132,10 +132,18 @@ reinício do serviço são ações do usuário, fora do sandbox.
 2. Completar M0.5, incluindo aplicação/testes dos ADRs 025–029 e dos requisitos Atomic;
    resolvers, promoção, lock, ativação, recuperação e backoff.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
-4. Seguir M0.6–M0.10 e os **37 critérios da Fase 0**, incluindo autossuficiência,
+4. Seguir M0.6–M0.10 e os **46 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
 
 ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural não implica
 implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
 2026-10-18, com implementação pendente em M0.5; consulte
 [architect-pending.md](architect-pending.md).
+
+## Contratos arquiteturais liberados em 2026-10-18
+
+ARQ-020–024 resolvidas pelos ADRs 036–040: promoção recuperável, overrides
+humanos, posse/recuperação de instâncias, crash loops e fronteira dos registros de dependências. Migrações normativas
+0004/0005, schema de overrides e critérios 38–46 estão no spec. Este registro
+abrange apenas arquitetura na branch principal; não incorpora nem certifica o
+código em andamento na branch do implementador.

@@ -88,8 +88,8 @@ São testes presentes no código; **sua execução em Linux ainda precisa ser re
   backoff de crashes pendentes. Kernel `log` ainda precisa do sink do supervisor.
 - ARQ-001–018 foram resolvidas arquiteturalmente. Isso não representa conclusão
   das adaptações ou dos critérios de aceitação dos ADRs 025–031.
-- O encerramento do ADR-029 exige confirmar a saída do bwrap antes de liberar
-  recursos; fork duplo, `setsid()` e morte do core com SIGKILL exigem prova no Linux.
+- O encerramento dos ADRs 029/038 exige confirmar término do launcher e PID 1
+  antes de liberar recursos; fork duplo, `setsid()` e morte do core com SIGKILL exigem prova no Linux.
 - A v0.1 também exige toolchains no sandbox, compactação, guarda de migração com
   backup, login, rollback e roteiro de desenvolvimento de dentro do Fictor.
 - Esta entrega não constitui aprovação de release v0.1 nem v1.0.
@@ -115,3 +115,30 @@ do gate no Fedora COSMIC Atomic nem execução de CI.
   pelo ADR-035; código do recebimento/recuperação e testes dos critérios 35–37
   continuam pendentes para o implementador. Nenhuma suíte Rust ou teste de
   aceitação foi executado nesta revisão de arquitetura.
+
+## Verificação arquitetural dos ADRs 036–040 — 2026-10-18
+
+Base: `4d713979adce3f405a1798be565e6673f0ddc37d`, worktree isolado da branch
+principal. Execução no Toolbx `fictor-dev`, Fedora Linux 44, sobre Bazzite
+`44.20261012.0` (Kinoite). Diagnóstico do spec; não é gate COSMIC nem CI.
+
+- Migrações 0001–0005 executadas em SQLite 3.51.2, bancos descartáveis em memória:
+  preservados os sete estados de propostas, nonces e eventos; defaults novos
+  corretos; 12 mutações inválidas recusadas, incluindo intenção pendente duplicada,
+  foreign key inválida, snapshots inconsistentes, recuperação duplicada por
+  sessão/global e UPDATE/DELETE de eventos. FTS, integridade e foreign keys passaram.
+- Rollback de transação conservou proposta/journal; falha injetada na migração
+  0004 desfez também ALTER TABLE e criação de tabela. PRAGMA FULL confirmado.
+  Isso verifica o schema, não simula durabilidade física em perda de energia.
+- Schema de overrides validado com a biblioteca Rust `jsonschema` já compilada
+  no Toolbx: 27 casos, incluindo patches vazios/parciais, false, null, caminhos,
+  chaves extras, env reservado, duplicatas, tipos e limites. A prova semântica
+  de subconjunto e a integração dos consumidores continuam a cargo dos testes
+  do implementador; validação JSON Schema não as substitui.
+- Revisão cruzada exigiu FULL no writer e impediu sobrescrever uma chave aprovada
+  com overrides diferentes. Nenhum arquivo de código ou migração antiga mudou.
+- Conferidos 217 links/âncoras locais, sequência dos 46 critérios e `git diff --check`.
+  Revisão independente também fixou a chave do bundle no journal de instância
+  e a mensagem WebSocket do reset humano; ambas foram incorporadas.
+- Critérios 38–46 descrevem os testes ainda necessários no produto. Nenhuma suíte
+  Rust do core ou aceitação ponta a ponta foi executada nesta revisão arquitetural.

@@ -106,6 +106,81 @@ Roda num sandbox com escrita na quarentena e rede só para os registros em `[ins
 
 Scripts de instalação de pacotes nunca rodam. Ao final, percorrer de novo o bundle com os limites de "bundle após dependências" e gerar a lista de pacotes resolvidos `(ecossistema, nome, versão)`.
 
+#### Registros de dependências
+
+`[installer].registries` define todos os destinos de rede permitidos ao processo
+que resolve dependências. Os defaults continuam:
+`["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]`.
+A lista é configuração confiável do humano. Ela autoriza destinos; não escolhe
+automaticamente o index/registry usado pelo gerenciador de pacotes.
+
+| Forma | Exemplo | Autorização |
+|---|---|---|
+| Nome DNS público sem porta | registry.npmjs.org | somente CONNECT para esse nome na porta 443, com todos os IPs resolvidos públicos |
+| Nome DNS e porta | registry.example:8443 | esse nome nessa porta, sujeito às regras normais de IPs do proxy |
+| IPv4 e porta | 127.0.0.1:18080 | somente esse literal nessa porta |
+| IPv6 entre colchetes e porta | [::1]:18080 | somente esse literal nessa porta |
+| localhost e porta | localhost:18080 | somente esse nome nessa porta; não autoriza automaticamente os literais nem seus subdomínios |
+
+- Nome DNS usa a gramática de domínio exato de net.allow; não há wildcard.
+  Normalizar ASCII para minúsculas e retirar o ponto final antes de validar e
+  comparar. Não inferir sufixos de domínio, apelidos ou equivalência com IP.
+- Porta decimal entre 1 e 65535, normalizada sem zeros à esquerda; ausência de
+  porta **permanece ausência**. Não converter `host` em `host:443`, pois isso
+  ampliaria a permissão para HTTP simples e endereços não públicos.
+- IPv6 segue a normalização e proibições de net.allow: colchetes e porta
+  obrigatórios; negar zona de interface, IPv4 mapeado e representação NAT64
+  proibida. Usar o IPv4 embutido quando a regra de net.allow assim exigir.
+- `localhost` e nomes em `.localhost`, assim como literais IP, exigem porta
+  explícita. Nome que só na resolução se revele não público continua negado sem
+  porta explícita; a resolução pertence ao proxy.
+- Rejeitar `*`, `*.example`, curingas parciais, CIDR, URLs com esquema, caminhos,
+  credenciais, query, fragmento, whitespace e forma ambígua. Rejeitar
+  `models.fictor.internal`: é uma rota interna reservada, não um registro.
+- Duplicatas após normalização não ampliam a lista e podem ser eliminadas. Lista
+  vazia é válida e não concede rede. Entrada inválida invalida a lista inteira;
+  não descartá-la silenciosamente nem herdar os defaults.
+- Validar a configuração ao carregá-la e conferir a lista efetiva antes de
+  iniciar o processo de dependências. Nunca produzir uma allowlist parcial.
+
+Valem integralmente a autenticação por instância, a resolução pelo core, a
+validação dos IPs resolvidos e NAT64 e as regras de CONNECT/HTTP simples do
+egress proxy. HTTP simples só é possível com host e porta explícitos; nenhuma
+exceção de DNS ou loopback é implícita. Isso admite registros falsos HTTP locais
+para testes, por exemplo `127.0.0.1:18080` com URL
+`http://127.0.0.1:18080/`. A forma `localhost:18080` também é permitida
+explicitamente; a restrição mais estreita de `providers.base_url` (ADR-022)
+não é transplantada para esta allowlist.
+
+Metadados de índices, tarballs/wheels, URLs no lockfile e redirecionamentos usam
+a mesma fronteira. Cada nova conexão, inclusive a provocada por redirect, precisa
+de autorização do proxy para seu destino exato. Host permitido não autoriza outro
+host CDN; porta permitida não autoriza outra porta. Um redirect relativo ou para
+destino já autorizado não exige ampliação. Um destino fora da lista é negado e
+a tentativa de instalação falha quando depende dele; o core não segue fora do
+proxy, tenta espelhos adicionais liberados automaticamente nem amplia regras
+para tornar a instalação bem-sucedida.
+
+A validação prévia de URLs conhecidas no lockfile pode antecipar o erro, mas não
+substitui o proxy: metadados e redirects podem revelar outros destinos depois.
+O proxy da Fase 0 continua sem MITM e não precisa interpretar Location dentro
+do túnel TLS; a autorização é aplicada às conexões geradas pelo cliente.
+
+O processo de dependências tem política própria derivada somente desta lista,
+sem união com `permissions.net.allow` da candidata, providers ou proxies do
+ambiente do host. Não recebe chaves de providers, credenciais do usuário ou
+configuração global de npm/uv; `NO_PROXY` permanece vazio. Configuração do pacote
+não pode remover o proxy, liberar rede direta ou ampliar a lista. Nenhum erro
+autoriza desligar TLS, sandbox ou verificação de hash do lockfile.
+
+O diagnóstico identifica o host/porta negados sem incluir URL completa,
+userinfo, query, tokens ou headers. Uma sugestão de configuração é apenas texto:
+o humano altera a lista e reenvia a instalação como tentativa nova. Não há retry com
+permissões ampliadas dentro da mesma proposta. Os checks/eventos existentes
+registram falha da etapa e `net.denied` conforme o proxy; este ADR não cria uma
+nova tabela ou um novo tipo de evento.
+
+
 ### Limites
 
 Constantes do core, não configuráveis. Mudar exige ADR.
@@ -232,7 +307,7 @@ Promoção automática (`auto:dev-profile`) só se **todas** as condições vale
 - nenhuma dependência nova;
 - todas as checagens bloqueantes passaram.
 
-Qualquer outro caso exige aprovação humana na tela de revisão ([08-shell.md](08-shell.md#gerenciador-de-extensões)) ou `fictor proposal approve`. Na revisão o humano PODE restringir permissões e ajustar a classificação de tools; os ajustes ficam em `overrides` no lock e o bundle não muda.
+Qualquer outro caso exige aprovação humana na tela de revisão ([08-shell.md](08-shell.md#gerenciador-de-extensões)) ou `fictor proposal approve`. Na revisão o humano PODE restringir permissões e ajustar a classificação de tools; os ajustes são validados e persistidos com a decisão, depois copiados para `overrides` no lock; o bundle não muda. O contrato completo está em [Overrides humanos](#overrides-humanos).
 
 Origens `git`, `mcp`, `skill` e `claude-plugin` nunca são promovidas automaticamente.
 
@@ -240,14 +315,47 @@ Origem `builtin`: promovida automaticamente quando o hash do bundle confere com 
 
 ### 9. Promoção
 
-1. Copiar a quarentena para `store/<id>/<chave>/` e remover permissão de escrita (arquivos 0444/0555, diretórios 0555).
-2. Atualizar o lock: gravar `lock.json.tmp`, fsync, rename.
-3. Executar o hot swap ([02-core.md](02-core.md#troca-de-versão-hot-swap)).
-4. Gravar `ext.promoted` e remover a quarentena.
+A promoção segue o [ADR-036](11-decisions.md#adr-036--promoção-recuperável-resolve-arq-020). Publicar bytes no store não ativa uma extensão. O compromisso lógico é a transação que grava `promoted`, `ext.promoted` e o journal `committed`, depois de tornar o lock durável; nenhum processo novo ou chamada nova usa a candidata antes desse compromisso.
+
+#### Revisão e comparação da base
+
+Ao passar a `checked`, o core fixa `review_base_hash = sha256(JCS(base))`, usando a serialização canônica já usada em `tools_hash`. `base` é `null` quando a extensão não existe no lock, ou `{active, enabled, version}`: `version` contém o registro completo da versão ativa no lock, inclusive overrides, tools e privilégios. Fixar `update_of` na mesma leitura: chave ativa ou `null` para instalação nova. Revalidar ambos na aprovação e antes de promover, sob a exclusão do instalador.
+
+Base diferente, ou `review_base_hash` ausente em proposta legada `checked`/`approved`: recusar com `promotion:stale_base`, preservar estado e exigir proposta/revisão nova. Não substituir `update_of`, renovar aprovação, copiar overrides da versão ativa nem habilitar uma extensão desativada silenciosamente. A promoção preserva `enabled` numa atualização; a primeira instalação aprovada usa `enabled: true`.
+
+Overrides humanos são persistidos na proposta junto da aprovação e depois ficam imutáveis ([Overrides humanos](#overrides-humanos)). Aprovação automática usa overrides vazios. A publicação usa o hash, manifest, catálogo, overrides e decisão fixados na proposta; nunca o conteúdo da origem original nem novos parâmetros de uma tentativa repetida.
+
+Na Fase 0, uma promoção não substitui o registro de uma chave já aprovada em `versions`. Se a chave candidata já é ativa, recusar com `promotion:already_active`; isso não afeta a resposta idempotente de uma operação já `committed`. Para reativar uma chave inativa existente, hash integral, manifest, catálogo, overrides, privilégios e demais metadados executáveis devem coincidir com o registro anterior: conservam-se `source` e `approved` desse registro e a nova decisão fica na proposta/evento. Divergência é `promotion:key_conflict`, sem alterar o lock. Alterar overrides de uma chave já registrada exige incrementar a versão do manifest e submeter nova proposta; rollback nunca reinterpreta uma chave antiga. Os snapshots anterior/próximo de uma intenção válida são sempre distintos.
+
+#### Journal e sequência
+
+A migração [0004_promotion_journal.sql](schemas/0004_promotion_journal.sql) acrescenta `review_base_hash`, `overrides` e `promotion_intents`. Cada tentativa de promoção tem `operation_id` próprio. O writer usa `synchronous=FULL`, confirmado antes de abrir transações, conforme [02-core.md](02-core.md#sqlite): `NORMAL` não garante o journal depois de perda de energia. O journal guarda o texto UTF-8 exato do lock anterior (`null` se ausente), do próximo lock, seus hashes SHA-256 dos bytes e a proposta. Os snapshots são dados privados do core; não vão para eventos públicos. Não apagar nem reescrever o histórico de eventos ao reconciliar.
+
+Todas as alterações de lock (incluindo runtime, rollback, enable/disable e comandos offline) usam a mesma seção crítica do instalador. Antes de alterar o lock, reconciliar qualquer intenção `prepared`; não admitir outra enquanto ela existir. A posse de `FICTOR_HOME` segue o ADR-038. A seção crítica cobre a leitura da base até o compromisso ou a interrupção segura.
+
+1. Revalidar proposta `approved`, identidade, decisão e base. Montar o próximo lock preservando as demais entradas. Gravar journal `prepared` e `ext.promotion_prepared` na mesma transação do writer, antes da materialização desta tentativa. Estado da proposta continua `approved`.
+2. Copiar da quarentena para staging privado, conferir hash integral, manifest e checagens aprovadas. Só bytes já verificados podem entrar no store. Publicar por rename sem sobrescrita em `store/<id>/<chave>/`, com arquivos 0444/0555, diretórios 0555 e fsync dos arquivos/diretórios e pais afetados. Destino existente só pode ser reutilizado se hash integral, manifest e imutabilidade forem idênticos; colisão do prefixo de 12 hex não autoriza reutilização.
+3. Suspender novas admissões/spawns da extensão. Gravar os bytes exatos de `after_lock` em arquivo novo privado, fsync, rename para `lock.json` e fsync do pai. O temporário é `lock.json.tmp`; só o dono da seção crítica o manipula. Chamadas já admitidas na versão antiga podem terminar; o novo lock não autoriza despacho enquanto o journal estiver `prepared`.
+4. Numa única transação, exigir journal `prepared` e proposta `approved`, mudar a proposta para `promoted`, gravar um único `ext.promoted` com `operation_id` e marcar o journal `committed`. Falha do commit mantém a extensão sem novas admissões e o journal recuperável; não alegar sucesso nem compensar o lock automaticamente.
+5. Atualizar o registro em memória, executar hot swap e notificações, e só então liberar as admissões. Limpar a quarentena e os temporários conhecidos depois do compromisso. Falha de limpeza não desfaz promoção. Reinício restaura o catálogo pelo lock reconciliado; notificações são invalidadores e podem se repetir, mas o evento durável não.
+
+#### Reconciliação da promoção
+
+No boot, antes de despachar extensões ou admitir mutações do lock, e depois de recuperar os registros de instância conforme ADR-038, preservando recursos cuja limpeza não foi autorizada, ler cada intenção `prepared`:
+
+| Lock encontrado | Ação |
+|---|---|
+| Bytes exatamente iguais a `before_lock` (inclusive ausência) | Não houve compromisso. Marcar intenção `aborted` e gravar `ext.promotion_aborted` atomicamente, com `promotion:interrupted`; manter a proposta `approved`. Uma repetição explícita cria outra intenção e revalida a base. |
+| Bytes exatamente iguais a `after_lock`, com bundle/catálogo/overrides íntegros | Sincronizar lock/pai e concluir a transação do passo 4 uma única vez. Não reexecutar smoke, dependências ou chamadas da extensão para recuperar. |
+| Diferente de ambos, snapshots inválidos ou integridade não comprovada | Reter journal e recursos, recusar despachos/mutações com `promotion:recovery_conflict` e diagnosticar para intervenção humana. Nunca sobrescrever um lock desconhecido nem escolher uma versão por data. |
+
+Repetir uma operação `committed` devolve o resultado já registrado, sem outra transição/evento; repetir uma `aborted` não a reabre. Uma tentativa com lock ainda anterior pode abortar por erro objetivo antes da publicação do lock, com `promotion:integrity` ou `promotion:io`. Se o resultado de rename/fsync for incerto, reler e aplicar a mesma tabela; não assumir que o rename falhou.
+
+Staging novo usa nomes derivados da intenção: `quarantine/.promotion-<operation_id>/` e, se necessário para publicação no mesmo pai, `store/<id>/.promotion-<operation_id>/`. Limpar apenas temporários atribuídos à tentativa, sem seguir links ou atravessar mounts. Temporário de quarentena órfão reconhecido pode ser removido sob exclusão; entradas de staging no store e cópias finais sem referência ficam inativas, retidas e diagnosticadas até coleta/revisão, sem inventar aprovação, alterar modos ou apagar uma versão publicada. Isso também cobre materializações legadas sem journal. `lock.json.tmp` nunca é fonte de verdade: reconciliar pelo lock final e pelo journal antes de descartá-lo.
 
 ## Lock
 
-`extensions/lock.json` é a fonte de verdade das extensões ativas. Só o instalador escreve nele.
+`extensions/lock.json` é a fonte de verdade das extensões ativas depois de reconciliar o journal de promoção. Enquanto houver intenção `prepared`, o lock sozinho não autoriza ativação. Só o instalador escreve nele.
 
 ```json
 {
@@ -296,6 +404,136 @@ Origem `builtin`: promovida automaticamente quando o hash do bundle confere com 
 - `source` para origens remotas inclui `url`, `ref` pedido e `sha` resolvido (ou `package` e `version`).
 - `privileges` só é editável por humano. Valor conhecido: `structured_output_trust` ([05-security.md](05-security.md#leitor-em-quarentena-fase-3)).
 
+`enabled` controla a habilitação administrativa da extensão inteira. O bloqueio de crash loop é separado, persiste no SQLite por extensão/chave/sessão e não é apagado por promoção, rollback ou enable/disable. Uma chave diferente tem contador próprio; reativar uma chave antiga conserva seu estado. `ext reset-crashes` limpa somente o estado selecionado, conforme [02-core.md](02-core.md#reabilitação-humana). Bloqueios por integridade ou mudança de tools conservam a exigência de nova proposta aprovada; reset de crashes não os remove.
+
+## Overrides humanos
+
+Schema: [overrides.schema.json](schemas/overrides.schema.json). O objeto pertence à versão aprovada e não
+altera bytes/hash do bundle, lista MCP fixada ou tools_hash. Somente o humano pela
+CLI/UI confiável pode fornecê-lo. Qualquer folha explícita de ajuste exige `approved.by = user`; objetos apenas estruturais vazios são no-op. Mesmo patch nominal vazio exige nome válido no catálogo fixado.
+Promoção automática usa objeto vazio e avalia elegibilidade pelo manifest original.
+Overrides da candidata, manifest ou MCP não têm autoridade. Não vazio significa ao menos uma folha explícita de ajuste; objetos estruturais vazios são no-op. Toda promoção automática grava a forma canônica vazia.
+
+Escrita canônica sem ajustes: {"permissions": {}, "tools": {}}. Ausência de
+overrides ou de uma das seções ao ler equivale ao objeto vazio, para compatibilidade
+com locks existentes. Null em qualquer nível, duplicatas, campos desconhecidos,
+tipos inválidos e coerção são proibidos. O schema de overrides não traz defaults;
+nenhum leitor preenche um patch parcial com defaults.
+
+| Campo | Ausente | Presente |
+|---|---|---|
+| permissions, fs, net | preservar folhas | processar somente folhas presentes |
+| fs.read, fs.write, net.allow, models, secrets | preservar lista original | substituir lista inteira; [] remove entradas |
+| spawn | preservar original (default false) | substituir booleano |
+| env | preservar mapa original | substituir mapa inteiro; {} remove variáveis declaradas |
+| tools | nenhum ajuste | aplicar patches abaixo |
+| tools.default, tools.<nome> | nenhum patch nesse nível | aplicar somente campos presentes; {} é no-op |
+| folha da classificação | preservar valor anterior | substituir, inclusive false |
+
+Remover uma chave do patch restaura herança numa nova decisão humana; não é
+tombstone. Não há deleção por null. Registro aprovado não se edita em lugar:
+ajuste posterior exige nova versão do manifest e nova revisão vinculada aos bytes e ao catálogo, conforme a regra de chaves da promoção.
+
+### Prova de restrição de permissões
+
+Resolver defaults do manifest: listas/env ausentes vazios; spawn false. Aplicar
+patch. O resultado DEVE validar todas as regras semânticas do manifest, incluindo
+I11, env reservado, colisões env/segredos, escopo/templates e exigência de rede
+não vazia e sem "*" quando houver segredo. Remover rede mantendo segredo é erro,
+não remoção implícita de segredo.
+
+Comparar com o manifest original, nunca com outra versão. A prova conservadora
+compara regras normalizadas, sem inferir inclusão textual de árvores ou curingas:
+
+| Folha efetiva | Condição |
+|---|---|
+| fs.write | subconjunto exato de fs.write original |
+| fs.read | subconjunto exato de fs.read ∪ fs.write originais |
+| net.allow | subconjunto exato das regras originais normalizadas |
+| models | subconjunto exato das entradas originais |
+| secrets | subconjunto exato de pares (name, env); sem repetição/remapeamento |
+| env | cada par (nome, valor) deve existir idêntico no mapa original |
+| spawn | true só se original true |
+
+Write implica read, permitindo downgrade de uma entrada write para read. Listas
+nunca se concatenam; ordem não tem efeito. Normalização é a mesma do manifest
+(incluindo IPv6). Não aceitar caminho novo só porque parece descendente de outro,
+troca por alias, domínio em lugar de wildcard ou provider em lugar de "*": todos
+falham nessa prova de igualdade. Para esses grants diferentes, uma nova proposta
+pode declarar o manifest correspondente. É limite deliberado da Fase 0: remoção
+e downgrade dispensam álgebra nova de paths/curingas. Ampliar a prova exige ADR.
+
+Bases implícitas do sandbox (bundle/runtime legíveis, ext_data/tmp da instância,
+sockets mediados, regras fixas) permanecem. Retirar entrada redundante não revoga
+essas bases; UI não deve afirmar que revoga. Overrides não mudam kernel, role,
+scope, runtime, isolation, hooks, surfaces, privileges ou configuração global.
+Canonicalização e bloqueios de caminhos sensíveis continuam obrigatórios no spawn.
+
+### Classificação nominal e default
+
+Para cada nome local t da lista MCP fixada:
+
+1. Escolher objeto inteiro manifest.tools[t] se t não é "default" e ele existe;
+   senão manifest.tools.default; senão {}. Objeto nominal não herda campos do
+   default do manifest.
+2. Completar ausentes: effect external, sensitivity private, output_trust
+   untrusted, model_visible true, ui_callable false, timeout_ms 120000.
+3. Aplicar campos presentes de overrides.tools.default a todas as tools,
+   inclusive as nominalmente classificadas.
+4. Aplicar campos presentes de overrides.tools[t] quando t != "default".
+   Nominal vence o patch comum só nos campos que explicita.
+5. Aplicar imposições normativas de 04/05: hooks sempre invisíveis; tool com rede
+   não vira read por override; rede fora de trusted_domains, flag de workspace
+   e marca d'água preservam sua proveniência. Flags existentes nunca apagam.
+
+A classificação humana pode corrigir o default conservador, inclusive numa
+direção menos conservadora, porque é a revisão já prevista pelo spec. Isso não
+concede capacidade de SO nem substitui nenhum piso estrutural. Mudança precisa
+constar da mesma aprovação dos bytes e catálogo revisados.
+
+Chaves são nomes locais exatos, sem prefixo de extensão nem glob. Chave nominal
+ausente na lista fixada é erro, inclusive typo ou patch nominal vazio {}. "default" é reservado ao patch
+comum: uma tool MCP literalmente chamada "default" pode existir, mas recebe só
+a classificação default e o patch comum. Não há patch nominal distinto para ela.
+Nenhum patch cria/remove tool ou altera descrição, schema e annotations MCP.
+
+Model_visible false retira de tools.list sem spawn; ui_callable false impede
+chamada de surfaces. Ocultação do catálogo não é ACL de todas as chamadas por
+nome: conserva o significado existente. Para negar a todas as origens, regra
+policy deny ou desativação da extensão. Hooks seguem invisíveis por imposição.
+
+Exemplo de precedência:
+manifest.tools.default = {effect:"write_local", model_visible:false}
+manifest.tools.read = {effect:"read"}
+overrides.tools = {default:{model_visible:false}, read:{sensitivity:"public"}}
+read termina read/public/untrusted/invisível/ui_callable false/120000.
+other termina write_local/private/untrusted/invisível/ui_callable false/120000.
+Sem override default, read seria visível, porque nominal não herda manifest.default.
+
+### Persistência, validação e consumo
+
+Gravar proposals.overrides na mesma transação da decisão, depois de validar schema,
+subconjunto, nome e semântica. Após approved é imutável; somente nova versão e proposta/revisão
+permitem outro objeto. A migração pode usar TEXT NOT NULL DEFAULT
+'{"permissions":{},"tools":{}}'. O journal de promoção fixa em `after_lock` o objeto
+aprovado. `review_base_hash` cobre registro ativo inclusive overrides, conforme
+ADR-036; registros legados checked/approved sem base vinculada não promovem.
+
+No boot e em toda ativação, resolver manifest verificado + catálogo fixado +
+overrides aprovados como unidade. Supervisor/permissões de runtime, egress/model
+proxy, registro/tools.list, tools.call, hooks e proveniência recebem o mesmo
+resultado. Consumidores não refazem merge/default por conta própria. Modificadores
+de sessão (trust de workspace, flags e marca d'água) agem sobre a mesma base.
+
+Erro impede operação inteira antes de spawn/chamada; não se retorna catálogo
+parcial nem classificação original como fallback. Diagnóstico não inclui valores
+de env/segredos. Rollback obedece à mesma regra; ext_overrides de eval também quando
+a Fase 2 chegar. Não há metade de snapshot velho com metade de novo.
+
+Tools_hash compara as definições MCP originais, mesmo itens ocultos. Não incorpora
+classificação ou filtragem do catálogo de modelo.
+
+
 ## Fixação das tools
 
 `tools_hash` = sha256 da serialização JSON canônica (RFC 8785) da lista de tools devolvida por `tools/list`, ordenada por `name`, com os campos `name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations` e `_meta`.
@@ -315,6 +553,8 @@ A cada inicialização da extensão e a cada `notifications/tools/list_changed`,
 | Ação | Efeito |
 |---|---|
 | `fictor ext rollback <id> [--to <chave>]` / botão no gerenciador | `active` volta para a chave anterior (ou a indicada). Hot swap. Evento `ext.rolled_back`. |
+| `fictor ext enable <id>` | `enabled: true`; preserva bloqueios por crash/integridade. Não inicia processo por si só. |
+| `fictor ext reset-crashes <id> [--key <chave>] [--session <session_id>]` | Limpa somente recuperação selecionada, com `ext.crash_reset`; preserva `enabled` e estado da extensão. |
 | `fictor ext disable <id>` | `enabled: false`. Instâncias encerradas, tools somem, timers param. |
 | `fictor ext remove <id>` | Sai do lock. Store e `data/<id>` ficam até `fictor gc` / `--purge-data`. |
 

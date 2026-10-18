@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fictor.local/schemas/overrides.schema.json",
+  "title": "Fictor human overrides (lock schema 1)",
+  "description": "Patch esparso, sem preenchimento de defaults. Ausência preserva; null é inválido. Regras de subconjunto e resolução em spec/06-lifecycle.md, Overrides humanos (ADR-037).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/pathSpec"
+              },
+              "uniqueItems": true
+            },
+            "write": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/pathSpec"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "net": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^(\\*|(\\*\\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?|\\[[0-9A-Fa-f:.]+\\]:[0-9]{1,5})$"
+              }
+            }
+          }
+        },
+        "models": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(\\*|[a-z0-9][a-z0-9-]*)$"
+          }
+        },
+        "spawn": {
+          "type": "boolean"
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "env"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$"
+              },
+              "env": {
+                "$ref": "#/$defs/envName"
+              }
+            }
+          },
+          "uniqueItems": true
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/envName"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "default é patch comum; as demais chaves são nomes locais exatos de tools fixadas.",
+      "propertyNames": {
+        "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/toolPatch"
+      }
+    }
+  },
+  "$defs": {
+    "pathSpec": {
+      "type": "string",
+      "pattern": "^(\\$\\{(workspace|ext_data|ext_root|store|tmp)\\}(/[^\\u0000]*)?|/[^\\u0000]+|~/[^\\u0000]+)$"
+    },
+    "envName": {
+      "description": "Nomes reservados: spec/04-extensions.md#variáveis-de-ambiente-reservadas.",
+      "type": "string",
+      "pattern": "^(?!(FICTOR_|LC_|LD_|DYLD_|DENO_|BASH_FUNC_))[A-Z][A-Z0-9_]*$",
+      "not": {
+        "enum": [
+          "PATH",
+          "HOME",
+          "TMPDIR",
+          "TMP",
+          "TEMP",
+          "LANG",
+          "LANGUAGE",
+          "USER",
+          "LOGNAME",
+          "SHELL",
+          "PWD",
+          "HTTP_PROXY",
+          "HTTPS_PROXY",
+          "ALL_PROXY",
+          "NO_PROXY",
+          "NODE_USE_ENV_PROXY",
+          "SSL_CERT_FILE",
+          "SSL_CERT_DIR",
+          "NODE_EXTRA_CA_CERTS",
+          "NODE_TLS_REJECT_UNAUTHORIZED",
+          "REQUESTS_CA_BUNDLE",
+          "CURL_CA_BUNDLE",
+          "GIT_SSL_NO_VERIFY",
+          "NODE_OPTIONS",
+          "NODE_PATH",
+          "PYTHONPATH",
+          "PYTHONHOME",
+          "PYTHONSTARTUP",
+          "PYTHONUSERBASE",
+          "BASH_ENV",
+          "ENV",
+          "PROMPT_COMMAND",
+          "PERL5OPT",
+          "RUBYOPT",
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_SYSTEM",
+          "SSH_AUTH_SOCK",
+          "GPG_AGENT_INFO",
+          "GNUPGHOME",
+          "DOCKER_HOST",
+          "XDG_RUNTIME_DIR",
+          "DBUS_SESSION_BUS_ADDRESS",
+          "DISPLAY",
+          "WAYLAND_DISPLAY"
+        ]
+      }
+    },
+    "toolPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "effect": {
+          "enum": [
+            "read",
+            "write_local",
+            "external"
+          ]
+        },
+        "sensitivity": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "output_trust": {
+          "enum": [
+            "trusted",
+            "untrusted",
+            "workspace"
+          ]
+        },
+        "model_visible": {
+          "type": "boolean"
+        },
+        "ui_callable": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 600000
+        }
+      }
+    }
+  }
+}

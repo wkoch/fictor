@@ -340,8 +340,10 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | -32008 | `RATE_LIMITED` | Orçamento ou limite de taxa. |
 | -32009 | `INVALID_KIND` | Kind de evento fora do namespace permitido. |
 | -32010 | `TOO_LARGE` | Mensagem, payload ou proposta acima do limite. |
-| -32011 | `EXT_UNAVAILABLE` | Extensão desativada, em crash loop ou caiu durante a chamada. |
+| -32011 | `EXT_UNAVAILABLE` | Extensão desativada, em backoff/crash loop ou caiu durante a chamada. |
 | -32012 | `CANCELLED` | Cancelado pelo usuário. |
+
+`EXT_UNAVAILABLE` por recuperação inclui `error.data.reason = "backoff"` ou `"crash_loop"`. Somente `backoff` inclui `retry_after_ms`, inteiro não negativo calculado no momento da resposta. Essa informação não concede autorização nem instrui o core a repetir uma chamada.
 
 ## Kinds de evento
 
@@ -365,9 +367,14 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `approval.decided` | user | `{approval_id, decision, scope}` |
 | `hook.failed` | core | `{point, ext_id, error}` |
 | `net.denied` | core | `{ext_id, host, count}` |
-| `ext.started`, `ext.stopped`, `ext.crashed`, `ext.tools_changed`, `ext.cleanup_failed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
+| `ext.started`, `ext.stopped`, `ext.tools_changed`, `ext.cleanup_failed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
+| `ext.crashed` | core | `{ext_id, key, instance_id, session_id: string \| null, code: number \| null, signal: number \| null, stderr_blob?, stderr_unavailable?, recovery_count, backoff_ms: number \| null, blocked}` — sessão `sys`. `recovery_count` é 1–6 após contar o crash; `backoff_ms` é 1000/2000/4000/8000/16000 ou nulo quando bloqueado. |
+| `ext.crash_blocked` | core | `{ext_id, key, session_id: string \| null, instance_id, crashes: 6, window_ms: 60000}` — sessão `sys`, na mesma transação do sexto crash. |
+| `ext.crash_reset` | user | `{ext_id, key, session_id: string \| null, previous_count, was_blocked}` — sessão `sys`, na mesma transação que limpa a recuperação selecionada. |
 | `ext.proposed`, `ext.checking`, `ext.checked`, `ext.approved`, `ext.rejected`, `ext.failed` | core ou user | `{proposal_id, ext_id: string \| null, version: string \| null, from: string \| null, state, reason?}` — sessão `sys`. `from = null` na criação; `reason` obrigatório em `ext.failed`. Identidade nula somente em `ext.proposed`/`ext.failed`; não há `key` antes da promoção. Ver [06-lifecycle.md](06-lifecycle.md#identidade-e-persistência). |
-| `ext.promoted` | core | `{proposal_id, ext_id, key}` — sessão `sys` |
+| `ext.promotion_prepared` | core | `{operation_id, proposal_id, ext_id, key, before_hash: string \| null, after_hash}` — sessão `sys`, na mesma transação que prepara o journal. |
+| `ext.promotion_aborted` | core | `{operation_id, proposal_id, ext_id, key, reason}` — sessão `sys`, na mesma transação que aborta a intenção; `reason` é código estável `promotion:*`. |
+| `ext.promoted` | core | `{operation_id, proposal_id, ext_id, key}` — sessão `sys`, na mesma transação que confirma a proposta e o journal. |
 | `ext.rolled_back` | core ou user | `{proposal_id?, ext_id, key}` — sessão `sys` |
 | `workspace.flagged` | core | `{workspace, flag: "U", session_id, source_event_id}` — sessão `sys` |
 | `workspace.cleared` | user | `{workspace}` — sessão `sys` |
@@ -379,6 +386,10 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 `ext.failed.reason` é um código estável do core para a checagem bloqueante que falhou, nunca o texto livre de `detail`. Antes da identidade e na recuperação, usar os códigos de [06-lifecycle.md](06-lifecycle.md#falhas-antes-da-identidade). Nas demais checagens, usar `check:failed` se não houver código específico.
 
 Os campos novos dos eventos de proposta valem a partir do ADR-035. Consumidores do histórico aceitam eventos anteriores sem `version`, `from`, `state` ou `reason`; não inferem uma identidade ausente e não reescrevem eventos. `proposal.updated` continua contendo somente `{proposal_id, state}`, e `ext.proposal_status` não muda de formato nem de fase.
+
+Os eventos de promoção do ADR-036 identificam a tentativa por `operation_id`; consumidores aceitam `ext.promoted` legado sem esse campo. Snapshots de lock são dados privados do journal e nunca entram nesses eventos. Recuperação idempotente não reescreve eventos nem duplica `ext.promoted`.
+
+Os campos de recuperação de `ext.crashed` valem para processos ativos a partir do ADR-039. Consumidores aceitam o histórico anterior sem esses campos e nunca reescrevem os eventos. Se o smoke registrar um crash diagnóstico com `smoke: true`, aquele evento não leva `recovery_count`, `backoff_ms` ou `blocked` e não cria estado de recuperação. `session_id` do payload identifica a instância; o evento continua na sessão `sys`.
 
 ### Gravados pelo harness
 

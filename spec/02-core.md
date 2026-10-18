@@ -4,6 +4,14 @@ O core tem os componentes abaixo. Política e aprovações estão em [05-securit
 
 Meta de tamanho: 5–8 mil linhas de Rust, sem contar testes. Se passar disso, revisar o que deveria ser extensão.
 
+## Posse do diretório de dados
+
+- Depois de criar o próprio diretório, se necessário, e antes de abrir o writer, migrar, recuperar, criar sockets ou iniciar processos, todo core/CLI que muta um home DEVE abrir o diretório canônico `FICTOR_HOME`, conferir que é diretório privado do usuário e adquirir flock exclusivo não bloqueante no seu inode. O descritor permanece aberto até o fim de todas as mutações e supervisão; é CLOEXEC, não é herdado pelos filhos e nunca é destravado antecipadamente.
+- O diretório não é removido nem substituído enquanto existir um dono. Caminhos alternativos para o mesmo inode concorrem pelo mesmo lock. Não adquirir o lock impede mutações; uma CLI com core ativo encaminha a operação pelo socket admin. Não há fallback offline quando o core está ocupado ou inacessível.
+- O core serializa suas próprias operações conflitantes de promoção/rollback/ativação e recupera journals antes de atender operações novas. O lock é posse, não evidência de que sandboxes do dono anterior terminaram. PID, idade de arquivo e existência/ausência de socket não substituem o lock.
+
+A posse segue o [ADR-038](11-decisions.md#adr-038--posse-do-home-e-recuperação-de-instâncias-resolve-arq-022) e a semântica de descritores de [flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html). Uma versão anterior que não implementa a posse global deve ser encerrada antes de usar a nova versão no mesmo home; PID files antigos não autorizam takeover.
+
 ## Supervisor
 
 Responsável por subir, monitorar e encerrar processos de extensão.
@@ -15,9 +23,9 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 
 ### Spawn
 
-1. Resolver o bundle ativo no lock (`store/<id>/<key>/`).
-2. Resolver as permissões do manifest em um `SandboxProfile` ([05-security.md](05-security.md#perfil-de-sandbox)), expandindo templates de caminho.
-3. Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel. `__sandbox-init` expõe esse socket dentro do sandbox como TCP em `127.0.0.1:3129` ([05-security.md](05-security.md#linux-bubblewrap)).
+1. Resolver o bundle ativo no lock (`store/<id>/<key>/`), após reconciliar promoções pendentes, conferir integridade e consultar a recuperação de crashes. Nenhuma candidata é usada antes do compromisso do [ADR-036](06-lifecycle.md#9-promoção).
+2. Derivar as permissões e a classificação efetivas aprovadas do manifest verificado, catálogo fixado e overrides aprovados ([ADR-037](06-lifecycle.md#overrides-humanos)). Supervisor, runtime, proxies, catálogo e política usam esse único resultado, sem outro merge ou default. Resolver seus caminhos em um `SandboxProfile` ([05-security.md](05-security.md#perfil-de-sandbox)). Escopos `kernel` permanecem os originais validados, pois overrides não os alteram.
+3. Persistir `prepared` conforme [Registro e barreira de spawn](#registro-e-barreira-de-spawn). Gerar o token do proxy da instância e, se o manifest pedir escopos de kernel, criar `run/k/<instance_id>.sock` (0600) e um token de kernel. `__sandbox-init` expõe esse socket dentro do sandbox como TCP em `127.0.0.1:3129` ([05-security.md](05-security.md#linux-bubblewrap)).
 4. Montar o ambiente do zero (nada herdado do usuário). Recusar o spawn se `permissions.env` ou `permissions.secrets[].env` usar nome reservado ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)); a validação principal ocorre no pipeline, esta é a segunda barreira.
 
 | Variável | Valor |
@@ -33,12 +41,45 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 | `FICTOR_SESSION_ID`, `FICTOR_WORKSPACE` | só para instâncias de sessão |
 | `FICTOR_KERNEL_URL`, `FICTOR_KERNEL_TOKEN` | só se houver escopos de kernel; URL `tcp://127.0.0.1:3129` |
 | `FICTOR_MODELS_URL` | `http://models.fictor.internal/p` se `permissions.models` não for vazio |
-| variáveis de `permissions.env` | valores estáticos do manifest |
+| variáveis de `permissions.env` | valores estáticos do resultado efetivo aprovado |
 | variáveis de `permissions.secrets` | ver [05-security.md](05-security.md#segredos) |
 
-5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap.
+5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap, cumprindo a sequência `spawning` → `armed` e a barreira durável antes de liberar a extensão.
 6. Conectar stdin/stdout ao cliente MCP (se `mcp: true`). Stderr vai para `logs/ext/<ext_id>.log`, com rotação a 10 MiB.
 7. Gravar o evento `ext.started` na sessão `sys`.
+
+### Registro e barreira de spawn
+
+O namespace de PID permanece a unidade de contenção. O launcher DEVE usar `--as-pid-1` para que `__sandbox-init` seja efetivamente PID 1, além de `--die-with-parent` e `--unshare-all`. O init não executa a extensão antes da barreira abaixo.
+
+Cada instância possui `run/instances/<instance_id>/`, 0700, criado exclusivamente pelo dono. O arquivo `state.json`, regular 0600, usa schema 1 ([ADR-038](11-decisions.md#adr-038--posse-do-home-e-recuperação-de-instâncias-resolve-arq-022)); o objeto e seus subobjetos têm exatamente os campos mostrados, todos obrigatórios. No exemplo, valores entre `<...>` representam tipos, não texto literal:
+
+```json
+{
+  "schema": 1,
+  "instance_id": "<ULID>",
+  "ext_id": "<manifest.id>",
+  "key": "<version-hash do bundle>",
+  "session_id": null,
+  "owner_id": "<ULID gerado por aquisição da posse>",
+  "boot_id": "<UUID /proc/sys/kernel/random/boot_id>",
+  "observer_pidns": { "dev": "<decimal u64>", "ino": "<decimal u64>" },
+  "owner": { "pid": 123, "start_ticks": "<decimal u64>" },
+  "state": "armed",
+  "launcher": { "pid": 124, "start_ticks": "<decimal u64>" },
+  "init": { "pid": 125, "start_ticks": "<decimal u64>" },
+  "sandbox_pidns": { "dev": "<decimal u64>", "ino": "<decimal u64>" }
+}
+```
+
+- ULIDs são válidos e `instance_id` coincide com o diretório; `ext_id` é um identificador válido de manifest; `key` é a chave válida `version-hash` do bundle, fixada desde `prepared`, inclusive no smoke. Não recuperá-la do lock atual: ele pode ter mudado ou a versão ainda não ter sido ativada. `session_id` é `null` para processo global e ID válido de sessão para harness e processo de sessão. PIDs são inteiros positivos no namespace observador; start_ticks é o campo 22 de /proc/<pid>/stat, sem conversão para relógio civil. dev/ino vêm de fstat dos descritores de namespace PID. Strings u64 são decimais canônicas sem sinal, zeros à esquerda ou overflow. observer_pidns identifica /proc/self/ns/pid.
+- state admite apenas prepared, spawning e armed. prepared exige launcher/init/sandbox_pidns nulos. spawning admite launcher nulo ou completo, exige init/sandbox_pidns nulos. armed exige os três completos. Campos desconhecidos, schema desconhecido, forma inválida ou duplicação de chaves não são aceitos para recuperação automática.
+- Caminhos descartáveis são derivados, não aceitos como caminhos livres do JSON: run/instances/<id>/tmp/ e run/k/<id>.sock. O tmp host é só a árvore auxiliar de preparação; o /tmp da carga continua privado no namespace. Estado, diretório pai, journal e lock não são montados na extensão. ext_data, workspace, bundles, logs, proxy.sock global e dados de outras instâncias nunca fazem parte desta limpeza.
+- Atualizar state.json exige arquivo temporário 0600 no mesmo diretório, escrita completa, fsync do arquivo, rename e fsync do diretório. Criação do diretório e remoções também são sincronizadas nos pais. O arquivo anterior válido continua sendo a autoridade até a substituição durável; um temporário de atualização não é promovido implicitamente no boot.
+- Ordem: (1) persistir prepared; (2) criar recursos derivados; (3) persistir spawning antes de criar qualquer filho; (4) iniciar bwrap e manter __sandbox-init bloqueado por canal privado do launcher; (5) obter identidades do launcher e do init no namespace observador, confirmar que init é PID 1 do namespace filho e abrir pidfds para ambos; (6) persistir armed com as identidades; (7) só então liberar a barreira para executar a extensão.
+- O canal da barreira não é Kernel Protocol nem é herdado pelo workload. EOF, ausência de autorização, falha de persistência ou morte do dono fazem init abortar sem executar a extensão; a proteção --die-with-parent continua obrigatória. Mecanismo interno do canal fica a cargo da implementação.
+- Nenhuma falha de spawn autoriza o destrutor de um temporário a apagar recursos antes da confirmação abaixo. Se prepared ainda é o último registro válido, a ordenação garante que nenhum filho chegou a ser criado; spawning cobre inclusive a janela entre fork e registro da identidade.
+- O supervisor conserva pidfds do launcher e do init até confirmar término. O registro não guarda tokens, segredos nem o ambiente. Este journal não altera a migração SQLite.
 
 ### Encerramento
 
@@ -47,21 +88,126 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 3. Aguardar 2 s e enviar SIGKILL à árvore.
 4. Confirmar que a árvore está vazia. Só então liberar `${tmp}`, os sockets e o slot da instância.
 
-A árvore da instância é o namespace de PID. Quando `__sandbox-init` (PID 1) morre, o kernel mata todos os processos do namespace, inclusive os que chamaram `setsid()`. A confirmação é a saída do `bwrap`.
+A árvore da instância é o namespace de PID. Quando `__sandbox-init` (PID 1) morre, o kernel mata todos os processos do namespace, inclusive os que chamaram `setsid()`. A confirmação exige a saída completa do PID 1 e do launcher, conforme [Confirmação e recuperação no boot](#confirmação-e-recuperação-no-boot).
 
 Sem confirmação em 10 s: a instância fica `cleanup_failed`, o core grava `ext.cleanup_failed` na sessão `sys`, retém os recursos, mantém os tokens revogados e alerta no shell. Uma nova instância da mesma extensão pode subir, com identidade nova.
 
-O mesmo procedimento roda quando o processo raiz sai sozinho (crash). Se o core morrer, `--die-with-parent` encerra os sandboxes; no boot seguinte, o core remove sockets e diretórios de instância que sobraram.
+O mesmo procedimento roda quando o processo raiz sai sozinho (crash). Se o core morrer, `--die-with-parent` encerra os sandboxes. No boot seguinte, o core recupera os registros e só remove recursos cuja posse e término foram confirmados; desconhecidos e registros parciais seguem as regras de retenção abaixo.
+
+### Confirmação e recuperação no boot
+
+Em execução normal, sinais vão a processos presos por pidfd; o grupo POSIX é auxiliar, nunca a prova de ausência. São exigidos término do launcher **e** saída completa do PID 1, confirmados pelo pidfd de cada processo. A confirmação de saída do PID 1 ocorre após a eliminação dos demais processos do namespace; --die-with-parent, EOF, lock liberado ou launcher morto isoladamente não bastam.
+
+1. Com a posse global adquirida, ler cada state.json por descritores ancorados em run/instances/, sem seguir links. Não reabrir nem retomar workloads do dono anterior. Um owner anterior com o mesmo boot, namespace observador e identidade PID/start_ticks comprovadamente vivo indica inconsistência de posse: recusar a recuperação mutante, conservar recursos e diagnosticar.
+2. Registro prepared válido pode ter seus recursos derivados removidos: nenhum filho foi iniciado. Para outro estado, boot_id diferente do boot atual prova que nenhum processo daquela execução sobreviveu; a limpeza ainda exige registro válido e caminhos confinados.
+3. No mesmo boot, observer_pidns DEVE coincidir com o atual. Mudança de namespace observador, /proc indisponível, permissão negada ou identidade ilegível são incerteza, nunca ausência.
+4. Para armed, confirmar separadamente as identidades originais de launcher e init. Abrir /proc/<pid> uma vez e ler stat relativamente a esse descritor; para init, conferir também namespace e PID 1. Abrir pidfd, reler a identidade pelo mesmo descritor de /proc e só associar o pidfd ao registro se a revalidação for coerente. Mudança durante a aquisição descarta o pidfd e repete a observação, sem sinal.
+5. Ausência comprovada daquele PID em /proc no namespace observador, ou presença de outro start_ticks, prova que o processo original terminou. PID reutilizado não recebe sinal e não passa a pertencer à instância. Ausência de um subarquivo, erro de leitura ou falha ao ler o namespace não equivalem à ausência do processo.
+6. Se a identidade coincide e está viva, aguardar sua saída por pidfd por até 10 s no total. Na recuperação automática não são enviados sinais a processos redescobertos. Se init coincide mas seu namespace diverge, tratar como registro inconsistente e reter, sem inferir término.
+7. spawning sem identidade completa não é limpo automaticamente no mesmo boot, mesmo quando o launcher não existe: um init ainda poderia estar finalizando. Conservar até um boot_id diferente; não procurar processos por nome, cmdline, grupos ou varredura heurística.
+8. Só após ambas as identidades de armed estarem terminadas (ou regras 2/7 após reboot) remover o socket exato e a árvore descartável. Operar por descritores relativos, sem seguir symlinks nem atravessar pontos de montagem; validar tipo/posse de cada raiz. Apagar state.json e seu diretório por último. Ausência já produzida por tentativa anterior é sucesso idempotente.
+9. Falha de confirmação ou de limpeza retém o registro e os recursos restantes, revoga/não recria tokens, para registro válido gera `ext.cleanup_failed` em `sys` com a identidade e chave persistidas, além de diagnóstico; nunca reporta limpeza concluída. O próximo boot tenta novamente. Outra instância usa outro ULID e recursos novos.
+10. PID files legados, temporários antigos em /tmp/fictor, diretórios sem registro, registros malformados e schemas desconhecidos são preservados e reportados para inspeção. Não são sinalizados nem apagados automaticamente, mesmo após reboot, pois sua posse não está demonstrada. Não inventar registros a partir deles. Sem identidade válida, emitir diagnóstico confiável sem evento que invente extensão, chave ou instância.
+
+O [pidfd permite acompanhar a saída](https://man7.org/linux/man-pages/man2/pidfd_open.2.html); um [descritor aberto de /proc não passa a representar outro processo](https://www.kernel.org/doc/html/latest/filesystems/proc.html) quando o PID é reutilizado. O [kernel encerra os processos do namespace antes de notificar a saída de seu init](https://github.com/torvalds/linux/blob/master/kernel/exit.c); o fechamento de arquivos ocorre antes dessa etapa. Por isso, nenhum lock ou pipe fechado substitui a confirmação do PID 1.
 
 ### Falhas
 
-- Saída inesperada: grava `ext.crashed` (com as últimas 50 linhas de stderr em blob). Reinício com backoff de 1 s, 2 s, 4 s, 8 s, 16 s.
-- Mais de 5 crashes em 60 s: a instância fica `disabled` até ação do usuário. Chamadas pendentes falham com `EXT_UNAVAILABLE`.
-- Chamadas em andamento quando o processo morre falham com `EXT_UNAVAILABLE`. O core não repete chamadas automaticamente.
+A recuperação pertence a `(ext_id, key, session_id)`: `key` é a chave completa
+`version-hash` do lock; `session_id` é nulo para `scope: global` e obrigatório
+para `scope: session` e harness. Ela independe de `instance_id`, que muda a cada
+spawn. Uma sessão, versão ou extensão não compartilha contador com outra. O
+contrato não habilita processos globais na Fase 0 (ADR-025).
+
+- Conta como crash uma saída inesperada de processo de extensão ativo, inclusive
+  exit code 0, observada pelo supervisor. Paradas solicitadas pelo core por idle,
+  arquivamento, disable, hot swap ou encerramento do serviço não contam. Falhas
+  antes de criar processo e processos de smoke não contam. A morte do core não
+  autoriza inferir que os processos interrompidos tenham causado crash; a
+  recuperação de recursos segue o ADR-038.
+- Para um crash observado em `t`, remover amostras com `at_ms <= t - 60000` e
+  adicionar a amostra corrente. As primeiras cinco amostras na janela
+  `(t - 60000, t]` impõem, respectivamente, esperas de 1, 2, 4, 8 e 16 s a partir
+  de `t`. Um processo saudável não zera o contador: as amostras expiram pela janela.
+- A sexta amostra coloca a combinação em `crash_blocked`. Esse bloqueio não
+  expira. Não muda `enabled` no lock nem impede instâncias de outras sessões ou
+  chaves. A chave antiga conserva o bloqueio depois de atualização/rollback,
+  disable/enable, remoção/reinstalação da mesma identidade e reinício do core.
+- Reinício é lazy: expirar a espera não cria processo. Somente uma nova entrada
+  para o harness ou uma nova chamada permitida dispara a avaliação normal de
+  spawn. Chamadas recebidas durante espera/bloqueio falham imediatamente com
+  `EXT_UNAVAILABLE`; não são enfileiradas para reexecução.
+- Chamadas em andamento quando o processo morre falham uma única vez com
+  `EXT_UNAVAILABLE`. O core nunca as repete, inclusive após reset humano. Uma
+  mensagem de entrada já gravada fica no histórico; reiniciar o harness não
+  reenvia automaticamente a notificação antiga nem reexecuta tools anteriores.
+- Nova instância ainda exige `enabled`, integridade, permissões, política,
+  recursos e condições de contenção normais. `cleanup_failed` não vira crash
+  adicional; recursos retidos e revogação seguem o contrato de encerramento.
+
+#### Persistência e relógio
+
+A migração [0005](schemas/0005_crash_recovery.sql) acrescenta
+`extension_crash_recovery`. `session_id = null` identifica global; não se usa uma
+sessão sentinela. Ausência de linha significa nenhuma falha registrada. `crashes`
+é JSON array ordenado por `at_ms`, de até seis objetos exatos
+`{"instance_id": "<ULID>", "at_ms": <inteiro não negativo>}`. IDs não se repetem;
+os tempos pertencem ao `boot_id` da linha. O writer valida esses detalhes além
+dos CHECKs do SQL. `retry_at_ms` é o prazo monotônico da espera; é zero sem espera
+ou enquanto bloqueado. `updated_at` usa Unix ms somente para diagnóstico.
+
+A janela e os prazos usam `CLOCK_BOOTTIME` em ms, que inclui suspensão, e o
+identificador de `/proc/sys/kernel/random/boot_id`, lidos pelo core. Não usam
+UTC, fuso horário nem o relógio civil. No mesmo boot, reiniciar o core preserva
+amostras e prazo. Em boot diferente, antes de admitir spawn, o writer conserva
+os `instance_id` de uma linha não bloqueada, rebaseia todos os `at_ms` para o
+instante atual, atualiza `boot_id` e aplica novamente a espera correspondente ao
+número de amostras. Bloqueios permanecem bloqueados, sem prazo. Assim não é
+necessário adivinhar a duração de uma parada ou interpretar um salto no relógio
+civil. Rebasear e podar a janela não alteram eventos históricos. Leitura inválida
+de identidade de boot, relógio ou registro impede o spawn; não equivale a reset.
+
+O writer único, com `synchronous=FULL` confirmado conforme [SQLite](#sqlite),
+grava na mesma transação a amostra, o novo prazo/bloqueio,
+`ext.crashed` e, no sexto crash, `ext.crash_blocked`, ambos em `sys`. A cauda de
+stderr continua em blob (últimas 50 linhas, filtrada como os logs); seu hash vai
+em `blob_refs`. Falta de blob é indicada por `stderr_unavailable`; não elimina a
+amostra nem autoriza omitir o crash. Falha na transação impede respawn e é
+reportada; não se alega auditoria concluída. Repetir o processamento de uma
+observação não pode somar duas vezes: `instance_id` identifica a observação, e o
+writer consulta também os eventos duráveis quando a amostra já saiu da janela.
+Uma transação interrompida não deixa evento sem contador nem contador sem evento.
+Após perda do core sem observação durável, aplica-se recuperação de recursos,
+sem inventar crash. Todos os leitores de disponibilidade consultam o estado
+confirmado antes de admitir spawn. Limpar a janela expirada ou alterar o lock
+não apaga uma linha bloqueada.
+
+#### Reabilitação humana
+
+`fictor ext reset-crashes <id> [--key <chave>] [--session <session_id>]` é uma ação
+humana explícita, disponível na CLI e na UI confiável. Não existe método de
+Kernel Protocol nem tool que a execute. A chave default é a ativa; `--key`
+seleciona outra chave ainda presente em `versions`. Sem `--session`, a seleção
+inclui todas as combinações dessa extensão/chave; com a opção, inclui somente
+aquela sessão, que deve existir. `--session` é inválido para bundle global.
+
+O writer apaga as linhas selecionadas e acrescenta um `ext.crash_reset` por linha
+na mesma transação durável, actor `user`, sessão `sys`. Se não houver linha, responde
+"nenhuma recuperação a limpar" sem evento fictício. Reset não inicia processos,
+não repete mensagens/chamadas, não altera `enabled`, o bundle, kv, `${ext_data}`,
+flags U/P, grants, recursos retidos ou bloqueios de integridade. `ext enable`
+só habilita no lock; uma extensão desabilitada e bloqueada exige as duas ações
+humanas. O reset também pode limpar uma espera/contagem que ainda não bloqueou.
+
+Com o serviço ativo, usa `admin.sock`. Offline, exige a mesma posse exclusiva de
+`FICTOR_HOME` do core e os mesmos guardas de versão/migração e writer único; a
+resolução de chave ocorre sob a exclusão do instalador, depois de reconciliar
+promoções pendentes. Não escreve `lock.json`. Um core ativo ou um journal que
+não possa ser reconciliado faz o comando falhar sem mudança parcial.
 
 ### Troca de versão (hot swap)
 
-Ao promover uma versão nova:
+Somente depois do compromisso lógico da promoção (`promoted` + `ext.promoted` + journal `committed`), conforme [ADR-036](06-lifecycle.md#9-promoção):
 
 1. As instâncias da versão antiga entram em `draining`: não recebem chamadas novas.
 2. Chamadas novas vão para instâncias da versão nova, criadas sob demanda.
@@ -123,7 +269,8 @@ Nenhum caminho da UI web ou de um sandbox chega a esse comando.
 
 ### SQLite
 
-- Arquivo `fictor.db`, `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`.
+- Arquivo `fictor.db`, `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`. Toda conexão que escreve usa `synchronous=FULL` desde antes da primeira transação; o core consulta o PRAGMA e recusa a escrita se não confirmar o valor `FULL` (2). Isso vale para inicialização, migrações, writer normal e operações offline; conexões de leitura continuam somente leitura. Journals, autorizações e auditoria precisam sobreviver a perda de energia: no WAL, [FULL sincroniza cada commit, enquanto NORMAL pode perder commits recentes](https://www.sqlite.org/pragma.html#pragma_synchronous). Um checkpoint posterior não substitui essa exigência ([ADR-036](11-decisions.md#adr-036--promoção-recuperável-resolve-arq-020)).
+- O comentário de `synchronous=NORMAL` na migração histórica 0001 fica preservado; o contrato vigente de conexão é `FULL`, acima. Não reescrever migrações antigas para alterar PRAGMA de conexão.
 - Migrações em `core/migrations/NNNN_nome.sql`, aplicadas no boot dentro de uma transação, controladas por `PRAGMA user_version`. A migração inicial é [schemas/0001_init.sql](schemas/0001_init.sql).
 - Antes de aplicar qualquer migração, o core copia o banco para `fictor.db.bak-<user_version atual>` (API de backup do SQLite, 0600) e mantém as 3 cópias mais recentes. Migrações só avançam; não existe migração reversa.
 - Se `user_version` for maior que a última migração que o binário conhece, o core não sobe e explica: um binário antigo nunca abre um banco de versão mais nova. Para voltar um binário, restaure também o backup correspondente.
@@ -433,9 +580,11 @@ default_model = "main"           # chave de [ext.harness.models]
 
 Seções `[ext.<id>]` são opacas para o core e só legíveis pela extensão `<id>`.
 
+`installer.registries` aceita somente destinos exatos conforme [Registros de dependências](06-lifecycle.md#registros-de-dependências). Preservar a presença explícita de porta; curingas e descoberta automática de hosts não são admitidos (ADR-040).
+
 ## CLI
 
-Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext rollback|enable|disable`; estes três editam o lock diretamente, para recuperar o sistema mesmo com o core parado.
+Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext rollback|enable|disable|reset-crashes`. Toda mutação offline exige a [posse exclusiva do home](#posse-do-diretório-de-dados) e os mesmos guardas de migração. Rollback/enable/disable alteram o lock sob a seção crítica do instalador, após reconciliar promoções pendentes. `reset-crashes` escreve somente o SQLite pelo writer único, conforme [Reabilitação humana](#reabilitação-humana); não altera o lock. Core ativo ou reconciliação inconclusiva impede fallback offline.
 
 | Comando | Fase | Função |
 |---|---|---|
@@ -446,8 +595,9 @@ Binário único `fictor`. Comandos que alteram estado com o servidor rodando fal
 | `fictor login` | 0 | Pede ao core em execução uma URL de login nova, com token de uso único. Útil quando o core roda como serviço systemd de usuário. |
 | `fictor ext list` | 0 | Extensões, versões ativas, estado. |
 | `fictor ext install <caminho> [--yes]` | 0 | Proposta de origem `local`; mostra permissões e pede confirmação no TTY. |
-| `fictor ext enable\|disable <id>` | 0 | Liga ou desliga no lock. |
+| `fictor ext enable\|disable <id>` | 0 | Liga ou desliga no lock; preserva bloqueios de crashes e integridade. |
 | `fictor ext rollback <id> [--to <key>]` | 0 | Volta para a versão anterior (ou a indicada). |
+| `fictor ext reset-crashes <id> [--key <chave>] [--session <session_id>]` | 0 | Limpa a recuperação selecionada com auditoria; não altera `enabled` nem executa processos. |
 | `fictor runtime list\|check\|update\|rollback [<nome>]` | 0 | Gerencia runtimes ([Runtimes](#runtimes)). |
 | `fictor update [--yes] [--core]` | 0 | Verifica e aplica atualizações de runtimes e extensões; `--core` troca o binário do core. |
 | `fictor update rollback <batch_id>` | 0 | Reverte um lote de atualizações. |

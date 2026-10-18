@@ -201,6 +201,8 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-029 — Contenção da árvore de processos (resolve ARQ-018)
 
+**Complementado pelo [ADR-038](#adr-038--posse-do-home-e-recuperação-de-instâncias-resolve-arq-022):** a confirmação exige término do launcher e do PID 1; registros parciais/legados não têm limpeza incondicional.
+
 - **Contexto.** Com `spawn: true`, um descendente pode chamar `setsid()`, trocar de grupo ou ficar órfão. Encerrar pelo grupo de processos não garante que a árvore inteira terminou.
 - **Decisão.**
   - A árvore da instância é o namespace de PID criado pelo bubblewrap, com `__sandbox-init` como PID 1. Quando o PID 1 morre, o kernel mata todos os processos do namespace.
@@ -279,3 +281,88 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
   - Migração 0003 preserva linhas, nonces e índice; 0001/0002 e eventos antigos ficam intactos. Os eventos de proposta passam a admitir identidade nula, separados dos eventos de promoção/rollback, que têm chave do store.
   - Contrato completo em [06-lifecycle.md](06-lifecycle.md#identidade-e-persistência), [03-kernel-protocol.md](03-kernel-protocol.md#gravados-pelo-core) e [schemas/0003_proposal_receipts.sql](schemas/0003_proposal_receipts.sql). Critérios 35–37 da Fase 0 cobrem persistência, interrupções, limpeza e migração.
 - **Consequências.** Toda tentativa admitida é rastreável pelo ID da proposta, mesmo sem extensão identificada. Leituras de propostas precisam aceitar identidade nula. O implementador deve aplicar a migração e adaptar o recebimento, a auditoria e a recuperação em M0.5; isso não antecipa APIs ou origens de fases posteriores e não altera as invariantes I1–I11.
+
+## ADR-036 — Promoção recuperável (resolve ARQ-020)
+
+- **Data:** 2026-10-18.
+- **Contexto.** Filesystem, `lock.json` e SQLite não compartilham transação. Um crash entre publicação, troca do lock e evento podia deixar uma versão ativa sem promoção auditada, ou usar uma aprovação cuja base já mudou.
+- **Decisão.** Writer SQLite com `synchronous=FULL` confirmado; `NORMAL` permite perder transações após queda de energia e não sustenta um lock já sincronizado. Journal durável `promotion_intents`, com snapshots exatos anterior/próximo do lock, e seção crítica comum a todos os escritores do lock. Comparar `update_of` e `review_base_hash` ao aprovar e promover. Publicar apenas bytes aprovados e íntegros; pausar novas admissões antes de trocar o lock. O compromisso lógico é a transação `promoted` + `ext.promoted` + journal `committed`, após lock durável. Hot swap ocorre depois. Chaves de versões já aprovadas não são sobrescritas por promoção; alteração de overrides requer nova versão/revisão.
+- **Recuperação.** Lock anterior aborta a intenção e preserva `approved`; próximo lock íntegro conclui o compromisso uma vez; qualquer terceiro estado bloqueia sem sobrescrever. Bytes publicados sem ativação ficam inertes. Detalhes e códigos em [06-lifecycle.md](06-lifecycle.md#9-promoção); migração 0004 preserva propostas e eventos anteriores.
+- **Consequências.** Nenhuma execução nova depende de promoção não auditada. Recuperação pode exigir intervenção em corrupção/conflito externo; não existe rollback adivinhado nem reexecução de tool. Aprovações legadas sem base fixada exigem nova proposta.
+
+## ADR-037 — Overrides humanos tipados e aplicação única (resolve ARQ-021)
+
+**Data:** 2026-10-18.
+
+**Decisão:** overrides segue [overrides.schema.json](schemas/overrides.schema.json). É patch esparso, sem
+semântica de JSON Merge Patch: ausente preserva; null é inválido; listas e mapa
+env presentes substituem a folha inteira. Objetos de estrutura não apagam irmãos.
+Permissões efetivas só removem capacidades pela prova conservadora de subconjunto
+de [06-lifecycle.md](06-lifecycle.md#overrides-humanos). Classificação é editável apenas por humano, nunca pela candidata,
+e não dispensa imposições do core.
+
+Persistir o objeto exato em proposals.overrides atomicamente com a decisão humana,
+tornando-o imutável a partir de approved; promoção copia esse objeto para o lock,
+sem depender de input CLI em memória. O journal de promoção fixa o mesmo objeto
+em `after_lock`. Um único resultado validado alimenta sandbox/runtime, proxies,
+catálogo e política. Validar na aprovação, promoção, boot, ativação e rollback.
+Objeto inválido impede a operação inteira, sem fallback nem catálogo parcial.
+
+**Motivo:** defaults inseridos no patch, substituição implícita e consumidores
+divergentes podem devolver acesso retirado ou expor tool ocultada. O contrato
+torna essas diferenças testáveis e não altera o bundle.
+
+## ADR-038 — Posse do home e recuperação de instâncias (resolve ARQ-022)
+
+- **Data:** 2026-10-18.
+- **Contexto.** PID e saída do launcher isoladamente não provam que um namespace terminou; um core morto pode deixar registros parciais e temporários. PID pode ser reutilizado.
+- **Decisão.** Há um único dono mutante de cada FICTOR_HOME, excluído por flock durante toda sua vida. Antes de executar código da extensão, o supervisor persiste um registro versionado com boot, namespace observador e identidades do launcher e do PID 1. A liberação exige prova de término do PID 1 e do launcher; pidfd fixa processos vivos. Registro incompleto, legado ou observação ambígua conserva os recursos, sem sinalizar PIDs numéricos recuperados.
+- **Consequências.** O boot recupera instâncias com identidade conhecida sem atingir processos alheios. Uma queda na janela anterior ao registro completo pode reter temporários até o próximo boot do SO. O novo formato é um journal privado em run/, não uma tabela SQLite. Este ADR complementa e torna mais estrita a confirmação de saída do ADR-029.
+
+## ADR-039 — Recuperação lazy e bloqueio durável de crash loop (resolve ARQ-023)
+
+**Data:** 2026-10-18. **Status:** aceito.
+
+**Contexto.** A identidade efêmera muda em cada spawn; contar por `instance_id`
+nunca detectaria um loop. O spec também não distinguia o bloqueio de uma sessão
+da desativação administrativa da extensão nem definia reabilitação e reinício.
+
+**Decisão.** O supervisor mantém recuperação por `(ext_id, key, session_id)`, com
+`session_id = null` para processos globais e a chave completa `version-hash` do
+lock. O sexto crash na janela deslizante de 60 s bloqueia somente essa combinação.
+As cinco primeiras falhas impõem 1/2/4/8/16 s; o restart é lazy e nenhuma chamada
+interrompida é repetida. A migração 0005 guarda janela, espera e bloqueio no SQLite;
+o commit do crash e da mudança de estado é único. `CLOCK_BOOTTIME` e o `boot_id`
+do Linux sustentam os prazos sem relógio civil. Reiniciar o core conserva-os;
+em outro boot, uma janela ainda armazenada é rebaseada conservadoramente.
+`enabled` continua uma escolha global no lock: habilitar, atualizar, voltar uma
+versão ou reiniciar não limpa bloqueios. Outra chave tem recuperação independente.
+A ação humana `fictor ext reset-crashes` limpa somente a recuperação selecionada,
+com evento atômico, pela CLI ou UI confiável. O comando também funciona offline
+sob posse exclusiva de `FICTOR_HOME`; não altera lock, permissões, estado da
+extensão, flags U/P ou bloqueios de integridade.
+
+**Consequências.** Nenhuma sessão saudável é bloqueada pelo crash de outra. Um
+rollback para uma chave bloqueada preserva a proteção. Reiniciar a máquina pode
+acrescentar até 16 s de espera e preservar por mais 60 s uma contagem anterior;
+é o custo deliberado de não depender do relógio civil para apagar falhas. O
+contrato normativo está em `02-core.md`, `03-kernel-protocol.md`,
+`06-lifecycle.md` e `schemas/0005_crash_recovery.sql`.
+
+## ADR-040 —Destinos exatos para registros de dependências (resolve ARQ-024)
+
+**Decisão:** `installer.registries` é uma allowlist de autoridades exatas, não uma
+lista de URLs nem um atalho para os curingas de `net.allow`. Aceita nome DNS com
+porta opcional, IPv4 com porta e IPv6 entre colchetes com porta. A ausência de
+porta significa apenas CONNECT/443 com destino público; a informação de porta
+explícita é preservada na normalização. `localhost` exige porta. A mesma lista
+limita metadados, artefatos e cada destino de redirecionamento, sempre pelo proxy.
+Nenhum destino é incorporado a partir de pacote, lockfile, redirect ou erro.
+
+**Motivo:** separar a permissão dada pelo usuário dos endereços sugeridos por
+conteúdo não aprovado; preservar a validação de endereços e a exigência existente
+de porta explícita para HTTP simples e destinos não públicos.
+
+**Escopo:** Fase 0, etapa de dependências. Não muda os padrões aceitos nas
+permissões de extensões, não cria gerenciador de registros, credenciais ou URLs
+base novas, nem antecipa origens externas da Fase 3. Sem migração.

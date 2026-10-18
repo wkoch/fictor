@@ -2,6 +2,41 @@
 
 Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
 
+## ARQ-020 — Recuperação da promoção entre filesystem, lock e evento
+
+- **Status: resolvida em 2026-10-18 — [ADR-036](../spec/11-decisions.md).**
+- **Referência:** [spec/06-lifecycle.md](../spec/06-lifecycle.md); contrato necessário para completar M0.5.
+- **Resolução:** Journal, base fixada na revisão e compromisso após lock durável; snapshots reconciliados sem reexecução. Migração 0004 e critérios 38–39.
+- **Entrega ao implementador:** adaptar código e automatizar os critérios; resolução arquitetural não declara implementação ou gate de release concluídos.
+
+## ARQ-021 — Formato e aplicação dos overrides humanos
+
+- **Status: resolvida em 2026-10-18 — [ADR-037](../spec/11-decisions.md).**
+- **Referência:** [spec/06-lifecycle.md](../spec/06-lifecycle.md); contrato necessário para completar M0.5.
+- **Resolução:** Schema de patch esparso; substituição por folha, subconjunto conservador e resultado único para sandbox, proxies, catálogo e política. Persistência atômica da decisão; critérios 40–41.
+- **Entrega ao implementador:** adaptar código e automatizar os critérios; resolução arquitetural não declara implementação ou gate de release concluídos.
+
+## ARQ-022 — Identidade e posse para limpeza de instâncias no boot
+
+- **Status: resolvida em 2026-10-18 — [ADR-038](../spec/11-decisions.md).**
+- **Referência:** [spec/02-core.md](../spec/02-core.md); contrato necessário para completar M0.5.
+- **Resolução:** Posse exclusiva do home, journal versionado, barreira antes do workload e prova de término do launcher/PID 1; retenção conservadora de registros incompletos/legados. Critérios 42–43.
+- **Entrega ao implementador:** adaptar código e automatizar os critérios; resolução arquitetural não declara implementação ou gate de release concluídos.
+
+## ARQ-023 — Escopo do crash loop e reabilitação humana
+
+- **Status: resolvida em 2026-10-18 — [ADR-039](../spec/11-decisions.md).**
+- **Referência:** [spec/02-core.md](../spec/02-core.md); contrato necessário para completar M0.5.
+- **Resolução:** Estado por extensão/chave/sessão, backoff lazy sem replay, bloqueio durável e reset humano explícito separado de enabled. Migração 0005 e critérios 44–45.
+- **Entrega ao implementador:** adaptar código e automatizar os critérios; resolução arquitetural não declara implementação ou gate de release concluídos.
+
+## ARQ-024 — Sintaxe e fronteira dos registros de dependências
+
+- **Status: resolvida em 2026-10-18 — [ADR-040](../spec/11-decisions.md).**
+- **Referência:** [spec/06-lifecycle.md](../spec/06-lifecycle.md#registros-de-dependências), etapa de dependências; configuração `installer.registries`.
+- **Resolução:** autoridades exatas com gramática e normalização definidas, preservando porta explícita. Metadados, artefatos e redirects obedecem à mesma lista pelo proxy; conteúdo da candidata nunca a amplia. Registros locais de teste exigem autorização exata. Critério 46.
+- **Entrega ao implementador:** adaptar validação/configuração e testes da etapa; sem nova capacidade de rede nem declaração de entrega concluída.
+
 ## ARQ-019 — Recebimento inválido antes da identidade do manifest
 
 - **Status: resolvida em 2026-10-18 — [ADR-035](../spec/11-decisions.md#adr-035--propostas-duráveis-antes-da-identidade-resolve-arq-019).**
@@ -235,7 +270,7 @@ significa implementação concluída; o progresso consta em `docs/implementation
 
 ## ARQ-018 — Contenção de descendentes após daemonização
 
-- **Status: resolvida em 2026-10-17 — [ADR-029](../spec/11-decisions.md).** Namespace de PID com `__sandbox-init` como PID 1; confirmar saída do bwrap antes de liberar recursos.
+- **Status: resolvida em 2026-10-17 — [ADR-029](../spec/11-decisions.md).** Namespace de PID com `__sandbox-init` como PID 1; confirmação de término reforçada pelo ADR-038 antes de liberar recursos.
 - **Referência:** `spec/02-core.md`, encerramento; `spec/05-security.md`, bubblewrap; critério 26 da Fase 0.
 - **Dúvida original:** um grupo POSIX não prova que toda a árvore terminou quando descendentes fazem `setsid()` ou trocam de grupo.
 - **Necessário definido:** o namespace contém toda a árvore; a morte do PID 1 encerra seus processos. `--die-with-parent` cobre a morte do core. Sem confirmação em 10 s, usar `cleanup_failed` e reter recursos.

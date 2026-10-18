@@ -138,7 +138,7 @@ Regras bloqueantes na validação (etapa 2 do pipeline); o schema cobre as estru
 | `remote` | Sem processo local. O gateway conecta via HTTP streamable do MCP à `runtime.url`, através do egress proxy (Fase 3). | — |
 | `none` | Sem processo. Bundle só de skills e comandos. | — |
 
-Flags do modelo de permissões do Node derivadas do manifest. É defesa em profundidade; a fronteira principal continua sendo o sandbox do SO e o egress proxy.
+Flags do modelo de permissões do Node derivadas das permissões efetivas aprovadas: manifest com os [overrides humanos validados](06-lifecycle.md#overrides-humanos). É defesa em profundidade; a fronteira principal continua sendo o sandbox do SO e o egress proxy. Runtime, sandbox e proxies recebem o mesmo resultado, sem reconstruir defaults ou merges próprios.
 
 | Permissão | Flag |
 |---|---|
@@ -180,6 +180,8 @@ Regras de validação por escopo (bloqueantes no pipeline):
 | `secrets` | `{name, env}[]` | Segredo injetado como variável de ambiente. Ver [05-security.md](05-security.md#segredos). |
 | `env` | mapa | Variáveis estáticas. Não podem usar nomes reservados. |
 
+Listas e `env` ausentes significam vazios; `spawn` ausente significa `false`. As bases implícitas do sandbox continuam valendo. O humano pode retirar capacidades pela prova de restrição dos [overrides](06-lifecycle.md#overrides-humanos), sem alterar o bundle. Overrides não ampliam permissões nem dispensam as regras semânticas abaixo; o resultado efetivo alimenta supervisor, runtime e proxies.
+
 ### Variáveis de ambiente reservadas
 
 O supervisor define o ambiente; o manifest não pode sobrescrevê-lo nem injetar variáveis que mudam o carregamento de código ou o roteamento de rede. Um nome reservado em `permissions.env` ou em `permissions.secrets[].env` é erro bloqueante na validação (etapa 2 do pipeline). O mesmo nome em `env` e em `secrets` também é erro.
@@ -217,7 +219,7 @@ Regras semânticas (etapa 2 do pipeline):
 
 ## Classificação de tools
 
-Cada tool tem quatro propriedades usadas pela política:
+Cada tool tem as seguintes propriedades usadas pela política e pelo catálogo:
 
 | Propriedade | Valores | Significado |
 |---|---|---|
@@ -230,7 +232,9 @@ Cada tool tem quatro propriedades usadas pela política:
 | `ui_callable` | bool | Pode ser chamada por surfaces da própria extensão. Default `false`. |
 | `timeout_ms` | 1000–600000 | Default 120000. |
 
-O core aplica a classificação do lock; o processo não consegue alterá-la em runtime. Classificações declaradas por terceiros são revisadas no pipeline ([06-lifecycle.md](06-lifecycle.md)).
+A base é o objeto inteiro `tools.<nome>` do manifest, senão `tools.default`, senão um objeto vazio. Campos ausentes nesse objeto recebem `effect: external`, `sensitivity: private`, `output_trust: untrusted`, `model_visible: true`, `ui_callable: false` e `timeout_ms: 120000`; uma classificação nominal não herda campos do `default` do manifest.
+
+O core aplica os [overrides humanos](06-lifecycle.md#overrides-humanos) da versão aprovada: patch `default` comum, depois patch nominal por campo, preservando as imposições estruturais de segurança. O mesmo resultado efetivo alimenta catálogo, chamadas e proveniência. O processo não consegue alterá-lo em runtime. Classificações declaradas por terceiros são revisadas no pipeline. `model_visible: false` oculta do catálogo, sem ser uma regra de negação de toda chamada por nome; `ui_callable: false` impede chamadas de surfaces.
 
 ## Hooks
 
@@ -263,7 +267,7 @@ Dois usos:
 - **Painel**: declarado em `surfaces` com um `slot` (`left`, `right`, `bottom`). O shell monta como aba no slot.
 - **Resultado de tool**: a tool declara o resource UI conforme o MCP Apps. O shell renderiza o iframe sob o card da chamada no chat, recebendo input e resultado da tool.
 
-Uma surface só chama tools da própria extensão com `ui_callable: true`, sempre via `tools.call` do core (origem `ui`, mesma política). Eventos de interface vão para a extensão como notificação `ui.event`.
+Uma surface só chama tools da própria extensão com `ui_callable: true` na classificação efetiva aprovada, sempre via `tools.call` do core (origem `ui`, mesma política). Eventos de interface vão para a extensão como notificação `ui.event`.
 
 Resources UI DEVEM ser autocontidos (HTML, CSS e JS inline ou servidos do próprio bundle). O iframe não tem acesso à rede. O design system `fx-*` está disponível em `/ds/fx.js` e `/ds/fx.css` no host de surfaces.
 

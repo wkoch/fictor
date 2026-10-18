@@ -31,7 +31,7 @@ Analogia: kernel / libc / aplicativos.
 
 | Processo | Quantidade | Escopo | Canais |
 |---|---|---|---|
-| `fictor serve` | 1 | máquina | HTTP/WS para o navegador; socket admin para a CLI |
+| `fictor serve` | 1 por `FICTOR_HOME` | máquina | HTTP/WS para o navegador; socket admin para a CLI |
 | Harness | 1 por sessão ativa | sessão | Kernel Protocol |
 | Extensão `scope: global` | 0 ou 1 por extensão | máquina | MCP stdio; Kernel Protocol se pedir escopos |
 | Extensão `scope: session` | 0 ou 1 por (extensão, sessão ativa) | sessão | MCP stdio; Kernel Protocol se pedir escopos |
@@ -41,7 +41,7 @@ Regras:
 - Processos de extensão sobem sob demanda (lazy): na primeira chamada de tool, hook ou surface. A lista de tools vem do lock (tools fixadas na promoção), então listar tools não exige subir o processo.
 - O harness sobe quando a sessão recebe a primeira entrada e morre após `harness.idle_timeout_min` sem atividade.
 - Extensões `scope: session` morrem após 15 min sem chamadas ou quando a sessão é arquivada.
-- Todo processo de extensão roda no seu próprio grupo de processos. Matar a extensão mata os descendentes.
+- Cada extensão roda no seu próprio namespace de PID, com `__sandbox-init` como PID 1. O encerramento confirma a saída do init e do launcher antes de liberar recursos; grupos POSIX não são a prova de contenção. Um único dono mutante mantém a posse do home durante toda sua vida ([02-core.md](02-core.md#posse-do-diretório-de-dados)).
 
 ## Canais
 
@@ -121,14 +121,17 @@ $FICTOR_HOME/
 │   ├── quarantine/<proposal_id>/
 │   └── data/<id>/                         ${ext_data} de extensões globais
 │       └── sessions/<session_id>/         ${ext_data} de instâncias de sessão
-├── run/                      sockets e pids (diretório 0700)
+├── run/                      sockets e registros de instância (diretório 0700)
 │   ├── admin.sock
 │   ├── proxy.sock            (Linux)
-│   └── k/<instance_id>.sock  Kernel Protocol por instância
+│   ├── k/<instance_id>.sock  Kernel Protocol por instância
+│   └── instances/<instance_id>/
+│       ├── state.json        posse e identidades de processos; schema 1, 0600
+│       └── tmp/              árvore auxiliar descartável; não é o /tmp do sandbox
 └── logs/
 ```
 
-Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da própria extensão (`store/...`, leitura), o `${ext_data}` da instância (escrita) e os sockets da própria instância. O harness também lê `store/` inteiro.
+Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da própria extensão (`store/...`, leitura), o `${ext_data}` da instância (escrita) e os sockets da própria instância. O harness também lê `store/` inteiro. Registros de instância e a árvore auxiliar de preparação não são montados; o `/tmp` do sandbox continua privado. Recuperação e descarte seguem [02-core.md](02-core.md#confirmação-e-recuperação-no-boot).
 
 ## Stack
 
