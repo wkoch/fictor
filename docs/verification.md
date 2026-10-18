@@ -1,5 +1,49 @@
 # Verificação da implementação
 
+## Promoção, crash loop e administração — 2026-10-18
+
+Código validado: `154d187f36cf395d03258fbb9564fcfc274e4d94`, na `main`.
+Toolbx `fictor-dev` Fedora 44 sobre **Bazzite 44.20261012.0**, Linux x86-64,
+SELinux Enforcing; ferramentas e imagem ativa são as do registro seguinte.
+Nenhuma instalação no host, chave real ou rede externa nos testes.
+
+| Verificação | Resultado |
+|---|---|
+| Formatação e Clippy de todos os alvos com `-D warnings` | Passaram. |
+| Suíte completa Cargo, locked/offline | **453 passaram, zero falhas e zero ignorados, em 36 alvos.** |
+| Build release locked/offline | Passou. |
+| Seleção do job Fedora executada localmente no Toolbx | **382 passaram, zero falhas e zero ignorados, em 27 alvos**, mantendo os mesmos três filtros autorizados. |
+| Workflow | YAML válido; job Ubuntu inalterado; novos alvos Fedora de promoção, crash loop e administração incluídos. |
+| Documentação | 344 links locais e 30 referências exatas de testes válidos. |
+
+Aprovação fixa base e patch exato; promoção preserva versões/decisões anteriores
+e coordena journal, materialização, lock durável e compromisso SQLite. Testes
+cobrem recuperação por reabertura antes/depois do lock, idempotência, terceiro
+estado, corrupção, base obsoleta, chave inativa e falha transacional após publicar
+o lock. Nenhum teste de recuperação executa candidata nem repete smoke/tool.
+Catálogo e novas admissões respeitam a seção do instalador e promoção pendente.
+
+Crash loop tem relógio controlado, fronteira de 60 s, esperas, sexto crash,
+restart/novo boot, deduplicação, reset humano interno e falha atômica de auditoria.
+Integrações reais contam saída espontânea zero e excluem parada/smoke. Listagem
+admin/CLI cobre snapshots online/offline, WAL, versão exata, posse ocupada,
+concorrência, UID, protocolo estrito e limites, sem mutações ou fallback offline.
+
+A execução completa revelou fixtures com fork concorrendo com posse por flock e
+bloqueios de auditoria que precisavam ocorrer depois da consulta de admissão.
+Os fixtures agora isolam essa concorrência e sincronizam o ponto real; as guardas
+de produção permanecem. A validação dos controles inseguros precede o diagnóstico
+de lock perdido, sem reparar nenhum deles.
+
+Logs locais: `.fictor/logs/m05-coordinator-{fmt,clippy,full-test,release,ci-yaml,fedora-selection,docs}.log`;
+dirigidas adicionais em `adr036-*`, `adr039-*`, `adr041-*` e
+`m05-coordinator-foundation-*`. Não representam jobs remotos.
+
+**M0.5 continua parcial:** integração da recuperação ao boot, journal/barreira de
+instâncias, proteção pré-init, testes de interrupção nos pontos restantes e
+instalação first-party ainda estão em desenvolvimento. Mutações administrativas
+online aguardam ARQ-029. **CI remota e gate no Fedora COSMIC Atomic pendentes.**
+
 ## Posse exclusiva, Kernel e origens — 2026-10-18
 
 Código validado: `598c10c436a1d2ec097796a17681598a778e0655`, na `main`.
