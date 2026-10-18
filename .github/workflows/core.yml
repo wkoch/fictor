@@ -97,7 +97,8 @@ jobs:
         # Unit tests, protocols, proxies and inert local bundles need no userns.
         run: >-
           cargo test --locked --offline --lib
-          --test bootstrap --test budget --test kernel --test kernel_tools --test local_checker
+          --test bootstrap --test budget --test extension_control
+          --test kernel --test kernel_tools --test local_checker
           --test manifest --test migrations --test model_tls --test models --test proposals
           --test promotion --test proposal_recovery
           --test proxy --test store

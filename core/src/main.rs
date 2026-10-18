@@ -19,7 +19,7 @@ enum Command {
     },
     /// Verifica configuração, sandbox, runtimes, keyring e portas.
     Doctor,
-    /// Recebe e verifica bundles locais em quarentena, sem ativá-los.
+    /// Verifica bundles e controla extensões no lock.
     Ext {
         #[command(subcommand)]
         command: ExtCommand,
@@ -40,6 +40,10 @@ enum Command {
 enum ExtCommand {
     /// Valida, calcula hash e executa smoke isolado; não aprova nem promove.
     Check { path: PathBuf },
+    /// Habilita uma extensão no lock com o core parado.
+    Enable { id: String },
+    /// Desabilita uma extensão no lock com o core parado.
+    Disable { id: String },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
                 }))?
             );
         }
+        Command::Ext {
+            command: ExtCommand::Enable { id },
+        } => set_extension_enabled(&home, &id, true)?,
+        Command::Ext {
+            command: ExtCommand::Disable { id },
+        } => set_extension_enabled(&home, &id, false)?,
         Command::Secrets { command } => {
             let config = fictor::config::Config::load(&home)?;
             let secrets =
@@ -178,5 +188,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::SandboxInit { .. } => bail!("sandbox init já tratado"),
     }
+    Ok(())
+}
+
+fn set_extension_enabled(home: &std::path::Path, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let change = fictor::installer::control::set_enabled(home, id, enabled)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ext_id": change.ext_id, "enabled": change.enabled, "changed": change.changed
+        }))?
+    );
     Ok(())
 }
