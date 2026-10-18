@@ -19,8 +19,22 @@ use std::path::Path;
 pub async fn initialize(home: &Path) -> Result<(), InitError> {
     home::prepare(home)?;
     config::Config::create_if_missing(home)?;
+    let lease = std::sync::Arc::new(installer::lease::InstallerLease::acquire(home)?);
     let store = store::Store::open(home).await?;
-    store.shutdown().await?;
+    let store = std::sync::Arc::new(store);
+    let report = installer::recovery::recover(home, store.clone(), lease).await?;
+    for diagnostic in report.diagnostics {
+        tracing::warn!(
+            code = diagnostic.code.as_str(),
+            proposal_id = diagnostic.proposal_id,
+            "installer recovery diagnostic"
+        );
+    }
+    // Recovery's owned worker has completed and released its Store reference.
+    match std::sync::Arc::try_unwrap(store) {
+        Ok(store) => store.shutdown().await?,
+        Err(_) => return Err(InitError::Store(store::StoreError::Closed)),
+    }
     Ok(())
 }
 
@@ -32,4 +46,6 @@ pub enum InitError {
     Config(#[from] config::ConfigError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
+    #[error(transparent)]
+    Recovery(#[from] installer::recovery::RecoveryError),
 }

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 fn base() -> Value {
-    json!({"schema":1,"id":"test-extension","version":"1.2.3","description":"A test extension","runtime":{"kind":"deno","entry":"server.ts"}})
+    json!({"schema":1,"id":"test-extension","version":"1.2.3","description":"A test extension","runtime":{"kind":"node","entry":"server.ts"}})
 }
 fn parse(value: Value) -> Result<Manifest, ManifestError> {
     Manifest::parse(&value.to_string())
@@ -157,23 +157,21 @@ fn process_roles_require_a_real_channel_and_harness_cannot_serve_mcp() {
 }
 
 #[test]
-fn toolchains_are_recognized_but_fail_closed_until_mount_support_exists() {
+fn removed_deno_runtime_and_toolchain_permissions_are_rejected() {
+    for enabled in [false, true] {
+        let mut value = base();
+        value["scope"] = "session".into();
+        value["permissions"] = json!({"toolchains":enabled});
+        assert_eq!(error(value), ManifestError::Schema);
+    }
     let mut value = base();
-    value["scope"] = "session".into();
-    value["permissions"] = json!({"toolchains":false});
-    let mut manifest = parse(value.clone()).unwrap();
-    assert!(!manifest.permissions.toolchains);
-    manifest.permissions.toolchains = true;
-    assert_eq!(manifest.validate(), Err(ManifestError::UnsupportedPhase));
-    value["permissions"]["toolchains"] = true.into();
-    assert_eq!(error(value.clone()), ManifestError::UnsupportedPhase);
-    value["scope"] = "global".into();
+    value["runtime"]["kind"] = "deno".into();
     assert_eq!(error(value), ManifestError::Schema);
 }
 
 #[test]
 fn local_runtimes_and_declarative_hooks_validate_without_activation() {
-    for kind in ["deno", "node", "python", "binary"] {
+    for kind in ["node", "python", "binary"] {
         let mut value = base();
         value["runtime"]["kind"] = kind.into();
         value["scope"] = "session".into();
@@ -198,7 +196,7 @@ fn schema_structure_and_future_runtime_tiers_are_enforced() {
         assert_eq!(error(value), ManifestError::Schema);
     }
     for runtime in [
-        json!({"kind":"deno"}),
+        json!({"kind":"node"}),
         json!({"kind":"binary","entry":"/usr/bin/tool"}),
         json!({"kind":"none","entry":"server.ts"}),
     ] {
@@ -412,7 +410,7 @@ fn commands_surfaces_and_kernel_lists_are_unique() {
 
 #[test]
 fn yaml_duplicates_tags_complex_keys_and_multiple_documents_fail_without_echo() {
-    let prefix = "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: deno, entry: server.ts}\n";
+    let prefix = "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: node, entry: server.ts}\n";
     for suffix in [
         "id: other\n",
         "permissions: {env: {TOKEN: fake-sensitive-one, TOKEN: fake-sensitive-two}}\n",
@@ -426,6 +424,52 @@ fn yaml_duplicates_tags_complex_keys_and_multiple_documents_fail_without_echo() 
             Err(error) => error,
         };
         assert!(!format!("{problem}: {problem:?}").contains("fake-sensitive"));
+    }
+}
+
+#[test]
+fn explicit_local_global_standard_and_directive_yaml_tags_are_rejected() {
+    let valid =
+        "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: none}\n";
+    for text in [
+        format!("!!forbidden\n{valid}"),
+        format!("!!map\n{valid}"),
+        format!("!Injected\n{valid}"),
+        format!("!<tag:example.com,2026:extension>\n{valid}"),
+        valid.replace("schema: 1", "!!str schema: 1"),
+        valid.replace("schema: 1", "schema: !!int 1"),
+        valid.replace("description: test", "description: !!str test"),
+        valid.replace("runtime: {kind: none}", "runtime: !!map {kind: none}"),
+        valid.replace("runtime: {kind: none}", "runtime: ! {kind: none}"),
+        format!("{valid}commands: !!seq []\n"),
+        format!("%TAG !e! tag:example.com,2026:\n---\n!e!extension\n{valid}"),
+        format!("%TAG !! tag:example.com,2026:\n---\n!!extension\n{valid}"),
+        format!("%TAG !e! tag:yaml.org,2002:\n---\n!e!map\n{valid}"),
+    ] {
+        assert!(
+            matches!(Manifest::parse(&text), Err(ManifestError::Parse)),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn taglike_text_in_scalar_values_and_comments_remains_literal() {
+    let valid =
+        "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: none}\n";
+    for description in [
+        "\"!!forbidden\"",
+        "'!Injected !!map %TAG !e! literal'",
+        "literal !Injected !!map https://example.test/!value",
+        "|\n  !!forbidden\n  !Injected %TAG !e! literal",
+        ">\n  !!forbidden\n  !Injected %TAG !e! literal",
+        "\"\\u0021\\u0021forbidden\"",
+    ] {
+        let text = valid.replace("description: test", &format!("description: {description}"));
+        assert!(
+            Manifest::parse(&format!("# !!forbidden %TAG !e! comment\n{text}")).is_ok(),
+            "{description}"
+        );
     }
 }
 

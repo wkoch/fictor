@@ -91,7 +91,7 @@ pub struct Inspection {
     pub ignored: Vec<PathBuf>,
 }
 
-pub use unix::{copy_local, inspect};
+pub use unix::{copy_local, copy_receipt, inspect};
 
 mod unix {
     use super::*;
@@ -167,6 +167,25 @@ mod unix {
         destination: &Path,
         budget: &BundleBudget,
     ) -> Result<Inspection, BundleError> {
+        copy(source, destination, budget, true)
+    }
+
+    /// ADR-035: the caller commits a failed receipt before deleting its bytes.
+    /// On error retain any partial destination for that cleanup or boot recovery.
+    pub fn copy_receipt(
+        source: &Path,
+        destination: &Path,
+        budget: &BundleBudget,
+    ) -> Result<Inspection, BundleError> {
+        copy(source, destination, budget, false)
+    }
+
+    fn copy(
+        source: &Path,
+        destination: &Path,
+        budget: &BundleBudget,
+        cleanup_on_error: bool,
+    ) -> Result<Inspection, BundleError> {
         budget.check_time()?;
         let (source, source_path) = open_root(source)?;
         if !destination.is_absolute()
@@ -198,7 +217,7 @@ mod unix {
         let destination = create_directory(&parent, name)?;
         // The private core-owned parent is not accessible to extensions. Keep the
         // guard until both copying and independent source revalidation succeed.
-        let mut cleanup = Cleanup(Some(destination_path));
+        let mut cleanup = Cleanup(cleanup_on_error.then_some(destination_path));
         let root_stamp = Stamp::of(&source.metadata()?);
         let copied = walk(source.try_clone()?, Some(destination), budget)?;
         let checked = walk(source.try_clone()?, None, budget)?;
@@ -219,10 +238,15 @@ mod unix {
             return Err(BundleError::Invalid("fonte contém .."));
         }
         let initial = fs::symlink_metadata(path)?;
-        if !initial.is_dir() || initial.file_type().is_symlink() {
-            return Err(BundleError::Invalid(
-                "raiz do bundle deve ser diretório, sem symlink",
-            ));
+        if initial.file_type().is_symlink() {
+            return Err(BundleError::Invalid("symlink no bundle"));
+        }
+        if !initial.is_dir() {
+            return Err(BundleError::Invalid(if initial.is_file() {
+                "raiz do bundle deve ser diretório"
+            } else {
+                "entrada especial no bundle"
+            }));
         }
         let canonical = path.canonicalize()?;
         let file = OpenOptions::new()
@@ -451,10 +475,11 @@ mod unix {
         let name = c_name(name)?;
         let metadata = entry_metadata(parent, OsStr::from_bytes(name.as_bytes()))?;
         let kind = metadata.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            return Err(BundleError::Invalid("symlink no bundle"));
+        }
         if kind != libc::S_IFDIR && kind != libc::S_IFREG {
-            return Err(BundleError::Invalid(
-                "symlink ou entrada especial no bundle",
-            ));
+            return Err(BundleError::Invalid("entrada especial no bundle"));
         }
         let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
         if kind == libc::S_IFDIR {
@@ -501,7 +526,7 @@ mod unix {
                     || (root
                         && matches!(
                             name.to_str(),
-                            Some("node_modules" | "vendor" | ".deno" | ".pydeps" | ".venv")
+                            Some("node_modules" | "vendor" | ".pydeps" | ".venv")
                         ))))
     }
     fn remove_directory(parent: &File, name: &OsStr) -> Result<(), BundleError> {
@@ -615,10 +640,11 @@ mod unix {
             let path = relative.join(&name);
             let metadata = entry_metadata(directory, &name)?;
             let kind = metadata.st_mode & libc::S_IFMT;
+            if kind == libc::S_IFLNK {
+                return Err(BundleError::Invalid("symlink no bundle"));
+            }
             if kind != libc::S_IFDIR && kind != libc::S_IFREG {
-                return Err(BundleError::Invalid(
-                    "symlink ou entrada especial no bundle",
-                ));
+                return Err(BundleError::Invalid("entrada especial no bundle"));
             }
             if kind == libc::S_IFDIR
                 && ignored_directory(&name, relative.as_os_str().is_empty(), budget.profile)
@@ -668,6 +694,39 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn durable_receipt_keeps_partial_bytes_until_failure_is_committed() {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            let parent = root.path().join("quarantine");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(source.join("a-file"), b"copied before failure").unwrap();
+            std::os::unix::fs::symlink("/never-follow", source.join("z-link")).unwrap();
+            let receipt = parent.join(".receipt-attempt");
+            let error = copy_receipt(&source, &receipt, &budget()).unwrap_err();
+            assert_eq!(error.receipt_reason(), "receipt:symlink");
+            assert!(receipt.is_dir());
+            fs::remove_file(source.join("z-link")).unwrap();
+            fs::write(source.join("z-file"), [b'x'; 64]).unwrap();
+            let limited = || {
+                let mut limits = BundleProfile::ReceiptLocal.limits();
+                limits.file_size = 32;
+                sized(limits)
+            };
+            let partial = parent.join(".receipt-partial");
+            let error = copy_receipt(&source, &partial, &limited()).unwrap_err();
+            assert_eq!(error.receipt_reason(), "limit:file_size");
+            // Traversal order is filesystem-dependent. The failing file was
+            // created before its size check; it must survive with the receipt.
+            assert!(partial.join("z-file").is_file());
+            let smoke = parent.join("smoke-copy");
+            assert!(copy_local(&source, &smoke, &limited()).is_err());
+            assert!(!smoke.exists(), "ordinary disposable copies still clean up");
+            assert!(source.join("a-file").exists());
+        }
         use std::sync::atomic::{AtomicU64, Ordering};
 
         fn budget() -> BundleBudget {
@@ -791,7 +850,6 @@ mod unix {
                 "__pycache__",
                 "node_modules",
                 "vendor",
-                ".deno",
                 ".pydeps",
                 ".venv",
             ] {
@@ -805,10 +863,30 @@ mod unix {
             directory(&temp.path().join("nested/vendor"));
             write(&temp.path().join("nested/vendor/file"), b"yes", 0o600);
             let scanned = inspect(temp.path(), &budget()).unwrap();
-            assert_eq!(scanned.ignored.len(), 8);
+            assert_eq!(scanned.ignored.len(), 7);
             assert_eq!(scanned.total_entries, 3);
             assert_eq!(scanned.total_bytes, 3);
             assert_eq!(scanned.files[0].path, Path::new("nested/vendor/file"));
+            // ADR-033 removed Deno: .deno is ordinary bundle content, not a cache exemption.
+            directory(&temp.path().join(".deno"));
+            write(&temp.path().join(".deno/file"), b"code", 0o600);
+            let with_deno = inspect(temp.path(), &budget()).unwrap();
+            assert_eq!(with_deno.ignored, scanned.ignored);
+            assert_eq!(with_deno.total_entries, scanned.total_entries + 2);
+            assert_eq!(with_deno.total_bytes, scanned.total_bytes + 4);
+            assert_eq!(with_deno.files[0].path, Path::new(".deno/file"));
+            assert_ne!(with_deno.bundle_hash, scanned.bundle_hash);
+            let mut limits = BundleProfile::ReceiptLocal.limits();
+            limits.entries = with_deno.total_entries - 1;
+            limit(inspect(temp.path(), &sized(limits)), "entries");
+            limits = BundleProfile::ReceiptLocal.limits();
+            limits.bytes = with_deno.total_bytes - 1;
+            limit(inspect(temp.path(), &sized(limits)), "bytes");
+            std::os::unix::fs::symlink("/never-read", temp.path().join(".deno/bad")).unwrap();
+            assert!(matches!(
+                inspect(temp.path(), &budget()),
+                Err(BundleError::Invalid(_))
+            ));
             for name in [
                 ".git",
                 "__pycache__",

@@ -1,8 +1,13 @@
 //! Phase-0 local receipt, validation and isolated checks. No automatic activation.
 pub mod bundle;
+pub mod control;
+pub mod dependencies;
+pub mod lease;
 pub mod local;
 pub mod lock;
 pub mod manifest;
+pub mod promotion;
+pub mod recovery;
 
 pub use bundle::{
     BundleBudget, BundleFile, BundleProfile, Inspection, MAX_BUNDLE_BYTES, copy_local, inspect,
@@ -18,4 +23,23 @@ pub enum BundleError {
     Limit(&'static str),
     #[error("fonte do bundle mudou durante o recebimento")]
     SourceChanged,
+}
+
+impl BundleError {
+    /// Stable receipt audit codes; never persist library errors or source paths.
+    pub fn receipt_reason(&self) -> &'static str {
+        match self {
+            Self::Limit("entries") => "limit:entries",
+            Self::Limit("bytes") => "limit:bytes",
+            Self::Limit("file_size") => "limit:file_size",
+            Self::Limit("depth") => "limit:depth",
+            Self::Limit("path_length") => "limit:path_length",
+            Self::Limit("time") => "limit:time",
+            Self::Invalid("symlink no bundle") => "receipt:symlink",
+            Self::Invalid("entrada especial no bundle") => "receipt:special_file",
+            Self::Invalid(_) => "receipt:invalid_path",
+            Self::SourceChanged => "receipt:source_changed",
+            Self::Io(_) | Self::Limit(_) => "receipt:io",
+        }
+    }
 }

@@ -1,6 +1,8 @@
 use fictor::{
     config::Mode,
-    kernel::{KernelIdentity, KernelServer, MAX_MESSAGE_BYTES},
+    kernel::{
+        KernelError, KernelIdentity, KernelServer, LogFuture, LogRecord, LogSink, MAX_MESSAGE_BYTES,
+    },
     store::{AppendEvent, NewSession, Provenance, Sensitivity, Store, Trust},
 };
 use serde_json::{Value, json};
@@ -130,6 +132,103 @@ impl Client {
 }
 fn error(value: &Value, name: &str) {
     assert_eq!(value["error"]["message"], name);
+}
+
+struct Logs(tokio::sync::mpsc::UnboundedSender<LogRecord>);
+impl LogSink for Logs {
+    fn write(&self, record: LogRecord) -> LogFuture {
+        Box::pin(std::future::ready(
+            self.0.send(record).map_err(|_| KernelError::Log),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn log_notifications_require_hello_validate_fields_and_never_reply() {
+    let fixture = Fixture::new().await;
+    let (sender, mut logs) = tokio::sync::mpsc::unbounded_channel();
+    let mut server = KernelServer::bind_with_log(
+        &fixture.home,
+        fixture.identity(Some(fixture.session.clone()), &["kv"]),
+        fixture.store.clone(),
+        vec![],
+        Some(Arc::new(Logs(sender))),
+    )
+    .await
+    .unwrap();
+    let mut unauthenticated = Client::raw(&server).await;
+    unauthenticated.send(json!({"jsonrpc":"2.0","method":"log","params":{"level":"info","message":"before hello"}})).await;
+    error(&unauthenticated.read().await, "UNAUTHENTICATED");
+    unauthenticated.closed().await;
+    assert!(logs.try_recv().is_err());
+
+    let mut client = Client::new(&server).await;
+    for level in ["debug", "info", "warn", "error"] {
+        client.send(json!({"jsonrpc":"2.0","method":"log","params":{"level":level,"message":"valid","fields":{"nested":{"number":3,"value":null},"ext_id":"untrusted field"}}})).await;
+    }
+    client
+        .send(
+            json!({"jsonrpc":"2.0","method":"log","params":{"level":"info","message":"no fields"}}),
+        )
+        .await;
+    for invalid in [
+        json!({"level":"trace","message":"invalid"}),
+        json!({"level":"info","message":1}),
+        json!({"level":"warn","message":"invalid","fields":[]}),
+        json!({"level":"warn","message":"invalid","fields":null}),
+        json!({"level":"error","message":"forged","ext_id":"another-extension"}),
+    ] {
+        client
+            .send(json!({"jsonrpc":"2.0","method":"log","params":invalid}))
+            .await;
+    }
+    // A subsequent request is a delivery barrier and detects forbidden replies
+    // to either valid or invalid notifications.
+    let result = client
+        .call("kv.get", json!({"key":"delivery-barrier"}))
+        .await;
+    assert!(result.get("result").is_some());
+    for level in ["debug", "info", "warn", "error"] {
+        let log = logs.try_recv().unwrap();
+        assert_eq!(log.level.as_str(), level);
+        assert_eq!(log.message, "valid");
+        assert_eq!(log.fields.unwrap()["nested"]["number"], 3);
+    }
+    let log = logs.try_recv().unwrap();
+    assert_eq!(log.message, "no fields");
+    assert!(log.fields.is_none());
+    assert!(logs.try_recv().is_err());
+    error(
+        &client
+            .call(
+                "log",
+                json!({"level":"info","message":"not a notification"}),
+            )
+            .await,
+        "METHOD_NOT_FOUND",
+    );
+    assert!(logs.try_recv().is_err());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unavailable_log_sink_closes_the_channel_without_echoing_the_record() {
+    let fixture = Fixture::new().await;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    let mut server = KernelServer::bind_with_log(
+        &fixture.home,
+        fixture.identity(Some(fixture.session.clone()), &["kv"]),
+        fixture.store.clone(),
+        vec![],
+        Some(Arc::new(Logs(sender))),
+    )
+    .await
+    .unwrap();
+    let mut client = Client::new(&server).await;
+    client.send(json!({"jsonrpc":"2.0","method":"log","params":{"level":"error","message":"fake credential never echoed"}})).await;
+    client.closed().await;
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -490,6 +589,22 @@ async fn kv_namespaces_blobs_config_reload_and_global_write_boundary() {
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
     global.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_notifies_clients_and_retains_socket_until_cleanup() {
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    let mut client = Client::new(&server).await;
+    let socket = server.socket_path().to_path_buf();
+    server.notify_shutdown();
+    assert_eq!(client.read().await["method"], "shutdown");
+    client.closed().await;
+    assert!(socket.exists(), "namespace cleanup still needs the socket");
+    assert!(UnixStream::connect(&socket).await.is_err());
+    server.revoke();
+    server.shutdown().await.unwrap();
+    assert!(!socket.exists());
 }
 
 #[tokio::test]

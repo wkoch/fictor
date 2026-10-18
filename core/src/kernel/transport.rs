@@ -26,7 +26,19 @@ impl KernelServer {
         home: &Path,
         identity: KernelIdentity,
         store: Arc<Store>,
+        provider_ids: Vec<String>,
+    ) -> Result<Self, KernelError> {
+        Self::bind_with_log(home, identity, store, provider_ids, None).await
+    }
+
+    /// Bind the instance's authenticated log destination along with its identity.
+    /// Low-level protocol endpoints may omit it; extension launches supply it.
+    pub async fn bind_with_log(
+        home: &Path,
+        identity: KernelIdentity,
+        store: Arc<Store>,
         mut provider_ids: Vec<String>,
+        log: Option<Arc<dyn LogSink>>,
     ) -> Result<Self, KernelError> {
         identity.validate()?;
         if !home.is_absolute()
@@ -66,6 +78,7 @@ impl KernelServer {
             home,
             store,
             provider_ids,
+            log,
         });
         // bind refuses an existing path; no stale socket or other file is removed.
         let listener = UnixListener::bind(&socket_path)?;
@@ -95,9 +108,15 @@ impl KernelServer {
     pub fn token(&self) -> &str {
         &self.state.token
     }
+    /// End the transport gracefully without removing its socket or revoking
+    /// the instance token. The supervisor revokes tokens after its grace period
+    /// and removes resources only after confirming the PID namespace has exited.
+    pub fn notify_shutdown(&self) {
+        let _ = self.stop.send(true);
+    }
     pub fn revoke(&self) {
         self.state.revoked.store(true, Ordering::Release);
-        let _ = self.stop.send(true);
+        self.notify_shutdown();
     }
     pub async fn shutdown(&mut self) -> Result<(), KernelError> {
         self.revoke();
@@ -274,9 +293,25 @@ async fn connection(stream: UnixStream, state: Arc<State>, mut stop: watch::Rece
             }
             continue;
         }
-        // This infrastructure has no log sink yet. Never acknowledge arbitrary
-        // notifications as successful calls or record their potentially secret fields.
         if id.is_none() {
+            if request.method == "log"
+                && let Ok(record) = params::<LogRecord>(request.params)
+                && let Some(sink) = &state.log
+            {
+                let result = tokio::select! {biased;
+                    _=stop.changed()=>{shutdown_notice(reader.get_mut()).await;return;},
+                    result=sink.write(record)=>result,
+                };
+                if result.is_err() {
+                    // No extension-controlled fields or raw errors reach core logs.
+                    tracing::warn!(
+                        ext_id = state.identity.ext_id,
+                        instance_id = state.identity.instance_id,
+                        "extension log unavailable"
+                    );
+                    return;
+                }
+            }
             continue;
         }
         let result = tokio::select! {biased;

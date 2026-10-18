@@ -3,19 +3,41 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
 };
 
 pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
+/// Kernel-triggered reloads accept user-managed regular-file symlinks, but must
+/// never open a pipe/device or leave a non-cancellable blocking worker behind.
+pub(crate) fn open_regular_config_file(path: &Path) -> io::Result<fs::File> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "configuration source must be a regular file",
+        ));
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        // O_NONBLOCK prevents a raced-in FIFO from blocking before the FD type
+        // check. No O_NOFOLLOW: regular-file symlinks remain supported.
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "configuration source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 // Extension configuration stays opaque; provider bodies and model formats never enter the core.
 #[derive(Deserialize, Serialize)]
 pub struct Config {
     pub server: Server,
     pub paths: Paths,
-    pub runtimes: BTreeMap<String, String>,
+    pub runtimes: BTreeMap<String, RuntimeSource>,
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     pub policy: Policy,
@@ -39,6 +61,19 @@ pub struct Server {
 #[derive(Deserialize, Serialize)]
 pub struct Paths {
     pub default_workspace: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeSource {
+    Nodejs {
+        channel: String,
+    },
+    GithubRelease {
+        repo: String,
+        asset: String,
+        checksum: String,
+        bin: String,
+    },
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Provider {
@@ -96,6 +131,7 @@ pub struct Harness {
     pub idle_timeout_min: u64,
 }
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sandbox {
     pub home_ro_files: Vec<String>,
 }
@@ -119,6 +155,13 @@ pub enum ConfigError {
 impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
+        if config
+            .runtimes
+            .values()
+            .any(|source| matches!(source, RuntimeSource::Nodejs { channel } if channel != "lts"))
+        {
+            return Err(ConfigError::Invalid("o canal Node deve ser lts"));
+        }
         if config.server.listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             return Err(ConfigError::Invalid("server.listen deve usar 127.0.0.1"));
         }
@@ -156,8 +199,9 @@ impl Config {
             #[serde(default)]
             ext: BTreeMap<String, toml::Table>,
         }
-        let mut config: Reload = toml::from_str(&fs::read_to_string(home.join("config.toml"))?)
-            .map_err(|_| ConfigError::Parse)?;
+        let mut text = String::new();
+        open_regular_config_file(&home.join("config.toml"))?.read_to_string(&mut text)?;
+        let mut config: Reload = toml::from_str(&text).map_err(|_| ConfigError::Parse)?;
         Ok(config.ext.remove(ext_id).unwrap_or_default())
     }
 

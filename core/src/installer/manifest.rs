@@ -10,13 +10,15 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    mem::MaybeUninit,
     sync::OnceLock,
 };
+use unsafe_libyaml as unsafe_yaml;
 
 const SCHEMA: &str = include_str!("../../../spec/schemas/extension.schema.json");
 // The local-receipt per-file ceiling is already fixed by ADR-024. Valid manifest
 // structure is shallow; bound invalid YAML before allocating a recursive Value.
-const MAX_MANIFEST_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 50 * 1024 * 1024;
 const MAX_PARSE_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -100,7 +102,6 @@ pub enum Isolation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
-    Deno,
     Node,
     Python,
     Binary,
@@ -250,7 +251,6 @@ pub struct Permissions {
     pub net: NetworkPermissions,
     pub models: Vec<String>,
     pub spawn: bool,
-    pub toolchains: bool,
     pub secrets: Vec<SecretBinding>,
     pub env: BTreeMap<String, String>,
 }
@@ -261,7 +261,6 @@ impl Permissions {
             && self.net.allow.is_empty()
             && self.models.is_empty()
             && !self.spawn
-            && !self.toolchains
             && self.secrets.is_empty()
             && self.env.is_empty()
     }
@@ -290,24 +289,7 @@ impl Manifest {
     }
 
     pub fn parse_with_nat64(text: &str, nat64: &Nat64Prefixes) -> Result<Self, ManifestError> {
-        if text.len() > MAX_MANIFEST_BYTES {
-            return Err(ManifestError::Limit);
-        }
-        let budget = ParseBudget {
-            nodes: Cell::new(text.len().saturating_mul(2).max(1)),
-            bytes: Cell::new(MAX_MANIFEST_BYTES),
-        };
-        let mut documents = serde_yaml_ng::Deserializer::from_str(text);
-        let document = documents.next().ok_or(ManifestError::Parse)?;
-        let value = JsonSeed {
-            budget: &budget,
-            depth: 0,
-        }
-        .deserialize(document)
-        .map_err(|_| ManifestError::Parse)?;
-        if documents.next().is_some() {
-            return Err(ManifestError::Parse);
-        }
+        let value = parse_yaml_value(text, MAX_MANIFEST_BYTES)?;
         validate_schema(&value)?;
         let mut manifest: Self =
             serde_json::from_value(value).map_err(|_| ManifestError::Schema)?;
@@ -360,10 +342,7 @@ impl Manifest {
         {
             return Err(ManifestError::Semantic("processo sem MCP exige kernel"));
         }
-        if self.runtime.kind == RuntimeKind::Remote
-            || self.isolation != Isolation::Os
-            || self.permissions.toolchains
-        {
+        if self.runtime.kind == RuntimeKind::Remote || self.isolation != Isolation::Os {
             return Err(ManifestError::UnsupportedPhase);
         }
         if self.kernel.iter().any(|scope| {
@@ -490,6 +469,31 @@ impl Manifest {
     }
 }
 
+/// Shared bounded data parser for manifests and skill frontmatter. This never
+/// resolves tags or accepts duplicate keys; aliases share the expansion budget.
+pub(crate) fn parse_yaml_value(text: &str, max_bytes: usize) -> Result<Value, ManifestError> {
+    if text.len() > max_bytes {
+        return Err(ManifestError::Limit);
+    }
+    reject_explicit_yaml_tags(text)?;
+    let budget = ParseBudget {
+        nodes: Cell::new(text.len().saturating_mul(2).max(1)),
+        bytes: Cell::new(max_bytes),
+    };
+    let mut documents = serde_yaml_ng::Deserializer::from_str(text);
+    let document = documents.next().ok_or(ManifestError::Parse)?;
+    let value = JsonSeed {
+        budget: &budget,
+        depth: 0,
+    }
+    .deserialize(document)
+    .map_err(|_| ManifestError::Parse)?;
+    if documents.next().is_some() {
+        return Err(ManifestError::Parse);
+    }
+    Ok(value)
+}
+
 fn validate_schema(value: &Value) -> Result<(), ManifestError> {
     static VALIDATOR: OnceLock<Result<jsonschema::Validator, ManifestError>> = OnceLock::new();
     let validator = VALIDATOR
@@ -613,6 +617,76 @@ pub fn valid_environment_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
         && !PREFIXES.iter().any(|prefix| name.starts_with(prefix))
         && !RESERVED.contains(&name)
+}
+
+/// serde_yaml_ng erases some explicit global/standard tags during deserialize_any.
+/// Inspect libyaml tokens first so every explicit tag is rejected, while tag-like
+/// text in quoted, plain and block scalars keeps its literal meaning.
+fn reject_explicit_yaml_tags(text: &str) -> Result<(), ManifestError> {
+    let mut scanner = YamlScanner::new(text)?;
+    loop {
+        match scanner.next()? {
+            unsafe_yaml::YAML_TAG_TOKEN | unsafe_yaml::YAML_TAG_DIRECTIVE_TOKEN => {
+                return Err(ManifestError::Parse);
+            }
+            unsafe_yaml::YAML_STREAM_END_TOKEN => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+struct YamlScanner<'a> {
+    // set_input_string stores a self-pointer; the initialized parser must remain
+    // at one heap address until yaml_parser_delete. Moving this Box is safe.
+    parser: Box<MaybeUninit<unsafe_yaml::yaml_parser_t>>,
+    _input: &'a str,
+}
+impl<'a> YamlScanner<'a> {
+    fn new(input: &'a str) -> Result<Self, ManifestError> {
+        let mut parser = Box::new(MaybeUninit::uninit());
+        // SAFETY: Box provides aligned writable storage at a stable address.
+        if unsafe { unsafe_yaml::yaml_parser_initialize(parser.as_mut_ptr()) }.fail {
+            return Err(ManifestError::Parse);
+        }
+        let mut scanner = Self {
+            parser,
+            _input: input,
+        };
+        // SAFETY: initialization succeeded, the parser stays pinned in its Box,
+        // and _input keeps the immutable UTF-8 byte slice alive through deletion.
+        unsafe {
+            unsafe_yaml::yaml_parser_set_input_string(
+                scanner.parser.as_mut_ptr(),
+                input.as_ptr(),
+                input.len() as u64,
+            );
+        }
+        Ok(scanner)
+    }
+
+    fn next(&mut self) -> Result<unsafe_yaml::yaml_token_type_t, ManifestError> {
+        let mut token = MaybeUninit::uninit();
+        // SAFETY: the parser is initialized, has live input and exclusive access;
+        // the token pointer provides aligned writable storage for this scan.
+        if unsafe { unsafe_yaml::yaml_parser_scan(self.parser.as_mut_ptr(), token.as_mut_ptr()) }
+            .fail
+        {
+            return Err(ManifestError::Parse);
+        }
+        // SAFETY: a successful scan initialized the complete token. Extract its
+        // Copy discriminant and free all token-owned allocations exactly once.
+        let mut token = unsafe { token.assume_init() };
+        let kind = token.type_;
+        unsafe { unsafe_yaml::yaml_token_delete(&mut token) };
+        Ok(kind)
+    }
+}
+impl Drop for YamlScanner<'_> {
+    fn drop(&mut self) {
+        // SAFETY: only successful initialization constructs Self; parser storage
+        // and borrowed input are still live, and this is its sole deletion.
+        unsafe { unsafe_yaml::yaml_parser_delete(self.parser.as_mut_ptr()) };
+    }
 }
 
 struct ParseBudget {

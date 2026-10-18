@@ -64,36 +64,7 @@ pub fn inspect_local(home: &Path) -> Vec<Check> {
             return checks;
         }
     };
-    for (name, required) in [
-        ("deno", true),
-        ("node", false),
-        ("uv", false),
-        ("python", false),
-    ] {
-        let configured = config.runtimes.get(name).filter(|s| !s.is_empty());
-        let path = match configured {
-            Some(path) => executable(Path::new(path)).then(|| PathBuf::from(path)),
-            None => find_executable(name),
-        };
-        let usable = path
-            .as_ref()
-            .is_some_and(|path| succeeds(Command::new(path).arg("--version")));
-        checks.push(check(
-            name,
-            if usable {
-                Status::Ok
-            } else if required {
-                Status::Fail
-            } else {
-                Status::Warn
-            },
-            if usable {
-                "executável disponível"
-            } else {
-                "ausente ou não executável; configure [runtimes]"
-            },
-        ));
-    }
+    checks.extend(runtime_checks(find_executable));
     checks.push(sandbox_check());
     for (name, port) in [
         ("porta shell", config.server.listen.port()),
@@ -141,6 +112,31 @@ pub fn inspect_local(home: &Path) -> Vec<Check> {
     checks
 }
 
+fn runtime_checks(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<Check> {
+    [("node", true), ("uv", false), ("python", false)]
+        .into_iter()
+        .map(|(name, required)| {
+            let usable = resolve(name)
+                .is_some_and(|path| succeeds(Command::new(path).arg("--version")));
+            check(
+                name,
+                if usable {
+                    Status::Ok
+                } else if required {
+                    Status::Fail
+                } else {
+                    Status::Warn
+                },
+                if usable {
+                    "executável de desenvolvimento disponível; runtimes gerenciados pendentes (M0.9)"
+                } else {
+                    "ausente ou não executável; prepare o toolbx de desenvolvimento (M0.9 instalará runtimes gerenciados)"
+                },
+            )
+        })
+        .collect()
+}
+
 fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|metadata| {
         use std::os::unix::fs::PermissionsExt;
@@ -149,6 +145,9 @@ fn executable(path: &Path) -> bool {
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
+    if name == "node" {
+        return executable(Path::new("/usr/bin/node")).then(|| "/usr/bin/node".into());
+    }
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
             .map(|dir| dir.join(name))
@@ -326,6 +325,14 @@ fn resolve_nat64_aaaa() -> std::io::Result<Vec<std::net::Ipv6Addr>> {
 mod nat64_tests {
     use super::*;
     use crate::proxy::nat64::Nat64Prefixes;
+    #[test]
+    fn missing_node_is_required_and_optional_python_runtimes_warn() {
+        let report = runtime_checks(|_| None);
+        assert_eq!(report.len(), 3);
+        assert_eq!(report[0].name, "node");
+        assert_eq!(report[0].status, Status::Fail);
+        assert!(report[1..].iter().all(|entry| entry.status == Status::Warn));
+    }
     #[test]
     fn injected_dns_only_suggests_unknown_prefix_and_preserves_policy() {
         let policy = Nat64Prefixes::new(&["2001:db8:1::/96".into()]).unwrap();

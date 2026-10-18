@@ -97,7 +97,16 @@ jobs:
         # Unit tests, protocols, proxies and inert local bundles need no userns.
         run: >-
           cargo test --locked --offline --lib
-          --test bootstrap --test budget --test kernel --test local_checker
-          --test manifest --test model_tls --test models --test proposals
+          --test bootstrap --test budget --test extension_control
+          --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
+          --test manifest --test migrations --test model_tls --test models --test proposals
+          --test promotion --test proposal_recovery
           --test proxy --test store
-          -- --skip doctor_reports_missing_runtime_without_modifying_config
+          -- --skip doctor_reports_development_runtime_status_without_modifying_config
+
+      - name: Test dependency planning and unsupported runtime refusal
+        # Actual npm/uv execution currently requires the development Toolbx.
+        # These cases exercise validation and refusal, without faking its marker.
+        run: |
+          cargo test --locked --offline --test dependencies plans_require_lockfiles_and_reject_ambiguous_or_malformed_metadata
+          cargo test --locked --offline --test dependencies dependency_execution_is_refused_outside_the_actual_development_toolbx

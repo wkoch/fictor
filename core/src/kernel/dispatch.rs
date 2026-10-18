@@ -203,7 +203,10 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
                 ulid(after)?;
             }
             let head = view_head(state, &p.session_id).await?;
-            let path = state.store.event_path_at(head, p.after_id, p.limit).await?;
+            let path = state
+                .store
+                .event_path_at_bounded(head, p.after_id, p.limit, MAX_MESSAGE_BYTES)
+                .await?;
             Ok(json!({"events":path.events,"truncated":path.truncated}))
         }
         "events.query" => {
@@ -226,9 +229,15 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
             };
             let events = if let Some(session) = requested {
                 let head = view_head(state, &session).await?;
-                state.store.query_events_at(head, query).await?
+                state
+                    .store
+                    .query_events_at_bounded(head, query, MAX_MESSAGE_BYTES)
+                    .await?
             } else {
-                state.store.query_events(query).await?
+                state
+                    .store
+                    .query_events_bounded(query, MAX_MESSAGE_BYTES)
+                    .await?
             };
             Ok(json!({"events":events}))
         }
@@ -274,10 +283,11 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
             limit(p.limit, 10000)?;
             let items = state
                 .store
-                .kv_list(
+                .kv_list_bounded(
                     state.identity.namespace(),
                     p.prefix.unwrap_or_default(),
                     p.limit.unwrap_or(1000),
+                    MAX_MESSAGE_BYTES,
                 )
                 .await?
                 .into_iter()
@@ -301,12 +311,50 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
         }
         "blobs.get" => {
             let p: Hash = params(value)?;
-            let bytes = state.store.get_blob(p.hash).await?;
+            let bytes = state
+                .store
+                .get_blob_bounded(p.hash, MAX_MESSAGE_BYTES / 4 * 3)
+                .await?;
             // Avoid constructing a base64 string that cannot fit the wire limit.
             if bytes.len().div_ceil(3) * 4 > MAX_MESSAGE_BYTES {
                 return Err(RpcError::TOO_LARGE);
             }
             Ok(json!({"base64":STANDARD.encode(&bytes),"size":bytes.len()}))
+        }
+        "tools.list" => {
+            let p: SessionId = params(value)?;
+            session_id(&p.session_id)?;
+            if state.identity.session_id.as_deref() != Some(&p.session_id) {
+                return Err(RpcError::SCOPE);
+            }
+            state.store.session(p.session_id).await?;
+            let home = state.home.clone();
+            let tools =
+                tokio::task::spawn_blocking(move || crate::gateway::registry::model_tools(&home))
+                    .await
+                    .map_err(|_| RpcError::INTERNAL)?
+                    .map_err(|error| match error {
+                        crate::gateway::registry::RegistryError::TooLarge => RpcError::TOO_LARGE,
+                        _ => RpcError::INTERNAL,
+                    })?;
+            Ok(json!({"tools":tools}))
+        }
+        "catalog.list" => {
+            let p: SessionId = params(value)?;
+            session_id(&p.session_id)?;
+            if state.identity.session_id.as_deref() != Some(&p.session_id) {
+                return Err(RpcError::SCOPE);
+            }
+            state.store.session(p.session_id).await?;
+            let home = state.home.clone();
+            let catalog = tokio::task::spawn_blocking(move || super::catalog::list(&home))
+                .await
+                .map_err(|_| RpcError::INTERNAL)?
+                .map_err(|error| match error {
+                    super::catalog::CatalogError::TooLarge => RpcError::TOO_LARGE,
+                    _ => RpcError::INTERNAL,
+                })?;
+            serialize(catalog)
         }
         "config.get" => {
             let p: Section = params(value)?;
@@ -325,16 +373,10 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
                 ),
                 "instructions" => {
                     let path = state.home.join("AGENTS.md");
-                    let text = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+                    let text = tokio::task::spawn_blocking(move || read_instructions(&path))
                         .await
-                        .map_err(|_| RpcError::INTERNAL)?;
-                    match text {
-                        Ok(text) => Ok(json!({"instructions":text})),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            Ok(json!({"instructions":null}))
-                        }
-                        Err(_) => Err(RpcError::INTERNAL),
-                    }
+                        .map_err(|_| RpcError::INTERNAL)??;
+                    Ok(json!({"instructions":text}))
                 }
                 _ => Err(RpcError::INVALID),
             }
@@ -344,6 +386,28 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
         _ => Err(RpcError::METHOD),
     }
 }
+fn read_instructions(path: &std::path::Path) -> Result<Option<String>, RpcError> {
+    use std::io::Read;
+    let file = match crate::config::open_regular_config_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(RpcError::INTERNAL),
+    };
+    if file.metadata().map_err(|_| RpcError::INTERNAL)?.len() > MAX_MESSAGE_BYTES as u64 {
+        return Err(RpcError::TOO_LARGE);
+    }
+    // Even if the file grows after metadata, never load an unbounded local file
+    // on behalf of an extension. The transport also limits escaped JSON bytes.
+    let mut text = String::new();
+    file.take(MAX_MESSAGE_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| RpcError::INTERNAL)?;
+    if text.len() > MAX_MESSAGE_BYTES {
+        return Err(RpcError::TOO_LARGE);
+    }
+    Ok(Some(text))
+}
+
 fn serialize(value: impl serde::Serialize) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|_| RpcError::INTERNAL)
 }

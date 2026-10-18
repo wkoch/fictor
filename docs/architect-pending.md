@@ -1,6 +1,35 @@
 # Pendências para o arquiteto
 
-Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
+ARQ-027 aberta em 2026-10-18. ARQ-020–026 resolvidas pelos ADRs 036–042.
+Resolução do spec não significa implementação concluída.
+
+## ARQ-027 — Correlação de IDs no limite de mensagem do Kernel Protocol
+
+- **Status: aberta.**
+- **Referência:** `spec/03-kernel-protocol.md`, transporte (JSON-RPC 2.0 e mensagem
+  máxima de 16 MiB); [JSON-RPC 2.0, seções 4 e 5](https://www.jsonrpc.org/specification),
+  consultado em 2026-10-18; `core/src/kernel/transport.rs`, `write_value`.
+- **Dúvida:** o limite atual admite uma requisição cujo ID ocupa quase todo o
+  frame, mas o envelope de erro com esse mesmo ID pode exceder 16 MiB. JSON-RPC
+  exige repetir o ID conhecido. No socket real, após `kernel.hello` válido,
+  `{"jsonrpc":"2.0","id":"<x repetido 16.777.177 vezes>","method":"x"}`
+  mede 16.777.215 bytes; com LF, cabe exatamente em 16.777.216 bytes. O erro
+  `METHOD_NOT_FOUND` correlacionado excede o limite em 39 bytes, e o fallback
+  `TOO_LARGE` correlacionado em 32 bytes, antes do LF. `write_value` então envia
+  o fallback de 74 bytes com `id: null`, embora o ID original tenha sido detectado.
+  Não é possível preservar o ID e o erro obrigatório dentro do limite para todos
+  os IDs hoje admitidos.
+- **Necessário:** ADR definindo um limite/formato de ID que reserve espaço para
+  o envelope de erro, ou a semântica de falha de transporte quando a resposta
+  correlacionada não couber. Definir validação antes do dispatch, resposta ou
+  encerramento permitido e o tratamento de efeitos já admitidos. A decisão deve
+  preservar o limite de 16 MiB e esclarecer a compatibilidade com JSON-RPC.
+- **Impacto:** o cliente pode continuar aguardando uma requisição que recebeu
+  erro com outro ID. O comportamento foi reproduzido com credenciais falsas e
+  socket local no Toolbx Fedora 44/Bazzite; a asserção de correlação falhou.
+  Não foi criado teto de ID, aumentado o frame nem alterado o protocolo sem ADR.
+  O teste temporário de investigação foi removido; transcript em
+  `.fictor/logs/kernel-large-id-before-transcript.log`.
 
 ## ARQ-026 — Destinos de links dos arquivos de controle do core
 
@@ -56,6 +85,18 @@ Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não s
 ## ARQ-019 — Recebimento inválido antes da identidade do manifest
 
 - **Status: resolvida em 2026-10-18 — [ADR-035](../spec/11-decisions.md#adr-035--propostas-duráveis-antes-da-identidade-resolve-arq-019).**
+- **Referência:** `spec/06-lifecycle.md`, recebimento e estados da proposta;
+  `spec/schemas/0001_init.sql`, tabela `proposals`; `core/src/store/proposals.rs`.
+- **Dúvida:** limites, symlinks, nomes inválidos e YAML inválido podem ser
+  detectados antes de haver `id`/`version` válidos. O pipeline exige uma proposta
+  `failed`, mas o schema exige identidade não nula e não define uma representação
+  para recebimentos sem identidade.
+- **Necessário:** ADR com a representação persistida (identidade opcional ou
+  registro separado), eventual migração, motivos/metadados mínimos e recuperação
+  de diretórios `.receipt-*` após interrupção do processo.
+- **Impacto:** esses recebimentos são recusados sem execução e a cópia temporária
+  é removida, mas não geram proposta durável. Nenhuma identidade sentinela foi
+  inventada. Falhas após identificar o bundle continuam registradas e auditadas.
 - **Resolução:** proposta registrada antes de abrir a origem; `ext_id` e `version`
   nulos em conjunto até validar o manifest; migração 0003 sem alterar migrações
   anteriores. Falhas têm motivo estável e evento atômico. Recuperação encerra
@@ -64,14 +105,10 @@ Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não s
   `spec/03-kernel-protocol.md`; critérios 35–37 da Fase 0.
 - **Entrega ao implementador:** copiar/aplicar a migração especificada, adaptar
   leituras e transições de propostas, recebimento, auditoria, recuperação e testes.
-  O código desses itens permanece pendente em M0.5.
+  Recebimento, migração e recuperação foram implementados em M0.5; o diagnóstico
+  no Toolbx/Bazzite consta em `verification.md`. O gate no COSMIC Atomic continua
+  pendente; resolução arquitetural e testes locais não constituem release.
 
-Registradas em 2026-10-17 durante a implementação. As pendências ARQ-001–018
-foram resolvidas pelo arquiteto nos ADRs 013–029. Os ADRs 030/031 definem
-Linux x86-64, Fedora COSMIC Atomic e a prioridade da v0.1 autossuficiente.
-As descrições de dúvida, necessidade e impacto das ARQ-001–011 ficam preservadas
-como histórico do registro original. Resolução arquitetural não
-significa implementação concluída; o progresso consta em `docs/implementation.md`.
 
 ## ARQ-001 — Corte e gate da V1.0
 

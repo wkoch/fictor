@@ -1,4 +1,4 @@
-use super::{Store, StoreError, now_ms};
+use super::{Store, StoreError, now_ms, read_budget::ReadBudget};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -218,7 +218,13 @@ impl Store {
         self.read(move |db| {
             let session = super::sessions::get(db, &session_id)?;
             let limit = limit.unwrap_or(2000).clamp(1, 10000);
-            path(db, session.head_id.as_deref(), after_id.as_deref(), limit)
+            path(
+                db,
+                session.head_id.as_deref(),
+                after_id.as_deref(),
+                limit,
+                None,
+            )
         })
         .await
     }
@@ -236,6 +242,30 @@ impl Store {
                 head.as_deref(),
                 after.as_deref(),
                 limit.unwrap_or(2000).clamp(1, 10000),
+                None,
+            )
+        })
+        .await
+    }
+
+    /// Kernel-only read budget; authorization of the head stays with the caller.
+    pub(crate) async fn event_path_at_bounded(
+        &self,
+        head: Option<String>,
+        after: Option<String>,
+        limit: Option<usize>,
+        response_limit: usize,
+    ) -> Result<EventPath, StoreError> {
+        self.read(move |db| {
+            // Count the actual bool after discovering truncation, so a true
+            // result does not lose one byte to a false worst-case estimate.
+            let budget = ReadBudget::new(response_limit, b"{\"events\":[],\"truncated\":}".len())?;
+            path(
+                db,
+                head.as_deref(),
+                after.as_deref(),
+                limit.unwrap_or(2000).clamp(1, 10000),
+                Some(budget),
             )
         })
         .await
@@ -259,7 +289,7 @@ impl Store {
                 .as_deref()
                 .map(|id| super::sessions::get(db, id).map(|session| session.head_id))
                 .transpose()?;
-            query_at(db, query, head)
+            query_at(db, query, head, None)
         })
         .await
     }
@@ -269,7 +299,39 @@ impl Store {
         head: Option<String>,
         query: EventQuery,
     ) -> Result<Vec<Event>, StoreError> {
-        self.read(move |db| query_at(db, query, Some(head))).await
+        self.read(move |db| query_at(db, query, Some(head), None))
+            .await
+    }
+
+    pub(crate) async fn query_events_bounded(
+        &self,
+        query: EventQuery,
+        response_limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.read(move |db| {
+            let head = query
+                .session_id
+                .as_deref()
+                .map(|id| super::sessions::get(db, id).map(|session| session.head_id))
+                .transpose()?;
+            let budget = ReadBudget::new(response_limit, b"{\"events\":[]}".len())?;
+            query_at(db, query, head, Some(budget))
+        })
+        .await
+    }
+
+    /// Kernel-only read budget; None remains an empty lineage, never global.
+    pub(crate) async fn query_events_at_bounded(
+        &self,
+        head: Option<String>,
+        query: EventQuery,
+        response_limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.read(move |db| {
+            let budget = ReadBudget::new(response_limit, b"{\"events\":[]}".len())?;
+            query_at(db, query, Some(head), Some(budget))
+        })
+        .await
     }
 }
 
@@ -277,6 +339,7 @@ fn query_at(
     db: &Connection,
     query: EventQuery,
     head: Option<Option<String>>,
+    mut budget: Option<ReadBudget>,
 ) -> Result<Vec<Event>, StoreError> {
     let mut sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE 1=1");
     let mut values = Vec::<rusqlite::types::Value>::new();
@@ -306,9 +369,16 @@ fn query_at(
     sql.push_str(" ORDER BY seq DESC LIMIT ?");
     values.push((query.limit.unwrap_or(100).clamp(1, 500) as i64).into());
     let mut statement = db.prepare(&sql)?;
-    Ok(statement
-        .query_map(rusqlite::params_from_iter(values), from_row)?
-        .collect::<Result<Vec<_>, _>>()?)
+    let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        let event = from_row(row)?;
+        if let Some(budget) = budget.as_mut() {
+            budget.item(&event, !events.is_empty())?;
+        }
+        events.push(event);
+    }
+    Ok(events)
 }
 
 pub(super) fn insert(transaction: &Transaction<'_>, event: &Event) -> Result<(), StoreError> {
@@ -336,6 +406,7 @@ fn path(
     head: Option<&str>,
     after: Option<&str>,
     limit: usize,
+    mut budget: Option<ReadBudget>,
 ) -> Result<EventPath, StoreError> {
     // Walk only IDs; read bounded payloads even when a session has a very long history.
     let lineage = "WITH RECURSIVE lineage(id,parent_id,depth) AS (SELECT id,parent_id,0 FROM events WHERE id=?1 UNION ALL SELECT e.id,e.parent_id,l.depth+1 FROM events e JOIN lineage l ON e.id=l.parent_id)";
@@ -355,11 +426,23 @@ fn path(
         .collect::<Vec<_>>()
         .join(", ");
     let mut statement = db.prepare(&format!("{lineage} SELECT {columns} FROM lineage l JOIN events e ON e.id=l.id WHERE (?2 IS NULL OR l.depth < (SELECT depth FROM lineage WHERE id=?2)) ORDER BY l.depth LIMIT ?3"))?;
-    let mut events = statement
-        .query_map(params![head, after, (limit + 1) as i64], from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    let truncated = events.len() > limit;
-    events.truncate(limit);
+    let mut rows = statement.query(params![head, after, (limit + 1) as i64])?;
+    let mut events = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if events.len() == limit {
+            truncated = true;
+            break;
+        }
+        let event = from_row(row)?;
+        if let Some(budget) = budget.as_mut() {
+            budget.item(&event, !events.is_empty())?;
+        }
+        events.push(event);
+    }
+    if let Some(budget) = budget.as_mut() {
+        budget.value(&truncated)?;
+    }
     events.reverse();
     Ok(EventPath { events, truncated })
 }
@@ -421,5 +504,111 @@ fn searchable_text(kind: &str, payload: &Value) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod read_limit_tests {
+    use super::*;
+    use crate::{config::Mode, store::NewSession};
+
+    #[tokio::test]
+    async fn event_budgets_match_exact_serialized_wrappers_and_truncation_bool() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("h");
+        let workspace = root.path().join("w");
+        std::fs::create_dir(&workspace).unwrap();
+        crate::initialize(&home).await.unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let session = store
+            .create_session(NewSession {
+                title: "boundaries".into(),
+                workspace,
+                workspace_trust: Trust::Trusted,
+                harness: "test".into(),
+                mode: Mode::Default,
+                model: None,
+            })
+            .await
+            .unwrap();
+        for index in 0..2 {
+            store
+                .append(AppendEvent {
+                    session_id: session.id.clone(),
+                    parent_id: None,
+                    kind: "x.test.note".into(),
+                    actor: "core".into(),
+                    payload: json!({"index":index,"text":"\"\n\\\u{1}"}),
+                    blob_refs: vec![],
+                    provenance: Provenance::core(),
+                })
+                .await
+                .unwrap();
+        }
+        let head = store.session(session.id).await.unwrap().head_id;
+        for head in [head, None] {
+            let expected = store
+                .event_path_at(head.clone(), None, Some(1))
+                .await
+                .unwrap();
+            let bytes = serde_json::to_vec(
+                &json!({"events":expected.events,"truncated":expected.truncated}),
+            )
+            .unwrap()
+            .len();
+            let actual = store
+                .event_path_at_bounded(head.clone(), None, Some(1), bytes)
+                .await
+                .unwrap();
+            assert_eq!(actual.truncated, expected.truncated);
+            assert_eq!(actual.events.len(), expected.events.len());
+            assert!(matches!(
+                store
+                    .event_path_at_bounded(head.clone(), None, Some(1), bytes - 1)
+                    .await,
+                Err(StoreError::TooLarge)
+            ));
+            let expected = store
+                .query_events_at(
+                    head.clone(),
+                    EventQuery {
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let bytes = serde_json::to_vec(&json!({"events":expected}))
+                .unwrap()
+                .len();
+            assert_eq!(
+                store
+                    .query_events_at_bounded(
+                        head.clone(),
+                        EventQuery {
+                            limit: Some(1),
+                            ..Default::default()
+                        },
+                        bytes
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                expected.len()
+            );
+            assert!(matches!(
+                store
+                    .query_events_at_bounded(
+                        head,
+                        EventQuery {
+                            limit: Some(1),
+                            ..Default::default()
+                        },
+                        bytes - 1
+                    )
+                    .await,
+                Err(StoreError::TooLarge)
+            ));
+        }
     }
 }

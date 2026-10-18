@@ -144,7 +144,7 @@ pub(super) fn arguments(
         let value = match key.as_str() {
             "HOME" => OsString::from("/tmp/home"),
             "TMPDIR" => OsString::from("/tmp"),
-            "DENO_DIR" | "FICTOR_WORKSPACE" => translate_path(value.as_ref(), &context.tmp_dir),
+            "FICTOR_WORKSPACE" => translate_path(value.as_ref(), &context.tmp_dir),
             "PATH" | "PYTHONPATH" => {
                 std::env::join_paths(std::env::split_paths(value).map(|path| {
                     std::path::PathBuf::from(translate_path(path.as_os_str(), &context.tmp_dir))
@@ -209,23 +209,12 @@ fn translate_argument(value: &std::ffi::OsStr, temporary: &Path) -> OsString {
         // Only runtime path flags are rewritten; arbitrary extension arguments
         // may contain opaque data that happens to resemble a host path.
         if let Some((flag, paths)) = value.split_once('=')
-            && matches!(
-                flag,
-                "--allow-read" | "--allow-write" | "--deny-read" | "--deny-write"
-            )
+            && matches!(flag, "--allow-fs-read" | "--allow-fs-write")
         {
-            let paths: Vec<_> = paths
-                .split(',')
-                .map(|path| translate_path(path.as_ref(), temporary))
-                .collect();
             let mut result = OsString::from(flag);
             result.push("=");
-            for (index, path) in paths.iter().enumerate() {
-                if index > 0 {
-                    result.push(",");
-                }
-                result.push(path);
-            }
+            // Node grants one path per repeated flag; a comma is a literal filename.
+            result.push(translate_path(paths.as_ref(), temporary));
             return result;
         }
     }
@@ -234,66 +223,28 @@ fn translate_argument(value: &std::ffi::OsStr, temporary: &Path) -> OsString {
 
 fn runtime_arguments(sandbox: &ValidatedSandbox, arguments: &[OsString]) -> Vec<OsString> {
     let context = &sandbox.context;
-    let kernel = sandbox.profile.kernel_socket.as_deref();
-    // M0.5's supervisor constructs exact runtime-kind-specific permissions. This
-    // internal launcher recognizes the standard Deno executable/run shape only.
-    let deno = context
+    // The supervisor supplies permissions. Only translate Node's trusted runtime
+    // flags before `--`; extension arguments remain opaque, even if flag-shaped.
+    let node = context
         .runtime
         .file_name()
-        .is_some_and(|name| name == "deno")
-        && arguments.first().is_some_and(|argument| argument == "run");
+        // Fedora's canonical executable is named node-<major>.
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "node" || name.starts_with("node-"))
+        && arguments
+            .first()
+            .is_some_and(|argument| argument == "--permission");
     let mut result = Vec::new();
-    let mut permissions = deno;
-    let mut network = Vec::<String>::new();
-    let mut unrestricted_network = false;
-    for (index, argument) in arguments.iter().enumerate() {
-        let value = argument.to_str();
-        if value == Some("--") {
+    let mut permissions = node;
+    for argument in arguments {
+        if argument == "--" {
             permissions = false;
         }
-        if permissions && index > 0 && !value.is_some_and(|value| value.starts_with('-')) {
-            permissions = false;
-        }
-        if permissions && let Some(value) = value {
-            if value == "--allow-net" {
-                unrestricted_network = true;
-            } else if let Some(hosts) = value.strip_prefix("--allow-net=") {
-                network.extend(
-                    hosts
-                        .split(',')
-                        .filter(|host| !host.is_empty())
-                        .map(str::to_owned),
-                );
-                continue;
-            }
-            if let Some((flag, paths)) = value.split_once('=')
-                && matches!(flag, "--allow-read" | "--allow-write")
-            {
-                let paths: Vec<_> = paths
-                    .split(',')
-                    .filter(|path| {
-                        *path != "/fx/kernel.sock"
-                            && !kernel.is_some_and(|socket| Path::new(path) == socket)
-                    })
-                    .collect();
-                // An empty Deno allow flag could grant everything; omit it instead.
-                if !paths.is_empty() {
-                    let flag = format!("{flag}={}", paths.join(","));
-                    result.push(translate_argument(flag.as_ref(), &context.tmp_dir));
-                }
-                continue;
-            }
-        }
-        result.push(translate_argument(argument, &context.tmp_dir));
-    }
-    if deno && !unrestricted_network {
-        if kernel.is_some() && !network.iter().any(|host| host == "127.0.0.1:3129") {
-            network.push("127.0.0.1:3129".into());
-        }
-        if !network.is_empty() {
-            // Deno permissions must precede the entrypoint and its opaque arguments.
-            result.insert(1, format!("--allow-net={}", network.join(",")).into());
-        }
+        result.push(if permissions {
+            translate_argument(argument, &context.tmp_dir)
+        } else {
+            argument.clone()
+        });
     }
     result
 }
@@ -373,7 +324,6 @@ mod tests {
                 env: BTreeMap::from([
                     ("HOME".into(), "/host/tmp/instance/home".into()),
                     ("TMPDIR".into(), "/host/tmp/instance".into()),
-                    ("DENO_DIR".into(), "/host/tmp/instance/deno".into()),
                     ("TOKEN".into(), "opaque/host/tmp/instance/value".into()),
                     (
                         "FICTOR_KERNEL_SOCKET".into(),
@@ -389,7 +339,7 @@ mod tests {
                 bundle_root: "/data/fictor/extensions/store/test/1-hash".into(),
                 ext_data: "/data/fictor/extensions/data/test".into(),
                 tmp_dir: "/host/tmp/instance".into(),
-                runtime: "/opt/runtime/deno".into(),
+                runtime: "/opt/runtime/node".into(),
                 runtime_root: "/opt/runtime".into(),
                 fictor_exe: "/opt/fictor".into(),
                 home_ro_files: vec!["/home/user/AGENTS.md".into()],
@@ -436,7 +386,7 @@ mod tests {
                 "/fx/fictor",
                 "__sandbox-init",
                 "--",
-                "/opt/runtime/deno",
+                "/opt/runtime/node",
                 "run"
             ]
         ));
@@ -452,15 +402,16 @@ mod tests {
         let args = arguments(
             &sandbox,
             &[
-                "run".into(),
-                "--allow-read=/work/input,/host/tmp/instance,/data/fictor/run/k/test.sock".into(),
+                "--permission".into(),
+                "--allow-fs-read=/work/input".into(),
+                "--allow-fs-read=/host/tmp/instance".into(),
+                "--".into(),
                 "server.ts".into(),
             ],
         )
         .unwrap();
         assert!(has(&args, &["--setenv", "HOME", "/tmp/home"]));
         assert!(has(&args, &["--setenv", "TMPDIR", "/tmp"]));
-        assert!(has(&args, &["--setenv", "DENO_DIR", "/tmp/deno"]));
         assert!(has(
             &args,
             &["--setenv", "FICTOR_KERNEL_URL", "tcp://127.0.0.1:3129"]
@@ -470,10 +421,7 @@ mod tests {
             &["--setenv", "TOKEN", "opaque/host/tmp/instance/value"]
         ));
         assert!(has(&args, &["--chdir", "/tmp/home"]));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--allow-read=/work/input,/tmp")
-        );
+        assert!(args.iter().any(|arg| arg == "--allow-fs-read=/tmp"));
         assert_eq!(
             translate_path(
                 "/host/tmp/instance-other".as_ref(),
@@ -510,15 +458,18 @@ mod tests {
     }
 
     #[test]
-    fn deno_uses_kernel_network_permission_without_socket_filesystem_grants() {
+    fn node_translates_each_permission_path_and_preserves_opaque_arguments() {
         let mut sandbox = fixture();
+        sandbox.context.runtime = "/usr/bin/node-24".into();
         let command: Vec<OsString> = [
-            "run",
-            "--allow-net=127.0.0.1:3128,example.test",
-            "--allow-read=/data/fictor/run/k/test.sock",
-            "--allow-write=/fx/kernel.sock,/work/output",
+            "--permission",
+            "--allow-fs-read=/host/tmp/instance/a,b",
+            "--allow-fs-read=/work/input",
+            "--allow-fs-write=/host/tmp/instance",
+            "--",
             "server.ts",
-            "--allow-read=/data/fictor/run/k/test.sock",
+            "--allow-fs-read=/host/tmp/instance/opaque",
+            "/host/tmp/instance/opaque",
         ]
         .map(Into::into)
         .to_vec();
@@ -526,40 +477,22 @@ mod tests {
         assert!(has(
             &arguments,
             &[
-                "run",
-                "--allow-net=127.0.0.1:3128,example.test,127.0.0.1:3129"
+                "--permission",
+                "--allow-fs-read=/tmp/a,b",
+                "--allow-fs-read=/work/input",
+                "--allow-fs-write=/tmp",
             ]
         ));
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "--allow-write=/work/output")
-        );
         assert!(has(
             &arguments,
-            &["server.ts", "--allow-read=/data/fictor/run/k/test.sock"]
+            &[
+                "server.ts",
+                "--allow-fs-read=/host/tmp/instance/opaque",
+                "/host/tmp/instance/opaque"
+            ]
         ));
-        assert_eq!(
-            arguments
-                .iter()
-                .filter(|argument| *argument == "--allow-read=/data/fictor/run/k/test.sock")
-                .count(),
-            1
-        );
-        assert!(
-            !arguments
-                .iter()
-                .any(|argument| argument == "--allow-read=" || argument == "--allow-write=")
-        );
-        sandbox.profile.kernel_socket = None;
-        let absent = runtime_arguments(&sandbox, &["run".into(), "server.ts".into()]);
-        assert_eq!(
-            absent,
-            vec![OsString::from("run"), OsString::from("server.ts")]
-        );
-        sandbox.context.runtime = "/opt/runtime/node".into();
-        let node = runtime_arguments(&sandbox, &["server.js".into()]);
-        assert_eq!(node, vec![OsString::from("server.js")]);
+        let absent = runtime_arguments(&sandbox, &["server.mjs".into()]);
+        assert_eq!(absent, vec![OsString::from("server.mjs")]);
     }
 
     #[test]

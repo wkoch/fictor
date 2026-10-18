@@ -32,7 +32,7 @@ async fn init_is_idempotent_and_preserves_configuration() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         db.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
@@ -127,6 +127,10 @@ async fn migrations_match_spec_and_protect_events() {
         include_str!("../migrations/0002_flow_budget.sql"),
         include_str!("../../spec/schemas/0002_flow_budget.sql")
     );
+    assert_eq!(
+        include_str!("../migrations/0003_proposal_receipts.sql"),
+        include_str!("../../spec/schemas/0003_proposal_receipts.sql")
+    );
     let dir = tempdir().unwrap();
     fictor::initialize(dir.path()).await.unwrap();
     let store = Store::open(dir.path()).await.unwrap();
@@ -141,6 +145,141 @@ async fn migrations_match_spec_and_protect_events() {
         Ok(())
     }).await.unwrap();
     store.shutdown().await.unwrap();
+}
+
+#[test]
+fn cli_receipt_failures_report_durable_id_and_safe_reason() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    let source = root.path().join("private-source");
+    fs::create_dir(&real).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("private.txt"), b"never-include-this-content").unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fictor"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &real)
+            .env("FICTOR_HOME", &home);
+        command
+    };
+    assert!(command().arg("init").output().unwrap().status.success());
+    let config = home.join("config.toml");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("backend = \"keyring\"", "backend = \"file\"");
+    fs::write(config, text).unwrap();
+    let output = command()
+        .args(["ext", "check"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let db = Connection::open(home.join("fictor.db")).unwrap();
+    let id: String = db
+        .query_row(
+            "SELECT id FROM proposals WHERE state='failed' AND ext_id IS NULL AND version IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains(&id));
+    assert!(error.contains("manifest:missing"));
+    assert!(!error.contains(source.to_str().unwrap()));
+    assert!(!error.contains("never-include-this-content"));
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM events WHERE kind IN ('ext.proposed','ext.failed')",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    drop(db);
+    assert!(command().arg("init").output().unwrap().status.success());
+    let db = Connection::open(home.join("fictor.db")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT id FROM proposals WHERE state='failed'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        id
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM events WHERE kind='ext.failed'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn cli_terminal_persistence_error_reports_id_without_claiming_audited_failure() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("core");
+    let real = root.path().join("user");
+    let source = root.path().join("source");
+    fs::create_dir(&real).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("copy.txt"), b"retain after failed commit").unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fictor"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &real)
+            .env("FICTOR_HOME", &home);
+        command
+    };
+    assert!(command().arg("init").output().unwrap().status.success());
+    let config = home.join("config.toml");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("backend = \"keyring\"", "backend = \"file\"");
+    fs::write(config, text).unwrap();
+    let db = Connection::open(home.join("fictor.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER refuse_failure BEFORE INSERT ON events WHEN new.kind='ext.failed' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+    drop(db);
+    let output = command()
+        .args(["ext", "check"])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let db = Connection::open(home.join("fictor.db")).unwrap();
+    let id: String = db
+        .query_row(
+            "SELECT id FROM proposals WHERE state='received'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains(&id));
+    assert!(error.contains("transição não confirmada"));
+    assert!(!error.contains("manifest:missing"));
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM events WHERE kind='ext.failed'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        home.join("extensions/quarantine")
+            .join(format!(".receipt-{id}"))
+            .join("copy.txt")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -184,23 +323,58 @@ fn cli_init_and_unsupported_install_are_honest() {
 }
 
 #[test]
-fn doctor_reports_missing_runtime_without_modifying_config() {
+fn doctor_reports_development_runtime_status_without_modifying_config() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("data");
     fs::create_dir(&home).unwrap();
     Config::create_if_missing(&home).unwrap();
-    let config =
-        DEFAULT_CONFIG.replace("deno = \"\"", "deno = \"/nonexistent/fictor-test-runtime\"");
-    fs::write(home.join("config.toml"), config).unwrap();
     let original = fs::read(home.join("config.toml")).unwrap();
     let report = fictor::doctor::inspect_local(&home);
     assert!(
         report
             .iter()
-            .any(|check| check.name == "deno" && check.status == fictor::doctor::Status::Fail)
+            .any(|check| check.name == "node" && check.detail.contains("M0.9"))
     );
     assert!(report.iter().any(|check| check.name == "keyring/segredos"));
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn runtime_sources_match_the_spec_and_reject_legacy_executable_overrides() {
+    use fictor::config::RuntimeSource;
+    let config = Config::parse(DEFAULT_CONFIG).unwrap();
+    assert_eq!(
+        config.runtimes["node"],
+        RuntimeSource::Nodejs {
+            channel: "lts".into()
+        }
+    );
+    assert!(matches!(
+        config.runtimes["uv"],
+        RuntimeSource::GithubRelease { .. }
+    ));
+    for replacement in [
+        "source = \"nodejs\"\nchannel = \"current\"",
+        "source = \"nodejs\"\nchannel = \"lts\"\nbin = \"/tmp/node\"",
+        "source = \"unknown\"\nchannel = \"lts\"",
+    ] {
+        assert!(
+            Config::parse(
+                &DEFAULT_CONFIG.replace("source = \"nodejs\"\nchannel = \"lts\"", replacement)
+            )
+            .is_err()
+        );
+    }
+    assert!(Config::parse(&DEFAULT_CONFIG.replace(
+        "[runtimes.node]                  # fonte; instalação/ativação gerenciada entra no M0.9\nsource = \"nodejs\"\nchannel = \"lts\"",
+        "[runtimes]\nnode = \"/tmp/node\""
+    )).is_err());
+    assert!(
+        Config::parse(&format!(
+            "{DEFAULT_CONFIG}\n[sandbox.toolchains]\nmounts = [\"~/.rustup\"]\n"
+        ))
+        .is_err()
+    );
 }
 
 #[test]

@@ -4,3 +4,4 @@
 
 # Workspace-local toolchain caches (ADR-031).
 .fictor/
+node_modules/

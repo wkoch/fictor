@@ -5,11 +5,20 @@ surface_port = 7351              # surfaces servidas em http://localhost:7351
 [paths]
 default_workspace = "~/Projetos"
 
-[runtimes]                       # vazio = procurar no PATH em `fictor doctor`
-deno = ""
-node = ""
-uv = ""
-python = ""
+[runtimes.node]                  # fonte; instalação/ativação gerenciada entra no M0.9
+source = "nodejs"
+channel = "lts"
+
+[runtimes.uv]
+source = "github-release"
+repo = "astral-sh/uv"
+asset = "uv-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "uv-x86_64-unknown-linux-gnu.tar.gz.sha256"
+bin = "uv-x86_64-unknown-linux-gnu/uv"
+
+[update]
+check = "weekly"
+core_source = "github:wkoch/fictor"
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
@@ -57,14 +66,9 @@ idle_timeout_min = 30
 [sandbox]
 home_ro_files = ["~/.gitconfig"] # arquivos do HOME real montados só leitura em instâncias de sessão
 
-[sandbox.toolchains]             # só para extensões com permissions.toolchains = true
-mounts = ["~/.rustup", "~/.cargo/bin", "~/.deno"]   # somente leitura; caminho sensível é recusado
-path = ["~/.cargo/bin", "~/.deno/bin"]              # prefixados ao PATH
-env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "${workspace}/.fictor/cargo" }   # sem nomes reservados
-
 [installer]
-registries = ["jsr.io", "registry.npmjs.org", "deno.land", "pypi.org", "files.pythonhosted.org"]
-trusted_packages = ["jsr:@std/*", "npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
+registries = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
+trusted_packages = ["npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
 
 [evals]                          # Fase 2
 judge_model = "main"             # chave de [ext.harness.models]
