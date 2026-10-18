@@ -164,6 +164,33 @@ impl ControlRegistry {
         .map_err(|_| MutationReason::IoError)?
     }
 
+    fn suspend_admissions(&self, ext_id: &str, promotion: bool) -> Result<(), MutationReason> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| MutationReason::InvalidState)?;
+        if !promotion && state.publishing.contains(ext_id) {
+            return Err(MutationReason::RecoveryRequired);
+        }
+        if promotion {
+            state.publishing.insert(ext_id.into());
+        }
+        state.blocked.insert(ext_id.into());
+        for instance in state
+            .live
+            .values()
+            .filter(|instance| instance.ext_id == ext_id)
+        {
+            if let Some(admission) = &instance.admission {
+                admission
+                    .suspend()
+                    .map_err(|_| MutationReason::InvalidState)?;
+            }
+        }
+        Ok(())
+    }
+
     fn publish_current(
         &self,
         ext_id: &str,
@@ -272,29 +299,7 @@ impl Drop for InstanceControlRegistration {
 }
 impl ControlPublication for ControlRegistry {
     fn block_admissions(&self, ext_id: &str) -> Result<(), MutationReason> {
-        self.0
-            .state
-            .lock()
-            .map_err(|_| MutationReason::InvalidState)?
-            .blocked
-            .insert(ext_id.into());
-        let state = self
-            .0
-            .state
-            .lock()
-            .map_err(|_| MutationReason::InvalidState)?;
-        for instance in state
-            .live
-            .values()
-            .filter(|instance| instance.ext_id == ext_id)
-        {
-            if let Some(admission) = &instance.admission {
-                admission
-                    .suspend()
-                    .map_err(|_| MutationReason::InvalidState)?;
-            }
-        }
-        Ok(())
+        self.suspend_admissions(ext_id, false)
     }
     fn publish_enabled<'a>(
         &'a self,
@@ -323,13 +328,7 @@ impl ControlPublication for ControlRegistry {
 
 impl PromotionPublication for ControlRegistry {
     fn block_before_lock(&self, ext_id: &str) -> Result<(), MutationReason> {
-        self.0
-            .state
-            .lock()
-            .map_err(|_| MutationReason::InvalidState)?
-            .publishing
-            .insert(ext_id.into());
-        self.block_admissions(ext_id)
+        self.suspend_admissions(ext_id, true)
     }
 
     fn publish_after_commit<'a>(

@@ -61,6 +61,10 @@ pub struct PromotionCoordinator {
     publication: Option<Arc<dyn PromotionPublication>>,
 }
 impl PromotionCoordinator {
+    pub(crate) fn using_publication(mut self, publication: Arc<dyn PromotionPublication>) -> Self {
+        self.publication = Some(publication);
+        self
+    }
     /// The caller shares the installer's existing file lease; acquiring a
     /// second independent flock would exclude its own checker/recovery worker.
     /// Only for exclusive offline work or boot before a runtime registry exists.
@@ -218,7 +222,10 @@ impl PromotionCoordinator {
                 }
                 return Ok((section, intent, false));
             }
-            coordinator.reconcile_locked().await?;
+            coordinator
+                .reconcile_locked()
+                .await
+                .map_err(|_| ActivationError::RecoveryConflict)?;
             coordinator.verify_owner()?;
             let proposal = coordinator.store.proposal(proposal_id.clone()).await?;
             let before = Lock::read_snapshot(coordinator.store.owner().home())

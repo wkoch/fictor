@@ -295,6 +295,75 @@ async fn a_review_that_does_not_fit_is_never_presented_or_authorized() {
     );
 }
 
+#[tokio::test]
+async fn legacy_approved_review_without_omitted_snapshot_stays_observable_without_invented_config()
+{
+    let fixture = Fixture::new().await;
+    let (id, checked) = fixture.checked("1.0.0").await;
+    let original = fixture
+        .store
+        .proposal(id.clone())
+        .await
+        .unwrap()
+        .checks
+        .unwrap();
+    let mut legacy = original.clone();
+    let detail = legacy
+        .iter_mut()
+        .find(|check| check.name == "permissions")
+        .unwrap()
+        .detail
+        .as_mut()
+        .unwrap();
+    let mut value: Value = serde_json::from_str(detail).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("omitted_home_ro_files");
+    value.as_object_mut().unwrap().remove("omitted_fs_complete");
+    *detail = serde_json::to_string(&value).unwrap();
+    async fn replace(fixture: &Fixture, id: &str, checks: Vec<fictor::store::ProposalCheck>) {
+        let id = id.to_owned();
+        fixture
+            .store
+            .write(move |db| {
+                db.execute(
+                    "UPDATE proposals SET checks=?1 WHERE id=?2",
+                    rusqlite::params![serde_json::to_string(&checks)?, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    replace(&fixture, &id, legacy.clone()).await;
+    assert_eq!(
+        fixture
+            .service
+            .status(id.clone(), None)
+            .await
+            .err()
+            .unwrap()
+            .reason,
+        MutationReason::IntegrityFailed
+    );
+    replace(&fixture, &id, original).await;
+    fixture.approve(&id, &checked).await;
+    replace(&fixture, &id, legacy).await;
+    let approved = fixture.service.status(id.clone(), None).await.unwrap();
+    assert_eq!(approved.state, ProposalState::Approved);
+    assert!(
+        approved.review.is_none() && approved.review_hash.is_none() && approved.nonce.is_none()
+    );
+    InstallStatus::parse(serde_json::to_value(approved).unwrap(), &id).unwrap();
+    fixture.service.promote(id.clone()).await.unwrap();
+    let promoted = fixture.wait(&id, ProposalState::Promoted).await;
+    assert!(
+        promoted.review.is_none() && promoted.review_hash.is_none() && promoted.nonce.is_none()
+    );
+    InstallStatus::parse(serde_json::to_value(promoted).unwrap(), &id).unwrap();
+}
+
 #[derive(Clone)]
 struct CliService {
     inner: InstallService,

@@ -729,9 +729,145 @@ impl PromotionPublication for CheckingPublisher {
                 .lock()
                 .unwrap()
                 .push(PublicationStep::Reconcile(intent.state));
+            if self.fail_publication.load(Ordering::SeqCst) {
+                return Err(MutationReason::IoError);
+            }
             self.registry.reconcile(intent).await
         })
     }
+}
+
+impl fictor::installer::controls::ControlPublication for CheckingPublisher {
+    fn block_admissions(&self, ext_id: &str) -> Result<(), MutationReason> {
+        fictor::installer::controls::ControlPublication::block_admissions(&self.registry, ext_id)
+    }
+    fn publish_enabled<'a>(
+        &'a self,
+        ext_id: &'a str,
+        key: &'a str,
+        enabled: bool,
+    ) -> fictor::installer::controls::PublicationFuture<'a> {
+        fictor::installer::controls::ControlPublication::publish_enabled(
+            &self.registry,
+            ext_id,
+            key,
+            enabled,
+        )
+    }
+    fn publish_reset<'a>(
+        &'a self,
+        selection: &'a fictor::crash_recovery::ResetCrashes,
+    ) -> fictor::installer::controls::PublicationFuture<'a> {
+        fictor::installer::controls::ControlPublication::publish_reset(&self.registry, selection)
+    }
+}
+
+fn controls(
+    f: &Fixture,
+    publisher: Arc<CheckingPublisher>,
+) -> fictor::installer::controls::AdminControlService {
+    let secrets = fictor::secrets::SecretStore::open_with_lease(
+        f.store.owner().clone(),
+        fictor::secrets::BackendKind::File,
+        Default::default(),
+    )
+    .unwrap();
+    // Deliberately supply an offline coordinator: the service must bind all
+    // reconciliation to its own live publication authority.
+    fictor::installer::controls::AdminControlService::new(
+        f.store.clone(),
+        secrets,
+        f.coordinator(),
+        Some(publisher),
+    )
+}
+
+#[tokio::test]
+async fn administrative_recovery_publishes_a_previous_promotion_through_the_same_registry() {
+    let f = Fixture::new().await;
+    let p = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let intent = f.prepared(&p).await;
+    materialize(&f.home, f.store.clone(), f.lease.clone(), p.id.clone())
+        .await
+        .unwrap();
+    f.publish_snapshot(&intent.after_lock);
+    let publisher = CheckingPublisher::new(&f, false);
+    let result = controls(&f, publisher.clone())
+        .call(
+            "ext.set_enabled",
+            &json!({"ext_id":"sample","enabled":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["changed"], false);
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [
+            PublicationStep::Block,
+            PublicationStep::Reconcile(PromotionState::Committed)
+        ]
+    );
+    assert!(publisher.registry.allow("sample").is_ok());
+    assert_eq!(f.count("ext.promoted").await, 1);
+}
+
+#[tokio::test]
+async fn failed_previous_publication_never_commits_the_requested_control_or_reset() {
+    let f = Fixture::new().await;
+    let p = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let intent = f.prepared(&p).await;
+    materialize(&f.home, f.store.clone(), f.lease.clone(), p.id.clone())
+        .await
+        .unwrap();
+    f.publish_snapshot(&intent.after_lock);
+    let publisher = CheckingPublisher::new(&f, true);
+    let service = controls(&f, publisher.clone());
+    let request = json!({"ext_id":"sample","enabled":false});
+    let error = service.call("ext.set_enabled", &request).await.unwrap_err();
+    assert_eq!(
+        error,
+        fictor::admin::AdminMutationError::none(MutationReason::IoError)
+    );
+    assert_eq!(
+        Lock::read_snapshot(&f.home).unwrap().unwrap(),
+        intent.after_lock.as_bytes()
+    );
+    assert_eq!(
+        f.store.proposal(p.id.clone()).await.unwrap().state,
+        ProposalState::Promoted
+    );
+    let head = f.store.session("sys".into()).await.unwrap().head_id;
+    for (method, params) in [
+        ("ext.set_enabled", request.clone()),
+        ("ext.reset_crashes", json!({"ext_id":"sample"})),
+    ] {
+        assert_eq!(
+            service.call(method, &params).await.unwrap_err(),
+            fictor::admin::AdminMutationError::none(MutationReason::RecoveryRequired)
+        );
+        assert_eq!(
+            Lock::read_snapshot(&f.home).unwrap().unwrap(),
+            intent.after_lock.as_bytes()
+        );
+        assert_eq!(f.store.session("sys".into()).await.unwrap().head_id, head);
+    }
+    publisher.fail_publication.store(false, Ordering::SeqCst);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    assert_eq!(
+        coordinator
+            .admit_promotion(p.id)
+            .await
+            .unwrap()
+            .operation_id,
+        intent.operation_id
+    );
+    assert_eq!(
+        service.call("ext.set_enabled", &request).await.unwrap()["changed"],
+        true
+    );
+    assert!(!Lock::load_required(&f.home).unwrap().extensions["sample"].enabled);
+    assert_eq!(f.count("ext.promoted").await, 1);
 }
 
 #[tokio::test]

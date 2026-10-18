@@ -334,7 +334,7 @@ impl InstallService {
         self.coordinator
             .reconcile_locked()
             .await
-            .map_err(activation_error)?;
+            .map_err(|_| Error::none(Reason::RecoveryRequired))?;
         drop(section);
         self.checker
             .prepare_local_before(Path::new(path), deadline)
@@ -380,8 +380,7 @@ impl InstallService {
             let built = if let Some(historical) = historical {
                 historical
                     .map_err(|_| integrity())
-                    .and_then(|lock| build_review(&snapshot.proposal, &lock, patch.clone()))
-                    .map(Some)
+                    .and_then(|lock| build_status_review(&snapshot.proposal, &lock, patch.clone()))
             } else {
                 let _section = tokio::time::timeout(
                     Duration::from_secs(5),
@@ -421,8 +420,7 @@ impl InstallService {
                             }
                         })
                     };
-                    lock.and_then(|lock| build_review(&snapshot.proposal, &lock, patch))
-                        .map(Some)
+                    lock.and_then(|lock| build_status_review(&snapshot.proposal, &lock, patch))
                 }
             };
             match built {
@@ -528,7 +526,7 @@ impl InstallService {
         self.coordinator
             .reconcile_locked()
             .await
-            .map_err(activation_error)?;
+            .map_err(|_| Error::none(Reason::RecoveryRequired))?;
         let snapshot = self
             .store
             .installation_snapshot(id.clone())
@@ -681,6 +679,32 @@ fn nonce_equal(expected: &str, provided: &str) -> bool {
     }
     different == 0
 }
+fn build_status_review(
+    proposal: &Proposal,
+    lock: &Lock,
+    patch: Overrides,
+) -> Result<Option<Review>, Error> {
+    if proposal.state != ProposalState::Checked {
+        // Older approvals did not capture the boot's omitted home files. Their
+        // state remains observable; current config cannot supply that history.
+        let detail = proposal
+            .checks
+            .as_deref()
+            .and_then(|checks| checks.iter().find(|check| check.name == "permissions"))
+            .and_then(|check| check.detail.as_deref());
+        let detail = detail
+            .map(|detail| crate::strict_json::parse(detail.as_bytes()).map_err(|_| integrity()))
+            .transpose()?;
+        if detail.as_ref().is_none_or(|detail| {
+            detail.get("omitted_home_ro_files").is_none()
+                || detail.get("omitted_fs_complete").is_none()
+        }) {
+            return Ok(None);
+        }
+    }
+    build_review(proposal, lock, patch).map(Some)
+}
+
 fn build_review(proposal: &Proposal, lock: &Lock, patch: Overrides) -> Result<Review, Error> {
     let id = proposal.ext_id.as_deref().ok_or_else(integrity)?;
     let base_hash = lock.review_base_hash(id).map_err(|_| integrity())?;

@@ -902,6 +902,23 @@ async fn mutation_busy_none_cannot_later_execute_after_gate_release() {
 }
 
 struct FailingPublication(fictor::supervisor::controls::ControlRegistry);
+impl fictor::installer::publication::PromotionPublication for FailingPublication {
+    fn block_before_lock(&self, ext_id: &str) -> Result<(), admin::MutationReason> {
+        fictor::installer::publication::PromotionPublication::block_before_lock(&self.0, ext_id)
+    }
+    fn publish_after_commit<'a>(
+        &'a self,
+        intent: &'a fictor::store::PromotionIntent,
+    ) -> fictor::installer::publication::PromotionPublicationFuture<'a> {
+        fictor::installer::publication::PromotionPublication::publish_after_commit(&self.0, intent)
+    }
+    fn reconcile<'a>(
+        &'a self,
+        intent: &'a fictor::store::PromotionIntent,
+    ) -> fictor::installer::publication::PromotionPublicationFuture<'a> {
+        fictor::installer::publication::PromotionPublication::reconcile(&self.0, intent)
+    }
+}
 impl fictor::installer::controls::ControlPublication for FailingPublication {
     fn block_admissions(&self, ext_id: &str) -> Result<(), admin::MutationReason> {
         fictor::installer::controls::ControlPublication::block_admissions(&self.0, ext_id)
@@ -962,6 +979,29 @@ struct PausedPublication {
     registry: fictor::supervisor::controls::ControlRegistry,
     entered: tokio::sync::watch::Sender<bool>,
     release: tokio::sync::Notify,
+}
+impl fictor::installer::publication::PromotionPublication for PausedPublication {
+    fn block_before_lock(&self, ext_id: &str) -> Result<(), admin::MutationReason> {
+        fictor::installer::publication::PromotionPublication::block_before_lock(
+            &self.registry,
+            ext_id,
+        )
+    }
+    fn publish_after_commit<'a>(
+        &'a self,
+        intent: &'a fictor::store::PromotionIntent,
+    ) -> fictor::installer::publication::PromotionPublicationFuture<'a> {
+        fictor::installer::publication::PromotionPublication::publish_after_commit(
+            &self.registry,
+            intent,
+        )
+    }
+    fn reconcile<'a>(
+        &'a self,
+        intent: &'a fictor::store::PromotionIntent,
+    ) -> fictor::installer::publication::PromotionPublicationFuture<'a> {
+        fictor::installer::publication::PromotionPublication::reconcile(&self.registry, intent)
+    }
 }
 impl fictor::installer::controls::ControlPublication for PausedPublication {
     fn block_admissions(&self, ext_id: &str) -> Result<(), admin::MutationReason> {

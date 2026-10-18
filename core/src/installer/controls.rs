@@ -20,7 +20,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 pub type PublicationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), MutationReason>> + Send + 'a>>;
-pub trait ControlPublication: Send + Sync {
+pub trait ControlPublication: super::publication::PromotionPublication {
     /// This block remains in force on any uncertain persistence/publication.
     fn block_admissions(&self, ext_id: &str) -> Result<(), MutationReason>;
     fn publish_enabled<'a>(
@@ -48,6 +48,13 @@ impl AdminControlService {
         coordinator: PromotionCoordinator,
         publication: Option<Arc<dyn ControlPublication>>,
     ) -> Self {
+        // Reconciliation may finish a different, already durable operation.
+        // It must publish through the same live registry as this command.
+        let coordinator = if let Some(publication) = &publication {
+            coordinator.using_publication(publication.clone())
+        } else {
+            coordinator
+        };
         Self {
             store,
             secrets,
@@ -365,6 +372,23 @@ fn secret_mutation(error: SecretError) -> AdminMutationError {
 /// A separate owner has no current manager/cache to publish. Recovery does not
 /// imply that every retained predecessor sandbox has already exited.
 struct OfflinePublication;
+impl super::publication::PromotionPublication for OfflinePublication {
+    fn block_before_lock(&self, _: &str) -> Result<(), MutationReason> {
+        Ok(())
+    }
+    fn publish_after_commit<'a>(
+        &'a self,
+        _: &'a crate::store::PromotionIntent,
+    ) -> super::publication::PromotionPublicationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _: &'a crate::store::PromotionIntent,
+    ) -> super::publication::PromotionPublicationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
 impl ControlPublication for OfflinePublication {
     fn block_admissions(&self, _: &str) -> Result<(), MutationReason> {
         Ok(())
