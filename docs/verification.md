@@ -63,9 +63,27 @@ Os logs são evidência local, não artefatos versionados nem execução remota 
 **M0.5 continua parcial.** Faltam bootstrap/bibliotecas protegidos antes do init,
 journal/barreira/recuperação de instâncias, promoção recuperável com aprovação,
 crash loop e canal/listagem administrativos. SDK permanece M0.8. A atestação
-executada pelo init não fecha o critério 64. O workflow Fedora está em adaptação;
-nenhum job remoto foi executado nesta revisão. **CI remota e gate no Fedora
+executada pelo init não fecha o critério 64. Nenhum job remoto foi executado
+nesta revisão. **CI remota e gate no Fedora
 COSMIC Atomic continuam pendentes.**
+
+### Escopo do job Fedora — 2026-10-18
+
+Workflow adaptado: `/tmp` usa tmpfs explícito para as origens ordinárias do
+ADR-044. A seleção Fedora inclui os novos testes de posse, blobs e segredos;
+filtra somente o diagnóstico doctor, o bind alias de ownership e a unidade de
+magic links, que exigem namespaces. Todos os alvos continuam sendo compilados.
+O job Ubuntu permanece idêntico, com `cargo test --locked --offline` sem filtros;
+os testes reais também continuam obrigatórios na máquina do usuário.
+
+O YAML foi analisado com o parser já existente no workspace. A comparação
+estrutural confirmou o job Ubuntu inalterado. O comando da seleção Fedora passou
+localmente no **Toolbx Fedora 44/Bazzite**: **333 testes, zero falhas, zero ignorados
+e três filtrados**. A unidade de magic links foi executada separadamente e passou
+com namespace próprio. Isso valida a seleção local, sem simular uma execução
+remota no container Fedora da CI.
+
+Logs locais: `.fictor/logs/ci-authorized-{workflow-validation,fedora-selection,magic-required}.log`.
 
 ## Resoluções arquiteturais dos ADRs 043/044 — 2026-10-18
 

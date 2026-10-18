@@ -62,7 +62,11 @@ jobs:
     runs-on: ubuntu-22.04
     # Stable COSMIC Atomic release checked against the Fedora Project on 2026-10-17.
     # Match this version to the user's release when the validated target advances.
-    container: registry.fedoraproject.org/fedora:44
+    container:
+      image: registry.fedoraproject.org/fedora:44
+      # Ordinary sandbox data must use an admitted filesystem (ADR-044).
+      # The image's overlay remains restricted to fixed system bases.
+      options: --tmpfs /tmp:rw,nosuid,nodev,mode=1777
     timeout-minutes: 30
     defaults:
       run:
@@ -93,17 +97,20 @@ jobs:
         run: cargo test --no-run --locked --offline
 
       - name: Test without nested sandbox
-        # Real namespace tests (sandbox, sandbox_init, supervisor) run in full on
+        # Real namespace tests (mount_origins, mount_plan, sandbox, sandbox_init,
+        # supervisor, the ownership bind alias and the magic-link unit) run in full on
         # Ubuntu and on the user's desktop. The doctor test also invokes bwrap.
-        # Unit tests, protocols, proxies and inert local bundles need no userns.
+        # Most units, protocols, proxies and inert local bundles need no userns.
         run: >-
           cargo test --locked --offline --lib
-          --test bootstrap --test budget --test control_files --test extension_control
+          --test blob_ownership --test bootstrap --test budget --test control_files --test extension_control
           --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
-          --test manifest --test migrations --test model_tls --test models --test overrides --test proposals
+          --test manifest --test migrations --test model_tls --test models --test overrides --test ownership --test proposals
           --test promotion --test proposal_recovery
-          --test proxy --test store
+          --test proxy --test secrets_ownership --test store
           -- --skip doctor_reports_development_runtime_status_without_modifying_config
+          --skip a_bind_alias_in_a_private_namespace_competes_for_the_same_inode
+          --skip permission_templates_and_home_files_reject_original_magic_links
 
       - name: Test dependency planning and unsupported runtime refusal
         # Actual npm/uv execution currently requires the development Toolbx.
