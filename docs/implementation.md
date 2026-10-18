@@ -8,7 +8,9 @@ Alvo de validação: **Fedora COSMIC Atomic**. Prioridade: **v0.1 autossuficient
 
 “Implementado” descreve o código presente. Build e testes passaram no Toolbx Fedora 44
 sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
-[verificação](verification.md) distingue esses ambientes.
+[verificação](verification.md) distingue esses ambientes. O
+[mapa de invariantes](invariants.md) relaciona I1–I11 aos testes existentes e às
+lacunas de cobertura funcional e de release.
 
 | Marco | Estado | Entrega e restante |
 |---|---|---|

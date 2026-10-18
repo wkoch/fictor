@@ -141,5 +141,6 @@ na máquina Fedora COSMIC Atomic do usuário, com data, versão do SO e commit
 registrados. Build, Clippy e 321 testes passaram no Toolbx Fedora 44 sobre Bazzite;
 esse diagnóstico não substitui o gate no COSMIC Atomic nem a execução da CI.
 
-Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md) e
-as [pendências do arquiteto](docs/architect-pending.md).
+Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md),
+a [cobertura das invariantes](docs/invariants.md) e as
+[pendências do arquiteto](docs/architect-pending.md).
