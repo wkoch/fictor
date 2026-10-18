@@ -388,7 +388,7 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
 }
 fn read_instructions(path: &std::path::Path) -> Result<Option<String>, RpcError> {
     use std::io::Read;
-    let file = match std::fs::File::open(path) {
+    let file = match crate::config::open_regular_config_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(RpcError::INTERNAL),

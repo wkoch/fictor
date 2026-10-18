@@ -3,12 +3,34 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
 };
 
 pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
+
+/// Kernel-triggered reloads accept user-managed regular-file symlinks, but must
+/// never open a pipe/device or leave a non-cancellable blocking worker behind.
+pub(crate) fn open_regular_config_file(path: &Path) -> io::Result<fs::File> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "configuration source must be a regular file",
+        ));
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        // O_NONBLOCK prevents a raced-in FIFO from blocking before the FD type
+        // check. No O_NOFOLLOW: regular-file symlinks remain supported.
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "configuration source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
 
 // Extension configuration stays opaque; provider bodies and model formats never enter the core.
 #[derive(Deserialize, Serialize)]
@@ -177,8 +199,9 @@ impl Config {
             #[serde(default)]
             ext: BTreeMap<String, toml::Table>,
         }
-        let mut config: Reload = toml::from_str(&fs::read_to_string(home.join("config.toml"))?)
-            .map_err(|_| ConfigError::Parse)?;
+        let mut text = String::new();
+        open_regular_config_file(&home.join("config.toml"))?.read_to_string(&mut text)?;
+        let mut config: Reload = toml::from_str(&text).map_err(|_| ConfigError::Parse)?;
         Ok(config.ext.remove(ext_id).unwrap_or_default())
     }
 

@@ -292,3 +292,128 @@ async fn instructions_bound_local_file_before_decoding_and_preserve_optional_tex
     );
     server.shutdown().await.unwrap();
 }
+
+#[test]
+fn config_sources_refuse_special_files_without_stalling_kernel_shutdown() {
+    const CHILD: &str = "FICTOR_CONFIG_SPECIAL_FILE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let fixture = Fixture::new().await;
+            let (mut server, mut client) = fixture.client(&["config"]).await;
+            for (section, filename) in [("instructions", "AGENTS.md"), ("ext", "config.toml")] {
+                for indirect in [false, true] {
+                    let path = fixture.home.join(filename);
+                    if std::fs::symlink_metadata(&path).is_ok() { std::fs::remove_file(&path).unwrap(); }
+                    let target = if indirect { fixture._root.path().join(format!("{filename}.fifo")) } else { path.clone() };
+                    let name = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: this isolated fixture owns the NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    if indirect { std::os::unix::fs::symlink(&target, &path).unwrap(); }
+                    let response = tokio::time::timeout(Duration::from_secs(1), call(&mut client, "config.get", json!({"section":section}))).await.expect("special-file read held a Kernel worker");
+                    assert_eq!(response["error"]["message"], "INTERNAL_ERROR");
+                    assert!(response.get("result").is_none());
+                    if indirect { std::fs::remove_file(&path).unwrap(); }
+                    std::fs::remove_file(&target).unwrap();
+                    assert_eq!(call(&mut client, "config.get", json!({"section":"providers"})).await["result"], json!({"providers":[]}));
+                }
+                for target in [std::path::Path::new("/dev/null"), std::path::Path::new("/dev/zero"), fixture._root.path()] {
+                    let path = fixture.home.join(filename);
+                    std::os::unix::fs::symlink(target, &path).unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(1), call(&mut client, "config.get", json!({"section":section}))).await.unwrap();
+                    assert_eq!(response["error"]["message"], "INTERNAL_ERROR");
+                    assert!(response.get("result").is_none());
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(1), server.shutdown()).await.unwrap().unwrap();
+        });
+        return;
+    }
+    // A pre-fix blocking File::open also prevents Tokio runtime shutdown after
+    // the request times out. Isolate it so a regression cannot hang cargo test.
+    let root = tempfile::Builder::new()
+        .prefix("cfg-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "config_sources_refuse_special_files_without_stalling_kernel_shutdown",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("TMPDIR", root.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Kernel config read stalled its isolated process: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn config_regular_file_symlinks_reload_only_the_authenticated_table() {
+    let fixture = Fixture::new().await;
+    let instructions = fixture._root.path().join("user-instructions.md");
+    let config = fixture._root.path().join("user-config.toml");
+    std::fs::write(&instructions, "Instruções do usuário: ação.\n").unwrap();
+    std::fs::write(
+        &config,
+        "[ext.client]\nvalue = 'first'\n[ext.other]\nsecret = 'private-marker'\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&instructions, fixture.home.join("AGENTS.md")).unwrap();
+    std::fs::remove_file(fixture.home.join("config.toml")).unwrap();
+    std::os::unix::fs::symlink(&config, fixture.home.join("config.toml")).unwrap();
+    let (mut server, mut client) = fixture.client(&["config"]).await;
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
+        json!({"instructions":"Instruções do usuário: ação.\n"})
+    );
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"ext"})).await["result"],
+        json!({"ext":{"value":"first"}})
+    );
+    std::fs::write(
+        &config,
+        "[ext.client]\nvalue = 'second'\n[ext.other]\nsecret = 'private-marker'\n",
+    )
+    .unwrap();
+    let response = call(&mut client, "config.get", json!({"section":"ext"})).await;
+    assert_eq!(response["result"], json!({"ext":{"value":"second"}}));
+    assert!(!response.to_string().contains("private-marker"));
+    assert_eq!(
+        call(
+            &mut client,
+            "config.get",
+            json!({"section":"ext","ext_id":"other"})
+        )
+        .await["error"]["message"],
+        "INVALID_PARAMS"
+    );
+    std::fs::remove_file(&instructions).unwrap();
+    assert_eq!(
+        call(&mut client, "config.get", json!({"section":"instructions"})).await["result"],
+        json!({"instructions":null})
+    );
+    server.shutdown().await.unwrap();
+}
