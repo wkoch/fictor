@@ -4,5 +4,5 @@ FROM registry.fedoraproject.org/fedora-toolbox:44
 # Fedora 44 defaults to Node 22; select its Node 24 LTS binaries explicitly.
 RUN dnf install --assumeyes \
         rust cargo clippy rustfmt gcc git \
-        nodejs24-bin nodejs24-npm-bin bubblewrap ripgrep \
+        nodejs24-bin nodejs24-npm-bin uv bubblewrap ripgrep \
     && dnf clean all
