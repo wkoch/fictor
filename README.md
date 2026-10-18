@@ -14,7 +14,8 @@ identifica o esqueleto atual; o gate de release ainda não foi cumprido.
 ## Executar a base atual
 
 O desenvolvimento usa o Toolbx Fedora 44 definido em `dev/Containerfile`, com
-Rust, Cargo, Clippy, rustfmt, GCC, Git, Node 24 LTS, npm, uv e bubblewrap. Nada é
+Rust, Cargo, Clippy, rustfmt, GCC, Git, Node 24 LTS, npm, uv, bubblewrap e
+`unshare` (util-linux). Nada é
 instalado na base imutável ou como ferramenta global no `$HOME`. As dependências
 Rust são fixadas em `core/Cargo.lock`. A compilação exige Linux x86-64.
 
@@ -83,7 +84,8 @@ as checagens em SQLite. No Toolbx, dependências Node usam `npm ci --ignore-scri
 com `package-lock.json`; Python usa uv com `requirements.lock`, hashes obrigatórios
 e builds desativados. A resolução roda em sandbox com estado descartável e rede
 limitada aos registros exatos de `[installer] registries`. Nenhum host é acrescentado
-a partir de lockfiles ou redirecionamentos; wildcards aguardam decisão arquitetural.
+a partir de lockfiles ou redirecionamentos; wildcards são recusados. Porta omitida
+permite somente CONNECT público na 443; IP/localhost exige porta explícita.
 O smoke de processos usa sandbox, estado descartável, nenhuma rede/modelo e
 honeytokens. Grants absolutos/`~/` não são concedidos ao código em verificação.
 O resultado imprime hashes, diretórios ignorados e checagens, incluindo as permissões

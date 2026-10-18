@@ -31,6 +31,8 @@ enum Command {
     },
     #[command(name = "__sandbox-init", hide = true)]
     SandboxInit {
+        #[arg(long, hide = true)]
+        mount_proof: String,
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -68,8 +70,12 @@ async fn main() -> anyhow::Result<()> {
         Err(error) if error.use_stderr() => bail!("argumentos inválidos; use fictor --help"),
         Err(error) => error.exit(),
     };
-    if let Command::SandboxInit { command } = cli.command {
-        let status = fictor::sandbox::init::run(command).await?;
+    if let Command::SandboxInit {
+        command,
+        mount_proof,
+    } = cli.command
+    {
+        let status = fictor::sandbox::init::run(command, &mount_proof).await?;
         std::process::exit(status);
     }
     let home = fictor::home::resolve().context("resolver FICTOR_HOME")?;

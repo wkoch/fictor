@@ -65,6 +65,7 @@ pub enum SupervisorError {
 
 pub struct Supervisor {
     home: PathBuf,
+    home_anchor: File,
     real_home: PathBuf,
     source_home: Option<PathBuf>,
     config: Arc<Config>,
@@ -122,12 +123,16 @@ impl Supervisor {
         proxy: Arc<EgressProxy>,
     ) -> Result<Self, SupervisorError> {
         let home = canonical_directory(home.as_ref())?;
+        // Pins identity only; exclusive ownership is the separate ADR-038 lease.
+        let home_anchor =
+            crate::sandbox::mounts::pin_home(&home).map_err(|_| SupervisorError::Sandbox)?;
         let real_home = canonical_directory(real_home.as_ref())?;
         let nat64 = Nat64Prefixes::new(&config.egress.nat64_prefixes)
             .map_err(|_| SupervisorError::Invalid)?;
         let fictor_exe = std::env::current_exe().map_err(|_| SupervisorError::Path)?;
         Ok(Self {
             home,
+            home_anchor,
             real_home,
             source_home: None,
             config,
@@ -448,6 +453,10 @@ impl Supervisor {
         {
             return Err(SupervisorError::Path);
         }
+        if let Some(workspace) = &workspace {
+            crate::sandbox::mounts::check_workspace(&self.home, &self.home_anchor, workspace)
+                .map_err(|_| SupervisorError::Sandbox)?;
+        }
         if smoke && manifest.scope == Scope::Session {
             let created = self
                 .store
@@ -685,7 +694,7 @@ impl Supervisor {
         {
             return Err(SupervisorError::Sandbox);
         }
-        let plan = SandboxPlan::new(
+        let plan = SandboxPlan::new_anchored(
             SandboxProfile {
                 read_paths: read,
                 write_paths: write,
@@ -709,6 +718,7 @@ impl Supervisor {
                 allow_store_read: manifest.role == Role::Harness,
             },
             arguments,
+            &self.home_anchor,
         )
         .map_err(|_| SupervisorError::Sandbox)?;
         let mut command =
@@ -767,7 +777,9 @@ impl Supervisor {
             exit,
         };
         tokio::spawn(async move {
-            let _ownership = (temporary, smoke_data, pid_file, smoke_home, owner);
+            // Mount source descriptors stay pinned until reap, including the
+            // interval before __sandbox-init verifies its post-mount proof.
+            let _ownership = (temporary, smoke_data, pid_file, smoke_home, owner, plan);
             let mut reservation = Some(reservation);
             let stderr = tokio::spawn(async move {
                 match stderr {

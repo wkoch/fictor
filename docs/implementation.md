@@ -13,10 +13,12 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 lacunas de cobertura funcional e de release.
 O [caminho até a v1.0](release-path.md) reúne as etapas restantes e os gates.
 
-Após a integração com a `main`, os ADRs 036–042 estão disponíveis: ARQ-020–026
-estão resolvidas no spec, com implementação e testes ainda pendentes. A ARQ-027
-continua aberta. Os registros anteriores abaixo descrevem os snapshots em que
-foram produzidos, sem substituir este estado atual.
+Os ADRs 036–042 estão disponíveis e ARQ-020–026 estão resolvidas no spec. O produto
+já aplica as migrações 0004/0005, FULL no writer, registros exatos de dependências,
+snapshots de overrides e leitura protegida dos controles. Promoção recuperável,
+posse/recuperação de instâncias, crash loop e listagem administrativa continuam
+pendentes. ARQ-027/028 seguem abertas. Os registros anteriores abaixo descrevem os
+snapshots em que foram produzidos, sem substituir este estado atual.
 
 | Marco | Estado | Entrega e restante |
 |---|---|---|
@@ -24,7 +26,7 @@ foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, resolvers npm/uv, smoke, materialização imutável de propostas aprovadas, `tools.list`, `catalog.list`, logs e controles offline no lock. `ext check` mantém quarentena. Implementar os contratos dos ADRs 036–042: promoção, overrides, posse/recuperação de instâncias, crash loop, registros, listagem e origem dos controles. ARQ-027 e integração first-party pendentes. |
+| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações e origem dos controles disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, posse/recuperação de instâncias, crash loop, listagem administrativa, ARQ-027/028 e integração first-party. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
@@ -515,8 +517,9 @@ e controles existentes são validados, sem chmod/chown ou reparo automático.
 
 Passaram 31 testes dirigidos no Toolbx Fedora 44 sobre Bazzite: primitiva (7),
 integração de controles (4), limites/releituras do Kernel (7) e bootstrap (13).
-A recusa de grants que exponham a árvore por aliases de montagem ainda está
-em implementação; esta base não declara encerrados todos os critérios 51–56.
+A proteção de aliases de montagem foi integrada conforme a seção abaixo.
+Os limites de política registrados na ARQ-028 continuam abertos; não se declara
+encerrado o gate completo dos critérios 51–56.
 
 ## Overrides humanos — base do ADR-037
 
@@ -539,3 +542,34 @@ compara um controle positivo com a remoção de env/segredo/modelos/rede/spawn e
 rebaixamento do workspace para leitura. A persistência do patch junto da aprovação
 na proposta e a publicação pelo journal ainda fazem parte da promoção pendente;
 a política contextual do M0.6 continua fora desta entrega.
+
+## Aliases e conferência das montagens antes do workload
+
+A validação compara as fontes em coordenadas do filesystem obtidas de mountinfo,
+incluindo bind mounts e submounts visíveis. A identidade dev/ino real fica separada
+dessas coordenadas porque OverlayFS pode reportar dispositivos diferentes para
+arquivos e para seu mount. O home é fixado por FD; substituí-lo não autoriza outro
+inode. Isso não implementa a posse exclusiva do ADR-038.
+
+O mesmo conjunto de FDs `O_PATH` validado produz a prova dos binds. Os FDs ficam
+CLOEXEC no core e são retidos até o reap; a prova interna contém somente caminhos
+e identidades, limitada a 64 KiB. O renderer compõe a topologia final respeitando
+binds aninhados; fontes opcionais ausentes não são incorporadas se aparecerem
+depois. `__sandbox-init` exige e confere a prova antes dos listeners/workload,
+sem repassá-la aos argumentos ou ambiente da extensão. Troca de fonte ou submount
+desconhecido aborta antes de executar a extensão.
+
+O launcher fixo `unshare --user --map-root-user --mount --propagation private --`
+precede bubblewrap, sem fork adicional. Isso impede que binds recebam montagens
+posteriores do namespace externo; somente a propagação slave usada por
+[bubblewrap](https://github.com/containers/bubblewrap/blob/v0.6.1/bubblewrap.c)
+não oferecia essa garantia. `util-linux` é dependência explícita no Containerfile
+e na CI, já presente no Toolbx usado; nenhuma ferramenta foi instalada no host.
+O perfil de rede, os grants e a remoção de capacidades do workload são mantidos.
+
+Passaram 18 testes dirigidos finais de sandbox/sandbox-init no Toolbx Fedora 44
+sobre Bazzite. Incluem binds/submounts da árvore privada, raiz do home montada,
+exceções próprias legítimas e seis cenários tardios após construir o Command:
+controle seguro aninhado, fonte trocada, submount novo e provas inválida, ausente
+e excessiva. Topologia coberta que não possa ser observada falha conservadoramente.
+Pseudo-filesystems e sobreposição de mounts internos aguardam o ADR da ARQ-028.

@@ -25,6 +25,7 @@ struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
     _proxy: UnixListener,
+    _plans: std::sync::Mutex<Vec<SandboxPlan>>,
 }
 
 impl Fixture {
@@ -56,6 +57,7 @@ impl Fixture {
             _temporary: temporary,
             root,
             _proxy: proxy,
+            _plans: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -108,9 +110,12 @@ impl Fixture {
     }
 
     fn command(&self, mode: &str, extra: BTreeMap<String, String>) -> Command {
-        self.plan(mode, extra).command().unwrap_or_else(|error| panic!(
+        let plan = self.plan(mode, extra);
+        let command = plan.command().unwrap_or_else(|error| panic!(
             "Linux sandbox prerequisite failed: {error}. Install bubblewrap and enable unprivileged user namespaces; run fictor doctor."
-        ))
+        ));
+        self._plans.lock().unwrap().push(plan);
+        command
     }
 }
 

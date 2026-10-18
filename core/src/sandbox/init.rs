@@ -3,13 +3,16 @@ use std::ffi::OsString;
 
 use super::SandboxError;
 
-pub async fn run(arguments: Vec<OsString>) -> Result<i32, SandboxError> {
+pub async fn run(arguments: Vec<OsString>, mount_proof: &str) -> Result<i32, SandboxError> {
     // SAFETY: getpid has no arguments or memory-safety preconditions.
     if unsafe { libc::getpid() } != 1 {
         return Err(SandboxError::Invalid(
             "__sandbox-init exige PID 1 no sandbox Linux",
         ));
     }
+    // This is core-generated metadata, consumed before any listener or workload
+    // exists. It is never placed in the child's environment or argument list.
+    super::attestation::Attestation::parse(mount_proof)?.verify()?;
     linux::run(arguments).await
 }
 
@@ -222,7 +225,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_execution_outside_linux_namespace_init() {
-        assert!(run(vec!["/bin/true".into()]).await.is_err());
+        assert!(run(vec!["/bin/true".into()], "{}").await.is_err());
         // Type-check the init entry without executing PID 1 operations.
         let _ = linux::run;
     }

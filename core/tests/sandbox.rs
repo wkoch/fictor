@@ -78,6 +78,12 @@ impl Fixture {
 }
 
 #[test]
+fn ordinary_profile_keeps_the_explicit_private_mount_exceptions() {
+    let fixture = Fixture::new();
+    let _plan = SandboxPlan::new(fixture.profile(), fixture.context(), vec![]).unwrap();
+}
+
+#[test]
 fn profile_validation_rejects_root_home_core_and_writable_code() {
     let fixture = Fixture::new();
     for path in [
@@ -169,7 +175,13 @@ fn sandbox_init_is_hidden_and_refuses_host_execution() {
     let output = Command::new(binary)
         .env_remove("HOME")
         .env_remove("FICTOR_HOME")
-        .args(["__sandbox-init", "--", "/usr/bin/true"])
+        .args([
+            "__sandbox-init",
+            "--mount-proof",
+            "{}",
+            "--",
+            "/usr/bin/true",
+        ])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -196,6 +208,8 @@ mod receipt_mount_cleanup {
             .prefix("fx-mount-")
             .tempdir_in("/tmp")
             .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fictor::home::prepare(home.path()).unwrap();
         let store = Arc::new(Store::open(home.path()).await.unwrap());
         (home, store)
@@ -297,5 +311,307 @@ mod receipt_mount_cleanup {
                 .is_empty()
         );
         assert!(!temporary.exists());
+    }
+}
+
+mod private_mount_aliases {
+    use super::*;
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, path::Path};
+
+    #[test]
+    fn grants_reject_private_bind_aliases_and_submounts_without_masking_them() {
+        for scenario in [
+            "home",
+            "ancestor",
+            "file",
+            "submount",
+            "data-submount",
+            "system-base",
+            "home-mount",
+            "own-data-filesystem",
+        ] {
+            let output = Command::new("/usr/bin/unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "private_mount_aliases::mount_namespace_subprocess",
+                    "--nocapture",
+                ])
+                .env("FICTOR_TEST_PRIVATE_MOUNT", scenario)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn bind(source: &Path, destination: &Path) {
+        let source = CString::new(source.as_os_str().as_bytes()).unwrap();
+        let destination = CString::new(destination.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this opt-in subprocess owns its mount/user namespace. Both
+        // paths are live fixture objects; the mount never changes the host tree.
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn mount_namespace_subprocess() {
+        let Some(scenario) = std::env::var_os("FICTOR_TEST_PRIVATE_MOUNT") else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let home = fixture.root.join("core");
+        let workspace = fixture.root.join("workspace");
+        let mut context = fixture.context();
+        let mut profile = fixture.profile();
+        let scenario = scenario.to_str().unwrap();
+        match scenario {
+            "home" | "ancestor" => {
+                let alias = fixture.root.join("outside/alias");
+                fs::create_dir(&alias).unwrap();
+                bind(
+                    if scenario == "home" {
+                        &home
+                    } else {
+                        &fixture.root
+                    },
+                    &alias,
+                );
+                profile.read_paths.push(alias);
+            }
+            "file" => {
+                bind(&home.join("config.toml"), &workspace.join("input.txt"));
+                profile.read_paths.push(workspace.join("input.txt"));
+            }
+            "submount" => {
+                let alias = workspace.join("nested");
+                fs::create_dir(&alias).unwrap();
+                bind(&home, &alias);
+            }
+            "data-submount" => {
+                let alias = context.ext_data.join("nested");
+                fs::create_dir(&alias).unwrap();
+                bind(&home, &alias);
+            }
+            "system-base" => bind(&home, Path::new("/etc/ssl")),
+            "home-mount" => {
+                let alias = fixture.root.join("outside/core-mount");
+                fs::create_dir(&alias).unwrap();
+                bind(&home, &alias);
+                context.fictor_home = alias.clone();
+                context.bundle_root = alias.join("extensions/store/test/0.1-hash");
+                context.ext_data = alias.join("extensions/data/test");
+                context.allow_store_read = true;
+                profile.proxy = ProxyEndpoint::Unix(alias.join("run/proxy.sock"));
+            }
+            "own-data-filesystem" => {
+                let destination = CString::new(context.ext_data.as_os_str().as_bytes()).unwrap();
+                // SAFETY: a fresh tmpfs is mounted only on this private fixture
+                // in the subprocess namespace, without changing host mounts.
+                assert_eq!(
+                    unsafe {
+                        libc::mount(
+                            c"tmpfs".as_ptr(),
+                            destination.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                profile.write_paths.push(context.ext_data.clone());
+            }
+            _ => panic!("unknown test scenario"),
+        }
+        let expected = matches!(scenario, "home-mount" | "own-data-filesystem");
+        let result = SandboxPlan::new(profile, context, vec![]);
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "{scenario}: {}",
+            result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        );
+        if scenario == "home" {
+            // Protect the directory identity even before an optional control
+            // exists: creating it must not make the same grant admissible.
+            assert!(!home.join("AGENTS.md").exists());
+            fs::write(home.join("AGENTS.md"), "new global instructions").unwrap();
+            let mut profile = fixture.profile();
+            profile.read_paths.push(fixture.root.join("outside/alias"));
+            assert!(SandboxPlan::new(profile, fixture.context(), vec![]).is_err());
+        }
+    }
+}
+
+mod mounted_source_attestation {
+    use super::*;
+    use std::{
+        ffi::{CString, OsString},
+        fs,
+        os::unix::ffi::OsStrExt,
+        path::Path,
+    };
+
+    fn bind(source: &Path, target: &Path) {
+        let source = CString::new(source.as_os_str().as_bytes()).unwrap();
+        let target = CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the test runs in its own user/mount namespace and owns both
+        // paths. The host mount tree is never changed.
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn late_source_and_submount_changes_abort_before_the_workload() {
+        for scenario in [
+            "safe",
+            "source",
+            "submount",
+            "malformed",
+            "missing",
+            "oversized",
+        ] {
+            let output = Command::new("/usr/bin/unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mounted_source_attestation::namespace_subprocess",
+                    "--nocapture",
+                ])
+                .env("FICTOR_TEST_MOUNT_ATTESTATION", scenario)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_subprocess() {
+        let Some(scenario) = std::env::var_os("FICTOR_TEST_MOUNT_ATTESTATION") else {
+            return;
+        };
+        let fixture = Fixture::new();
+        let mut context = fixture.context();
+        context.runtime = PathBuf::from("/usr/bin/sh").canonicalize().unwrap();
+        context.runtime_root = "/usr".into();
+        let canary = context.ext_data.join("attestation.canary");
+        let mut profile = fixture.profile();
+        profile
+            .env
+            .insert("ATTESTATION_CANARY".into(), canary.to_str().unwrap().into());
+        let source = fixture.root.join("outside/grant");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        if scenario == "safe" {
+            let public = fixture.root.join("outside/public");
+            fs::create_dir(&public).unwrap();
+            bind(&public, &source.join("nested"));
+            profile.write_paths.push(source.join("nested"));
+        }
+        profile.read_paths.push(source.clone());
+        let plan = SandboxPlan::new(profile, context, vec!["-c".into(), "case \"$*\" in *--mount-proof*) exit 91;; esac; printf reached > \"$ATTESTATION_CANARY\"".into()]).unwrap();
+        let command = plan.command().unwrap();
+        // Freeze the validated Command before changing the path/topology. No
+        // sleeps, scheduling assumptions or production hooks create this race.
+        if scenario == "source" {
+            fs::rename(&source, fixture.root.join("outside/original")).unwrap();
+            symlink(fixture.root.join("core"), &source).unwrap();
+        } else if scenario == "submount" {
+            let before = fs::metadata(&source).unwrap();
+            bind(&fixture.root.join("core"), &source.join("nested"));
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&source).unwrap().ino(), before.ino());
+            assert_eq!(fs::metadata(&source).unwrap().dev(), before.dev());
+        }
+        let mut args: Vec<OsString> = command.get_args().map(Into::into).collect();
+        let proof = args.iter().position(|arg| arg == "--mount-proof").unwrap();
+        if scenario == "missing" {
+            args.drain(proof..proof + 2);
+        } else if scenario == "malformed" {
+            args[proof + 1] = "{}".into();
+        } else if scenario == "oversized" {
+            args[proof + 1] = " ".repeat(64 * 1024 + 1).into();
+        }
+        let output = Command::new(command.get_program())
+            .args(args)
+            .env_clear()
+            .output()
+            .unwrap();
+        if scenario == "safe" {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read(&canary).unwrap(), b"reached");
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                !canary.exists(),
+                "untrusted workload ran with an invalid proof"
+            );
+            if scenario != "missing" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("atestação"),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        // Retain the plan's O_PATH inode anchors until the process has exited.
+        drop(plan);
     }
 }

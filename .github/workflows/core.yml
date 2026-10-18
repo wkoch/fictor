@@ -30,9 +30,10 @@ jobs:
       - name: Install sandbox dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap ripgrep
+          sudo apt-get install --yes --no-install-recommends bubblewrap ripgrep util-linux
           bwrap --version
           rg --version
+          unshare --version
         # Keep kernel/userns/AppArmor policies intact: unavailable isolation fails tests.
 
       - name: Install Rust stable
@@ -70,7 +71,7 @@ jobs:
     steps:
       - name: Install build dependencies
         working-directory: /
-        run: dnf install --assumeyes gcc gcc-c++ make git curl-minimal tar gzip xz pkgconf-pkg-config openssl-devel ca-certificates findutils
+        run: dnf install --assumeyes gcc gcc-c++ make git curl-minimal tar gzip xz pkgconf-pkg-config openssl-devel ca-certificates findutils util-linux
 
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,9 +98,9 @@ jobs:
         # Unit tests, protocols, proxies and inert local bundles need no userns.
         run: >-
           cargo test --locked --offline --lib
-          --test bootstrap --test budget --test extension_control
+          --test bootstrap --test budget --test control_files --test extension_control
           --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
-          --test manifest --test migrations --test model_tls --test models --test proposals
+          --test manifest --test migrations --test model_tls --test models --test overrides --test proposals
           --test promotion --test proposal_recovery
           --test proxy --test store
           -- --skip doctor_reports_development_runtime_status_without_modifying_config

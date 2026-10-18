@@ -1,13 +1,17 @@
 //! OS confinement. Inputs are constructed by the trusted supervisor, never an extension.
+mod attestation;
 pub mod init;
 pub mod linux;
+pub(crate) mod mounts;
 pub mod sensitive;
 
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fs::File,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone)]
@@ -61,6 +65,8 @@ pub enum SandboxError {
 pub struct SandboxPlan {
     validated: ValidatedSandbox,
     arguments: Vec<OsString>,
+    home: File,
+    proof: Mutex<Arc<mounts::MountProof>>,
 }
 
 impl SandboxPlan {
@@ -69,24 +75,68 @@ impl SandboxPlan {
         context: SandboxContext,
         arguments: Vec<OsString>,
     ) -> Result<Self, SandboxError> {
+        let home = mounts::pin_home(&context.fictor_home)?;
+        Self::with_home(profile, context, arguments, home)
+    }
+
+    pub(crate) fn new_anchored(
+        profile: SandboxProfile,
+        context: SandboxContext,
+        arguments: Vec<OsString>,
+        home: &File,
+    ) -> Result<Self, SandboxError> {
+        Self::with_home(profile, context, arguments, home.try_clone()?)
+    }
+
+    fn with_home(
+        profile: SandboxProfile,
+        context: SandboxContext,
+        arguments: Vec<OsString>,
+        home: File,
+    ) -> Result<Self, SandboxError> {
+        let validated = validate(profile, context, &home)?;
+        let proof = check_mounts(&validated.profile, &validated.context, &home)?;
         Ok(Self {
-            validated: validate(profile, context)?,
+            validated,
             arguments,
+            home,
+            proof: Mutex::new(Arc::new(proof)),
         })
     }
 
+    /// Keep this plan alive until the private init completes (the supervisor
+    /// retains it through reap). Raw Command alone is not a source-inode lease.
     pub fn command(&self) -> Result<Command, SandboxError> {
-        linux::command(&self.validated, &self.arguments)
+        let proof = Arc::new(check_mounts(
+            &self.validated.profile,
+            &self.validated.context,
+            &self.home,
+        )?);
+        *self
+            .proof
+            .lock()
+            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))? = proof.clone();
+        linux::command(&self.validated, &self.arguments, &proof)
     }
 
     pub fn linux_arguments(&self) -> Result<Vec<OsString>, SandboxError> {
-        linux::arguments(&self.validated, &self.arguments)
+        let proof = Arc::new(check_mounts(
+            &self.validated.profile,
+            &self.validated.context,
+            &self.home,
+        )?);
+        *self
+            .proof
+            .lock()
+            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))? = proof.clone();
+        linux::arguments(&self.validated, &self.arguments, &proof)
     }
 }
 
 fn validate(
     mut profile: SandboxProfile,
     mut context: SandboxContext,
+    home: &File,
 ) -> Result<ValidatedSandbox, SandboxError> {
     context.fictor_home = directory(&context.fictor_home)?;
     context.real_home = directory(&context.real_home)?;
@@ -256,6 +306,7 @@ fn validate(
             "ambiente contém nome ou valor inválido",
         ));
     }
+    check_mounts(&profile, &context, home)?;
     let tmp_home = context.tmp_dir.join("home");
     crate::home::private_dir(&tmp_home)?;
     let utf8 = |path: &Path| {
@@ -288,6 +339,96 @@ fn validate(
             .map_err(|_| SandboxError::Invalid("PATH deve ser UTF-8"))?,
     );
     Ok(ValidatedSandbox { profile, context })
+}
+
+fn check_mounts(
+    profile: &SandboxProfile,
+    context: &SandboxContext,
+    home: &File,
+) -> Result<mounts::MountProof, SandboxError> {
+    let boundary = mounts::Boundary::new(&context.fictor_home, home)?;
+    let mut proof = mounts::MountProof::default();
+    // These are exactly the implicit host sources rendered by linux::arguments.
+    for base in [
+        "/usr",
+        "/etc/ssl",
+        "/etc/pki",
+        "/etc/ca-certificates",
+        "/etc/alternatives",
+        "/etc/localtime",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/crypto-policies",
+        "/etc/nsswitch.conf",
+    ] {
+        match Path::new(base).canonicalize() {
+            Ok(path) => proof.record(base.into(), Some(boundary.prove(&path, &[])?))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                proof.record(base.into(), None)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    proof.record(
+        context.bundle_root.clone(),
+        Some(boundary.prove(&context.bundle_root, &[&context.bundle_root])?),
+    )?;
+    proof.record(
+        context.ext_data.clone(),
+        Some(boundary.prove(&context.ext_data, &[&context.ext_data])?),
+    )?;
+    proof.record(
+        context.fictor_exe.clone(),
+        Some(boundary.prove(&context.fictor_exe, &[])?),
+    )?;
+    let runtime_exceptions = if context.runtime_root == context.bundle_root {
+        vec![context.bundle_root.as_path()]
+    } else {
+        Vec::new()
+    };
+    if !context.runtime_root.starts_with("/usr") {
+        proof.record(
+            context.runtime_root.clone(),
+            Some(boundary.prove(&context.runtime_root, &runtime_exceptions)?),
+        )?;
+    }
+    let store = context.fictor_home.join("extensions/store");
+    if context.allow_store_read {
+        proof.record(store.clone(), Some(boundary.prove(&store, &[&store])?))?;
+    }
+    let exceptions = |path: &Path, writable: bool| {
+        let mut allowed = Vec::new();
+        if path.starts_with(&context.ext_data) {
+            allowed.push(context.ext_data.as_path());
+        }
+        if !writable && path.starts_with(&context.bundle_root) {
+            allowed.push(context.bundle_root.as_path());
+        }
+        if !writable && context.allow_store_read && path.starts_with(&store) {
+            allowed.push(store.as_path());
+        }
+        allowed
+    };
+    for (path, writable) in profile
+        .read_paths
+        .iter()
+        .map(|path| (path, false))
+        .chain(profile.write_paths.iter().map(|path| (path, true)))
+    {
+        if !path.starts_with(&context.tmp_dir) {
+            proof.record(
+                path.clone(),
+                Some(boundary.prove(path, &exceptions(path, writable))?),
+            )?;
+        }
+    }
+    if let Some(socket) = &profile.kernel_socket {
+        proof.record(socket.clone(), Some(boundary.prove(socket, &[socket])?))?;
+    }
+    let ProxyEndpoint::Unix(socket) = &profile.proxy;
+    proof.record(socket.clone(), Some(boundary.prove(socket, &[socket])?))?;
+    boundary.finish()?;
+    Ok(proof)
 }
 
 fn overlaps(left: &Path, right: &Path) -> bool {

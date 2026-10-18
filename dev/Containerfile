@@ -6,3 +6,7 @@ RUN dnf install --assumeyes \
         rust cargo clippy rustfmt gcc git \
         nodejs24-bin nodejs24-npm-bin uv bubblewrap ripgrep \
     && dnf clean all
+
+# unshare makes mount propagation private before bubblewrap starts.
+# Declare this dependency even when it is already present in the Toolbx base.
+RUN dnf install --assumeyes util-linux && dnf clean all

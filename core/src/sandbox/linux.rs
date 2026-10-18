@@ -2,12 +2,16 @@
 use std::process::Command;
 use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
-use super::{ProxyEndpoint, SandboxError, ValidatedSandbox};
+use super::{
+    ProxyEndpoint, SandboxError, ValidatedSandbox, attestation::Attestation, mounts::MountProof,
+};
 
 pub(super) fn arguments(
     sandbox: &ValidatedSandbox,
     command: &[OsString],
+    proof: &MountProof,
 ) -> Result<Vec<OsString>, SandboxError> {
+    let mut attestation = Attestation::default();
     let ProxyEndpoint::Unix(proxy) = &sandbox.profile.proxy;
     let mut args: Vec<OsString> = [
         "--die-with-parent",
@@ -18,7 +22,14 @@ pub(super) fn arguments(
     .into_iter()
     .map(OsString::from)
     .collect();
-    mount(&mut args, "--ro-bind", Path::new("/usr"), Path::new("/usr"));
+    mount(
+        &mut args,
+        &mut attestation,
+        proof,
+        "--ro-bind",
+        Path::new("/usr"),
+        Path::new("/usr"),
+    )?;
     for (target, link) in [
         ("usr/bin", "/bin"),
         ("usr/sbin", "/sbin"),
@@ -38,7 +49,14 @@ pub(super) fn arguments(
         "/etc/crypto-policies",
         "/etc/nsswitch.conf",
     ] {
-        mount(&mut args, "--ro-bind-try", Path::new(path), Path::new(path));
+        mount(
+            &mut args,
+            &mut attestation,
+            proof,
+            "--ro-bind-try",
+            Path::new(path),
+            Path::new(path),
+        )?;
     }
     // Reproduce only Fedora Atomic's trusted root aliases. Their /var targets
     // remain empty unless a specific canonical runtime/workspace grant mounts them.
@@ -91,17 +109,21 @@ pub(super) fn arguments(
     if !context.runtime_root.starts_with("/usr") {
         mount(
             &mut args,
+            &mut attestation,
+            proof,
             "--ro-bind",
             &context.runtime_root,
             &context.runtime_root,
-        );
+        )?;
     }
     mount(
         &mut args,
+        &mut attestation,
+        proof,
         "--ro-bind",
         &context.bundle_root,
         &context.bundle_root,
-    );
+    )?;
     let writes: BTreeSet<_> = profile.write_paths.iter().collect();
     let mut reads: BTreeSet<_> = profile
         .read_paths
@@ -117,25 +139,48 @@ pub(super) fn arguments(
             && !writes.contains(path)
             && path != &context.ext_data
         {
-            mount(&mut args, "--ro-bind", path, path);
+            mount(&mut args, &mut attestation, proof, "--ro-bind", path, path)?;
         }
     }
     // Writes are mounted last so a narrower read grant cannot hide a write grant.
-    mount(&mut args, "--bind", &context.ext_data, &context.ext_data);
+    mount(
+        &mut args,
+        &mut attestation,
+        proof,
+        "--bind",
+        &context.ext_data,
+        &context.ext_data,
+    )?;
     for path in writes {
         if !path.starts_with(&context.tmp_dir) && path != &context.ext_data {
-            mount(&mut args, "--bind", path, path);
+            mount(&mut args, &mut attestation, proof, "--bind", path, path)?;
         }
     }
     mount(
         &mut args,
+        &mut attestation,
+        proof,
         "--ro-bind",
         &context.fictor_exe,
         Path::new("/fx/fictor"),
-    );
-    mount(&mut args, "--bind", proxy, Path::new("/fx/proxy.sock"));
+    )?;
+    mount(
+        &mut args,
+        &mut attestation,
+        proof,
+        "--bind",
+        proxy,
+        Path::new("/fx/proxy.sock"),
+    )?;
     if let Some(socket) = &profile.kernel_socket {
-        mount(&mut args, "--bind", socket, Path::new("/fx/kernel.sock"));
+        mount(
+            &mut args,
+            &mut attestation,
+            proof,
+            "--bind",
+            socket,
+            Path::new("/fx/kernel.sock"),
+        )?;
     }
     for (key, value) in &profile.env {
         if matches!(key.as_str(), "FICTOR_KERNEL_SOCKET" | "FICTOR_KERNEL_URL") {
@@ -163,7 +208,9 @@ pub(super) fn arguments(
         "--chdir".into(),
         translate_path(profile.cwd.as_os_str(), &context.tmp_dir),
     ]);
-    args.extend(["/fx/fictor", "__sandbox-init", "--"].map(OsString::from));
+    args.extend(["/fx/fictor", "__sandbox-init", "--mount-proof"].map(OsString::from));
+    args.push(attestation.encode()?.into());
+    args.push("--".into());
     args.push(context.runtime.as_os_str().into());
     args.extend(runtime_arguments(sandbox, command));
     Ok(args)
@@ -185,12 +232,31 @@ pub(super) fn atomic_alias_target(alias: &Path, target: &Path) -> bool {
         && matches!(target.to_str(), Some("../var/usrlocal" | "/var/usrlocal")))
 }
 
-fn mount(args: &mut Vec<OsString>, option: &str, source: &Path, target: &Path) {
+fn mount(
+    args: &mut Vec<OsString>,
+    attestation: &mut Attestation,
+    proof: &MountProof,
+    option: &str,
+    source: &Path,
+    target: &Path,
+) -> Result<(), SandboxError> {
+    let snapshot = if option == "--ro-bind-try" {
+        proof.optional_source(source)?
+    } else {
+        Some(proof.source(source)?)
+    };
+    // A base source that was absent during validation stays absent. Never
+    // mount an object that appeared only after that validated observation.
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    attestation.bind(target, snapshot)?;
     args.extend([
         option.into(),
         source.as_os_str().into(),
         target.as_os_str().into(),
     ]);
+    Ok(())
 }
 
 fn translate_path(value: &std::ffi::OsStr, temporary: &Path) -> OsString {
@@ -252,6 +318,7 @@ fn runtime_arguments(sandbox: &ValidatedSandbox, arguments: &[OsString]) -> Vec<
 pub(super) fn command(
     sandbox: &ValidatedSandbox,
     child_arguments: &[OsString],
+    proof: &MountProof,
 ) -> Result<Command, SandboxError> {
     // Do not resolve a security boundary from the user's PATH or extension env.
     let executable = ["/usr/bin/bwrap", "/bin/bwrap"]
@@ -260,10 +327,29 @@ pub(super) fn command(
         .ok_or(SandboxError::Invalid(
             "bubblewrap indisponível; execute fictor doctor",
         ))?;
-    let mut command = Command::new(executable);
+    let unshare = "/usr/bin/unshare";
+    if !Path::new(unshare).is_file() {
+        return Err(SandboxError::Invalid(
+            "util-linux unshare indisponível; execute fictor doctor",
+        ));
+    }
+    // bubblewrap makes inherited sources slaves, which can still receive host
+    // submounts. Privatize an additional child namespace before its bind setup.
+    // No --fork: unshare execs bwrap and preserves the supervised PID/parent.
+    // This changes no mounts in the core/host namespace and adds no workload caps.
+    let mut command = Command::new(unshare);
     command
         .env_clear()
-        .args(arguments(sandbox, child_arguments)?);
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            executable,
+        ])
+        .args(arguments(sandbox, child_arguments, proof)?);
     use std::os::unix::process::CommandExt;
     command.process_group(0);
     Ok(command)
@@ -274,6 +360,62 @@ mod tests {
     use super::*;
     use crate::sandbox::{SandboxContext, SandboxProfile, Tier};
     use std::collections::BTreeMap;
+
+    fn test_proof(sandbox: &ValidatedSandbox) -> MountProof {
+        use crate::sandbox::mounts::{SnapshotEntry, SourceSnapshot};
+        let mut sources: Vec<std::path::PathBuf> = [
+            "/usr",
+            "/etc/ssl",
+            "/etc/pki",
+            "/etc/ca-certificates",
+            "/etc/alternatives",
+            "/etc/localtime",
+            "/etc/passwd",
+            "/etc/group",
+            "/etc/crypto-policies",
+            "/etc/nsswitch.conf",
+        ]
+        .map(Into::into)
+        .into();
+        sources.extend([
+            sandbox.context.bundle_root.clone(),
+            sandbox.context.ext_data.clone(),
+            sandbox.context.runtime_root.clone(),
+            sandbox.context.fictor_exe.clone(),
+            sandbox.context.fictor_home.join("extensions/store"),
+        ]);
+        sources.extend(sandbox.profile.read_paths.iter().cloned());
+        sources.extend(sandbox.profile.write_paths.iter().cloned());
+        sources.extend(sandbox.context.home_ro_files.iter().cloned());
+        let ProxyEndpoint::Unix(proxy) = &sandbox.profile.proxy;
+        sources.push(proxy.clone());
+        sources.extend(sandbox.profile.kernel_socket.iter().cloned());
+        MountProof::for_test(
+            sources
+                .into_iter()
+                .map(|path| {
+                    (
+                        path,
+                        Some(SourceSnapshot {
+                            entries: vec![SnapshotEntry {
+                                relative: Default::default(),
+                                device: (0, 0),
+                                inode: 1,
+                            }],
+                            private: true,
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn arguments(
+        sandbox: &ValidatedSandbox,
+        command: &[OsString],
+    ) -> Result<Vec<OsString>, SandboxError> {
+        super::arguments(sandbox, command, &test_proof(sandbox))
+    }
 
     #[test]
     fn atomic_aliases_only_accept_the_documented_var_targets() {
@@ -380,16 +522,12 @@ mod tests {
             &args,
             &["--bind", "/data/fictor/run/k/test.sock", "/fx/kernel.sock"]
         ));
-        assert!(has(
-            &args,
-            &[
-                "/fx/fictor",
-                "__sandbox-init",
-                "--",
-                "/opt/runtime/node",
-                "run"
-            ]
-        ));
+        let init = args
+            .windows(3)
+            .position(|values| values == ["/fx/fictor", "__sandbox-init", "--mount-proof"])
+            .unwrap();
+        assert!(Attestation::parse(args[init + 3].to_str().unwrap()).is_ok());
+        assert_eq!(&args[init + 4..], &["--", "/opt/runtime/node", "run"]);
         assert!(!args.iter().any(|arg| arg == "/home/user"
             || arg == "/data/fictor"
             || arg == "/host/tmp/instance"));
