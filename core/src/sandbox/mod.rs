@@ -3,6 +3,7 @@ mod attestation;
 pub mod init;
 pub mod linux;
 pub(crate) mod mounts;
+mod plan;
 pub mod sensitive;
 
 use std::{
@@ -60,13 +61,19 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
     #[error("perfil de sandbox inválido: {0}")]
     Invalid(&'static str),
+    #[error("origem {resource:?}: filesystem {filesystem}, regra {rule}")]
+    Origin {
+        resource: PathBuf,
+        filesystem: String,
+        rule: &'static str,
+    },
 }
 
 pub struct SandboxPlan {
     validated: ValidatedSandbox,
     arguments: Vec<OsString>,
     home: File,
-    proof: Mutex<Arc<mounts::MountProof>>,
+    proof: Mutex<Vec<Arc<mounts::MountProof>>>,
 }
 
 impl SandboxPlan {
@@ -95,41 +102,37 @@ impl SandboxPlan {
         home: File,
     ) -> Result<Self, SandboxError> {
         let validated = validate(profile, context, &home)?;
-        let proof = check_mounts(&validated.profile, &validated.context, &home)?;
+        let (_, proof) = check_mounts(&validated.profile, &validated.context, &home)?;
         Ok(Self {
             validated,
             arguments,
             home,
-            proof: Mutex::new(Arc::new(proof)),
+            proof: Mutex::new(vec![Arc::new(proof)]),
         })
     }
 
     /// Keep this plan alive until the private init completes (the supervisor
     /// retains it through reap). Raw Command alone is not a source-inode lease.
     pub fn command(&self) -> Result<Command, SandboxError> {
-        let proof = Arc::new(check_mounts(
-            &self.validated.profile,
-            &self.validated.context,
-            &self.home,
-        )?);
-        *self
-            .proof
+        let (mounts, proof) =
+            check_mounts(&self.validated.profile, &self.validated.context, &self.home)?;
+        let proof = Arc::new(proof);
+        self.proof
             .lock()
-            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))? = proof.clone();
-        linux::command(&self.validated, &self.arguments, &proof)
+            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))?
+            .push(proof.clone());
+        linux::command(&self.validated, &self.arguments, &mounts, &proof)
     }
 
     pub fn linux_arguments(&self) -> Result<Vec<OsString>, SandboxError> {
-        let proof = Arc::new(check_mounts(
-            &self.validated.profile,
-            &self.validated.context,
-            &self.home,
-        )?);
-        *self
-            .proof
+        let (mounts, proof) =
+            check_mounts(&self.validated.profile, &self.validated.context, &self.home)?;
+        let proof = Arc::new(proof);
+        self.proof
             .lock()
-            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))? = proof.clone();
-        linux::arguments(&self.validated, &self.arguments, &proof)
+            .map_err(|_| SandboxError::Invalid("prova de montagem indisponível"))?
+            .push(proof.clone());
+        linux::arguments(&self.validated, &self.arguments, &mounts, &proof)
     }
 }
 
@@ -345,90 +348,68 @@ fn check_mounts(
     profile: &SandboxProfile,
     context: &SandboxContext,
     home: &File,
-) -> Result<mounts::MountProof, SandboxError> {
-    let boundary = mounts::Boundary::new(&context.fictor_home, home)?;
+) -> Result<(plan::MountPlan, mounts::MountProof), SandboxError> {
+    let mut boundary = mounts::Boundary::new(&context.fictor_home, home)?;
     let mut proof = mounts::MountProof::default();
-    // These are exactly the implicit host sources rendered by linux::arguments.
-    for base in [
-        "/usr",
-        "/etc/ssl",
-        "/etc/pki",
-        "/etc/ca-certificates",
-        "/etc/alternatives",
-        "/etc/localtime",
-        "/etc/passwd",
-        "/etc/group",
-        "/etc/crypto-policies",
-        "/etc/nsswitch.conf",
-    ] {
-        match Path::new(base).canonicalize() {
-            Ok(path) => proof.record(base.into(), Some(boundary.prove(&path, &[])?))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                proof.record(base.into(), None)?
-            }
-            Err(error) => return Err(error.into()),
-        }
+    boundary.protect_temporary(&context.tmp_dir, &mut proof)?;
+    let plan = plan::MountPlan::declare(profile, context)?;
+    let mut done = std::collections::BTreeSet::new();
+    for index in 0..plan.mounts.len() {
+        prove_mount(index, &plan, context, &boundary, &mut proof, &mut done)?;
     }
-    proof.record(
-        context.bundle_root.clone(),
-        Some(boundary.prove(&context.bundle_root, &[&context.bundle_root])?),
-    )?;
-    proof.record(
-        context.ext_data.clone(),
-        Some(boundary.prove(&context.ext_data, &[&context.ext_data])?),
-    )?;
-    proof.record(
-        context.fictor_exe.clone(),
-        Some(boundary.prove(&context.fictor_exe, &[])?),
-    )?;
-    let runtime_exceptions = if context.runtime_root == context.bundle_root {
-        vec![context.bundle_root.as_path()]
-    } else {
-        Vec::new()
-    };
-    if !context.runtime_root.starts_with("/usr") {
-        proof.record(
-            context.runtime_root.clone(),
-            Some(boundary.prove(&context.runtime_root, &runtime_exceptions)?),
-        )?;
-    }
-    let store = context.fictor_home.join("extensions/store");
-    if context.allow_store_read {
-        proof.record(store.clone(), Some(boundary.prove(&store, &[&store])?))?;
-    }
-    let exceptions = |path: &Path, writable: bool| {
-        let mut allowed = Vec::new();
-        if path.starts_with(&context.ext_data) {
-            allowed.push(context.ext_data.as_path());
-        }
-        if !writable && path.starts_with(&context.bundle_root) {
-            allowed.push(context.bundle_root.as_path());
-        }
-        if !writable && context.allow_store_read && path.starts_with(&store) {
-            allowed.push(store.as_path());
-        }
-        allowed
-    };
-    for (path, writable) in profile
-        .read_paths
-        .iter()
-        .map(|path| (path, false))
-        .chain(profile.write_paths.iter().map(|path| (path, true)))
-    {
-        if !path.starts_with(&context.tmp_dir) {
-            proof.record(
-                path.clone(),
-                Some(boundary.prove(path, &exceptions(path, writable))?),
-            )?;
-        }
-    }
-    if let Some(socket) = &profile.kernel_socket {
-        proof.record(socket.clone(), Some(boundary.prove(socket, &[socket])?))?;
-    }
-    let ProxyEndpoint::Unix(socket) = &profile.proxy;
-    proof.record(socket.clone(), Some(boundary.prove(socket, &[socket])?))?;
     boundary.finish()?;
-    Ok(proof)
+    plan.normalized(&proof)?;
+    Ok((plan, proof))
+}
+
+fn prove_mount(
+    index: usize,
+    plan: &plan::MountPlan,
+    context: &SandboxContext,
+    boundary: &mounts::Boundary,
+    proof: &mut mounts::MountProof,
+    done: &mut std::collections::BTreeSet<usize>,
+) -> Result<(), SandboxError> {
+    if done.contains(&index) {
+        return Ok(());
+    }
+    let request = &plan.mounts[index];
+    let store = context.fictor_home.join("extensions/store");
+    let mut exceptions = Vec::new();
+    if request.source.starts_with(&context.ext_data) {
+        exceptions.push(context.ext_data.as_path());
+    }
+    if !request.writable && request.source.starts_with(&context.bundle_root) {
+        exceptions.push(context.bundle_root.as_path());
+    }
+    if !request.writable && context.allow_store_read && request.source.starts_with(&store) {
+        exceptions.push(store.as_path());
+    }
+    if request.role == plan::Role::Endpoint {
+        exceptions.push(request.source.as_path());
+    }
+    let result = if let Some(outer) = plan.covering(index) {
+        prove_mount(outer, plan, context, boundary, proof, done)?;
+        boundary.prove_covered(
+            &request.source,
+            &exceptions,
+            &plan.mounts[outer].source,
+            proof,
+        )
+    } else {
+        boundary.prove(&request.source, &exceptions, request.purpose())
+    };
+    match result {
+        Ok(proven) => proof.record(request.source.clone(), Some(proven))?,
+        Err(SandboxError::Io(error))
+            if request.optional && error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            proof.record(request.source.clone(), None)?
+        }
+        Err(error) => return Err(error),
+    }
+    done.insert(index);
+    Ok(())
 }
 
 fn overlaps(left: &Path, right: &Path) -> bool {
@@ -441,7 +422,7 @@ fn canonical(path: &Path) -> Result<PathBuf, SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::Invalid("caminho deve ser absoluto"));
     }
-    Ok(path.canonicalize()?)
+    mounts::canonicalize(path)
 }
 fn directory(path: &Path) -> Result<PathBuf, SandboxError> {
     let path = canonical(path)?;

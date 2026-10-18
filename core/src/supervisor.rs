@@ -149,9 +149,8 @@ impl Supervisor {
     /// A trusted host executable override, principally for integration-test
     /// launchers on Linux where current_exe is the test harness, not __sandbox-init.
     pub fn with_fictor_exe(mut self, executable: PathBuf) -> Result<Self, SupervisorError> {
-        self.fictor_exe = executable
-            .canonicalize()
-            .map_err(|_| SupervisorError::Path)?;
+        self.fictor_exe =
+            crate::sandbox::mounts::canonicalize(&executable).map_err(|_| SupervisorError::Path)?;
         if !self.fictor_exe.is_file() {
             return Err(SupervisorError::Path);
         }
@@ -429,9 +428,7 @@ impl Supervisor {
             return Err(SupervisorError::Path);
         }
         let temporary = create_temporary(&id)?;
-        let tmp = temporary
-            .path()
-            .canonicalize()
+        let tmp = crate::sandbox::mounts::canonicalize(temporary.path())
             .map_err(|_| SupervisorError::Path)?;
         ensure_directory(&tmp, &tmp.join("home"))?;
         let mut session = if smoke && manifest.scope == Scope::Session {
@@ -1314,14 +1311,12 @@ fn expand_path(value: &str, paths: &Paths<'_>) -> Result<PathBuf, SupervisorErro
     } else if let Some(suffix) = value.strip_prefix("~/") {
         (paths.home, suffix)
     } else {
-        return Path::new(value)
-            .canonicalize()
+        return crate::sandbox::mounts::canonicalize(Path::new(value))
             .map_err(|_| SupervisorError::Path);
     };
     let candidate = root.join(suffix);
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|_| SupervisorError::Path)?;
+    let canonical =
+        crate::sandbox::mounts::canonicalize(&candidate).map_err(|_| SupervisorError::Path)?;
     if !canonical.starts_with(root) {
         return Err(SupervisorError::Path);
     }
@@ -1331,7 +1326,7 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, SupervisorError> {
     if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
         return Err(SupervisorError::Path);
     }
-    let path = path.canonicalize().map_err(|_| SupervisorError::Path)?;
+    let path = crate::sandbox::mounts::canonicalize(path).map_err(|_| SupervisorError::Path)?;
     if !path.is_dir() {
         return Err(SupervisorError::Path);
     }
@@ -1357,8 +1352,7 @@ fn ensure_directory(root: &Path, path: &Path) -> Result<(), SupervisorError> {
     Ok(())
 }
 fn create_temporary(id: &str) -> Result<tempfile::TempDir, SupervisorError> {
-    let base = std::env::temp_dir()
-        .canonicalize()
+    let base = crate::sandbox::mounts::canonicalize(&std::env::temp_dir())
         .map_err(|_| SupervisorError::Path)?;
     let root = base.join("fictor");
     ensure_directory(&base, &root)?;
@@ -1372,7 +1366,8 @@ fn expand_home_file(value: &str, home: &Path) -> Result<PathBuf, SupervisorError
         .strip_prefix("~/")
         .map(|v| home.join(v))
         .unwrap_or_else(|| PathBuf::from(value));
-    let canonical = value.canonicalize().map_err(|_| SupervisorError::Path)?;
+    let canonical =
+        crate::sandbox::mounts::canonicalize(&value).map_err(|_| SupervisorError::Path)?;
     if !canonical.starts_with(home) || !canonical.is_file() {
         return Err(SupervisorError::Path);
     }
@@ -1404,17 +1399,16 @@ fn runtime_command(
     environment: &mut BTreeMap<String, String>,
 ) -> Result<(PathBuf, PathBuf, Vec<OsString>), SupervisorError> {
     let RuntimeGrants { read, write } = grants;
-    let entry = paths
-        .bundle
-        .join(
+    let entry = crate::sandbox::mounts::canonicalize(
+        &paths.bundle.join(
             manifest
                 .runtime
                 .entry
                 .as_deref()
                 .ok_or(SupervisorError::Unsupported)?,
-        )
-        .canonicalize()
-        .map_err(|_| SupervisorError::Path)?;
+        ),
+    )
+    .map_err(|_| SupervisorError::Path)?;
     if !entry.starts_with(paths.bundle) || !entry.is_file() {
         return Err(SupervisorError::Path);
     }
@@ -1426,13 +1420,13 @@ fn runtime_command(
         if !Path::new("/run/.toolboxenv").is_file() {
             return Err(SupervisorError::Unsupported);
         }
-        let runtime = PathBuf::from(match manifest.runtime.kind {
-            RuntimeKind::Node => "/usr/bin/node",
-            RuntimeKind::Python => "/usr/bin/python3",
-            _ => return Err(SupervisorError::Unsupported),
-        })
-        .canonicalize()
-        .map_err(|_| SupervisorError::Unsupported)?;
+        let runtime =
+            crate::sandbox::mounts::canonicalize(Path::new(match manifest.runtime.kind {
+                RuntimeKind::Node => "/usr/bin/node",
+                RuntimeKind::Python => "/usr/bin/python3",
+                _ => return Err(SupervisorError::Unsupported),
+            }))
+            .map_err(|_| SupervisorError::Unsupported)?;
         if !executable(&runtime) {
             return Err(SupervisorError::Unsupported);
         }
@@ -1638,6 +1632,60 @@ async fn append_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permission_templates_and_home_files_reject_original_magic_links() {
+        use std::os::{fd::AsRawFd, unix::fs::symlink};
+        if std::env::var_os("FICTOR_TEST_SUPERVISOR_MAGIC").is_none() {
+            let output = std::process::Command::new("/usr/bin/unshare")
+                .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--pid", "--fork", "--mount-proc", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "supervisor::tests::permission_templates_and_home_files_reject_original_magic_links", "--nocapture"])
+                .env("FICTOR_TEST_SUPERVISOR_MAGIC", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Only this helper's fake files and own PID namespace are observable.
+        assert_eq!(unsafe { libc::getpid() }, 1);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        fs::write(&input, "fake test content").unwrap();
+        let file = File::open(&input).unwrap();
+        let magic = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let link = root.path().join("link");
+        symlink(&magic, &link).unwrap();
+        let paths = Paths {
+            bundle: root.path(),
+            data: root.path(),
+            tmp: root.path(),
+            store: root.path(),
+            workspace: Some(root.path()),
+            home: root.path(),
+        };
+        for value in [
+            "${workspace}/link",
+            "${ext_root}/link",
+            "${ext_data}/link",
+            "${store}/link",
+            "${tmp}/link",
+            "~/link",
+            link.to_str().unwrap(),
+            magic.to_str().unwrap(),
+        ] {
+            assert!(expand_path(value, &paths).is_err(), "{value}");
+        }
+        assert!(expand_home_file("~/link", root.path()).is_err());
+        let directory = File::open(root.path()).unwrap();
+        let directory_magic = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        assert!(canonical_directory(&directory_magic).is_err());
+        assert_eq!(expand_home_file("~/input", root.path()).unwrap(), input);
+        assert_eq!(expand_path("${workspace}/input", &paths).unwrap(), input);
+    }
     #[test]
     fn failed_pid_write_retains_the_record_until_its_owner_releases_it() {
         let directory = tempfile::tempdir().unwrap();

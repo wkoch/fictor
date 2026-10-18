@@ -1,187 +1,75 @@
 //! Bubblewrap's mount namespace is built from a small base plus validated grants.
 use std::process::Command;
-use std::{collections::BTreeSet, ffi::OsString, path::Path};
+use std::{ffi::OsString, path::Path};
 
-use super::{
-    ProxyEndpoint, SandboxError, ValidatedSandbox, attestation::Attestation, mounts::MountProof,
-};
+use super::{SandboxError, ValidatedSandbox, attestation::Attestation, mounts::MountProof};
 
 pub(super) fn arguments(
     sandbox: &ValidatedSandbox,
     command: &[OsString],
+    mounts: &super::plan::MountPlan,
     proof: &MountProof,
 ) -> Result<Vec<OsString>, SandboxError> {
+    let normalized = mounts.normalized(proof)?;
+    render(sandbox, command, mounts, proof, &normalized)
+}
+
+fn render(
+    sandbox: &ValidatedSandbox,
+    command: &[OsString],
+    mounts: &super::plan::MountPlan,
+    proof: &MountProof,
+    normalized: &[&super::plan::Mount],
+) -> Result<Vec<OsString>, SandboxError> {
     let mut attestation = Attestation::default();
-    let ProxyEndpoint::Unix(proxy) = &sandbox.profile.proxy;
     let mut args: Vec<OsString> = [
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
         "--as-pid-1",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/tmp/home",
+        "--dir",
+        "/fx",
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
-    mount(
-        &mut args,
-        &mut attestation,
-        proof,
-        "--ro-bind",
-        Path::new("/usr"),
-        Path::new("/usr"),
-    )?;
-    for (target, link) in [
-        ("usr/bin", "/bin"),
-        ("usr/sbin", "/sbin"),
-        ("usr/lib", "/lib"),
-        ("usr/lib64", "/lib64"),
-    ] {
-        args.extend(["--symlink".into(), target.into(), link.into()]);
-    }
-    for path in [
-        "/etc/ssl",
-        "/etc/pki",
-        "/etc/ca-certificates",
-        "/etc/alternatives",
-        "/etc/localtime",
-        "/etc/passwd",
-        "/etc/group",
-        "/etc/crypto-policies",
-        "/etc/nsswitch.conf",
-    ] {
-        mount(
-            &mut args,
-            &mut attestation,
-            proof,
-            "--ro-bind-try",
-            Path::new(path),
-            Path::new(path),
-        )?;
-    }
-    // Reproduce only Fedora Atomic's trusted root aliases. Their /var targets
-    // remain empty unless a specific canonical runtime/workspace grant mounts them.
-    for (alias, target) in ATOMIC_ALIASES {
-        if std::fs::read_link(alias)
-            .ok()
-            .is_some_and(|link| atomic_alias_target(Path::new(alias), &link))
-        {
-            args.extend(["--symlink".into(), (*target).into(), (*alias).into()]);
-        }
-    }
-    args.extend(
-        [
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--dir",
-            "/tmp/home",
-            "--dir",
-            "/fx",
-        ]
-        .map(OsString::from),
-    );
-    let context = &sandbox.context;
-    let profile = &sandbox.profile;
-    for path in profile.read_paths.iter().chain(&profile.write_paths) {
-        if path.starts_with(&context.tmp_dir) && !path.is_dir() {
-            return Err(SandboxError::Invalid(
-                "Linux tmp aceita só diretórios; entradas devem estar no bundle ou data",
-            ));
-        }
-    }
-    // The instance tmp is fresh tmpfs; reproduce directory structure, never host contents.
-    for path in profile
-        .read_paths
+    // The only ordering here is structural: fixed bases provide existing alias
+    // nodes; data/grant normalization has already rejected every override.
+    for mount in normalized
         .iter()
-        .chain(&profile.write_paths)
-        .chain(std::iter::once(&profile.cwd))
+        .filter(|mount| mount.role == super::plan::Role::Base)
     {
-        if path.starts_with(&context.tmp_dir) && path.is_dir() {
+        render_mount(&mut args, &mut attestation, proof, mount)?;
+    }
+    for alias in &mounts.aliases {
+        attestation.alias(&alias.destination, &alias.target)?;
+        if alias.create {
             args.extend([
-                "--dir".into(),
-                translate_path(path.as_os_str(), &context.tmp_dir),
+                "--symlink".into(),
+                alias.target.as_os_str().into(),
+                alias.destination.as_os_str().into(),
             ]);
         }
     }
-    if !context.runtime_root.starts_with("/usr") {
-        mount(
-            &mut args,
-            &mut attestation,
-            proof,
-            "--ro-bind",
-            &context.runtime_root,
-            &context.runtime_root,
-        )?;
+    for directory in &mounts.directories {
+        args.extend(["--dir".into(), directory.as_os_str().into()]);
     }
-    mount(
-        &mut args,
-        &mut attestation,
-        proof,
-        "--ro-bind",
-        &context.bundle_root,
-        &context.bundle_root,
-    )?;
-    let writes: BTreeSet<_> = profile.write_paths.iter().collect();
-    let mut reads: BTreeSet<_> = profile
-        .read_paths
+    for mount in normalized
         .iter()
-        .chain(&context.home_ro_files)
-        .collect();
-    let store = context.fictor_home.join("extensions/store");
-    if context.allow_store_read {
-        reads.insert(&store);
+        .filter(|mount| mount.role != super::plan::Role::Base)
+    {
+        render_mount(&mut args, &mut attestation, proof, mount)?;
     }
-    for path in reads {
-        if !path.starts_with(&context.tmp_dir)
-            && !writes.contains(path)
-            && path != &context.ext_data
-        {
-            mount(&mut args, &mut attestation, proof, "--ro-bind", path, path)?;
-        }
-    }
-    // Writes are mounted last so a narrower read grant cannot hide a write grant.
-    mount(
-        &mut args,
-        &mut attestation,
-        proof,
-        "--bind",
-        &context.ext_data,
-        &context.ext_data,
-    )?;
-    for path in writes {
-        if !path.starts_with(&context.tmp_dir) && path != &context.ext_data {
-            mount(&mut args, &mut attestation, proof, "--bind", path, path)?;
-        }
-    }
-    mount(
-        &mut args,
-        &mut attestation,
-        proof,
-        "--ro-bind",
-        &context.fictor_exe,
-        Path::new("/fx/fictor"),
-    )?;
-    mount(
-        &mut args,
-        &mut attestation,
-        proof,
-        "--bind",
-        proxy,
-        Path::new("/fx/proxy.sock"),
-    )?;
-    if let Some(socket) = &profile.kernel_socket {
-        mount(
-            &mut args,
-            &mut attestation,
-            proof,
-            "--bind",
-            socket,
-            Path::new("/fx/kernel.sock"),
-        )?;
-    }
+    let context = &sandbox.context;
+    let profile = &sandbox.profile;
     for (key, value) in &profile.env {
         if matches!(key.as_str(), "FICTOR_KERNEL_SOCKET" | "FICTOR_KERNEL_URL") {
             continue;
@@ -216,45 +104,26 @@ pub(super) fn arguments(
     Ok(args)
 }
 
-const ATOMIC_ALIASES: &[(&str, &str)] = &[
-    ("/home", "var/home"),
-    ("/opt", "var/opt"),
-    ("/srv", "var/srv"),
-    ("/mnt", "var/mnt"),
-    ("/root", "var/roothome"),
-];
+pub(super) use super::plan::atomic_alias_target;
 
-pub(super) fn atomic_alias_target(alias: &Path, target: &Path) -> bool {
-    ATOMIC_ALIASES.iter().any(|(path, relative)| {
-        alias == Path::new(path)
-            && (target == Path::new(relative) || target == Path::new("/").join(relative))
-    }) || (alias == Path::new("/usr/local")
-        && matches!(target.to_str(), Some("../var/usrlocal" | "/var/usrlocal")))
-}
-
-fn mount(
+fn render_mount(
     args: &mut Vec<OsString>,
     attestation: &mut Attestation,
     proof: &MountProof,
-    option: &str,
-    source: &Path,
-    target: &Path,
+    mount: &super::plan::Mount,
 ) -> Result<(), SandboxError> {
-    let snapshot = if option == "--ro-bind-try" {
-        proof.optional_source(source)?
+    attestation.bind(&mount.destination, proof.source(&mount.source)?)?;
+    let option = if mount.writable {
+        "--bind"
+    } else if mount.optional {
+        "--ro-bind-try"
     } else {
-        Some(proof.source(source)?)
+        "--ro-bind"
     };
-    // A base source that was absent during validation stays absent. Never
-    // mount an object that appeared only after that validated observation.
-    let Some(snapshot) = snapshot else {
-        return Ok(());
-    };
-    attestation.bind(target, snapshot)?;
     args.extend([
         option.into(),
-        source.as_os_str().into(),
-        target.as_os_str().into(),
+        mount.source.as_os_str().into(),
+        mount.destination.as_os_str().into(),
     ]);
     Ok(())
 }
@@ -318,6 +187,7 @@ fn runtime_arguments(sandbox: &ValidatedSandbox, arguments: &[OsString]) -> Vec<
 pub(super) fn command(
     sandbox: &ValidatedSandbox,
     child_arguments: &[OsString],
+    mounts: &super::plan::MountPlan,
     proof: &MountProof,
 ) -> Result<Command, SandboxError> {
     // Do not resolve a security boundary from the user's PATH or extension env.
@@ -349,7 +219,7 @@ pub(super) fn command(
             "--",
             executable,
         ])
-        .args(arguments(sandbox, child_arguments, proof)?);
+        .args(arguments(sandbox, child_arguments, mounts, proof)?);
     use std::os::unix::process::CommandExt;
     command.process_group(0);
     Ok(command)
@@ -358,7 +228,9 @@ pub(super) fn command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{SandboxContext, SandboxProfile, Tier};
+    use crate::sandbox::{
+        ProxyEndpoint, SandboxContext, SandboxProfile, Tier, plan::ATOMIC_ALIASES,
+    };
     use std::collections::BTreeMap;
 
     fn test_proof(sandbox: &ValidatedSandbox) -> MountProof {
@@ -401,6 +273,8 @@ mod tests {
                                 relative: Default::default(),
                                 device: (0, 0),
                                 inode: 1,
+                                filesystem: "tmpfs".into(),
+                                filesystem_magic: libc::TMPFS_MAGIC as u64,
                             }],
                             private: true,
                         }),
@@ -414,7 +288,14 @@ mod tests {
         sandbox: &ValidatedSandbox,
         command: &[OsString],
     ) -> Result<Vec<OsString>, SandboxError> {
-        super::arguments(sandbox, command, &test_proof(sandbox))
+        let mounts = super::super::plan::MountPlan::declare(&sandbox.profile, &sandbox.context)?;
+        // Rendering tests use fictional paths. FD-backed equivalence is tested
+        // in mounts/plan integration; this supplies only structural identities.
+        let normalized = mounts.normalize_with(
+            |outer, inner, relative| Ok(outer.source.join(relative) == inner.source),
+            |_| Ok(false),
+        )?;
+        super::render(sandbox, command, &mounts, &test_proof(sandbox), &normalized)
     }
 
     #[test]
@@ -510,9 +391,17 @@ mod tests {
         assert!(has(&args, &["--tmpfs", "/tmp"]));
         assert!(has(&args, &["--ro-bind", "/work/input", "/work/input"]));
         assert!(has(&args, &["--bind", "/work/output", "/work/output"]));
+        let home_target = if std::fs::read_link("/home")
+            .ok()
+            .is_some_and(|target| atomic_alias_target(Path::new("/home"), &target))
+        {
+            "/var/home/user/AGENTS.md"
+        } else {
+            "/home/user/AGENTS.md"
+        };
         assert!(has(
             &args,
-            &["--ro-bind", "/home/user/AGENTS.md", "/home/user/AGENTS.md"]
+            &["--ro-bind", "/home/user/AGENTS.md", home_target]
         ));
         assert!(has(
             &args,

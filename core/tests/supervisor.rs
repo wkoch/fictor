@@ -1922,7 +1922,16 @@ async fn approved_effective_restrictions_reach_node_environment_filesystem_and_p
     };
     // /tmp is an implicit writable Node base. Keep the workspace outside it so
     // this probe independently exercises the runtime's removed write grant.
-    let fixture = Fixture::new_in(Path::new("/var/tmp")).await;
+    // ADR-044 rejects ordinary overlay data; Toolbx /var/tmp belongs to its
+    // overlay image. Select the build's known storage explicitly for this fake
+    // fixture instead. No production path is copied or remapped.
+    let build_storage = Path::new(env!("CARGO_BIN_EXE_fictor"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    assert!(!build_storage.starts_with("/tmp"));
+    let fixture = Fixture::new_in(build_storage).await;
     let session = fixture.session().await;
     let canary = fixture.workspace.join("readonly-canary");
     fs::write(&canary, "original data").unwrap();

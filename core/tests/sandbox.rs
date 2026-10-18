@@ -559,7 +559,7 @@ mod mounted_source_attestation {
             let public = fixture.root.join("outside/public");
             fs::create_dir(&public).unwrap();
             bind(&public, &source.join("nested"));
-            profile.write_paths.push(source.join("nested"));
+            profile.read_paths.push(source.join("nested"));
         }
         profile.read_paths.push(source.clone());
         let plan = SandboxPlan::new(profile, context, vec!["-c".into(), "case \"$*\" in *--mount-proof*) exit 91;; esac; printf reached > \"$ATTESTATION_CANARY\"".into()]).unwrap();

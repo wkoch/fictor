@@ -1,5 +1,5 @@
-//! The trusted init verifies what bubblewrap actually mounted before launching
-//! untrusted code. This closes the pathname race after the host-side proof.
+//! Final mount verification by the trusted init before untrusted code runs.
+//! This supplements, and cannot itself establish, pre-exec bootstrap trust.
 use super::{SandboxError, mounts};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,11 +17,13 @@ fn invalid() -> SandboxError {
     SandboxError::Invalid("atestação das montagens ausente, inválida ou divergente")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Identity {
     device: (u32, u32),
     inode: u64,
+    filesystem: String,
+    filesystem_magic: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,12 +39,14 @@ struct Entry {
 struct WireProof {
     roots: Vec<Vec<u8>>,
     entries: Vec<Entry>,
+    aliases: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Default)]
 pub(super) struct Attestation {
     roots: BTreeSet<PathBuf>,
     entries: BTreeMap<PathBuf, Identity>,
+    aliases: BTreeMap<PathBuf, PathBuf>,
 }
 impl Attestation {
     pub(super) fn bind(
@@ -69,6 +73,8 @@ impl Attestation {
                     Identity {
                         device: entry.device,
                         inode: entry.inode,
+                        filesystem: entry.filesystem.clone(),
+                        filesystem_magic: entry.filesystem_magic,
                     },
                 )
                 .is_some()
@@ -79,12 +85,30 @@ impl Attestation {
         if !entries.contains_key(target) {
             return Err(invalid());
         }
-        // A later explicit parent bind hides earlier binds below it. A narrower
-        // explicit bind replaces only its own subtree, preserving its parent.
-        self.roots.retain(|path| !path.starts_with(target));
-        self.entries.retain(|path, _| !path.starts_with(target));
+        // The normalized plan has no overrides. Refuse overlap again here so
+        // mount order cannot silently change the meaning of its proof.
+        if self
+            .roots
+            .iter()
+            .any(|path| path.starts_with(target) || target.starts_with(path))
+        {
+            return Err(invalid());
+        }
         self.roots.insert(target.to_owned());
         self.entries.extend(entries);
+        Ok(())
+    }
+
+    pub(super) fn alias(&mut self, destination: &Path, target: &Path) -> Result<(), SandboxError> {
+        if !absolute(destination)
+            || !absolute(target)
+            || self
+                .aliases
+                .insert(destination.into(), target.into())
+                .is_some()
+        {
+            return Err(invalid());
+        }
         Ok(())
     }
 
@@ -103,7 +127,17 @@ impl Attestation {
                 .iter()
                 .map(|(path, identity)| Entry {
                     destination: path.as_os_str().as_bytes().to_vec(),
-                    identity: *identity,
+                    identity: identity.clone(),
+                })
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .map(|(destination, target)| {
+                    (
+                        destination.as_os_str().as_bytes().to_vec(),
+                        target.as_os_str().as_bytes().to_vec(),
+                    )
                 })
                 .collect(),
         };
@@ -118,6 +152,12 @@ impl Attestation {
         }
         let wire: WireProof = serde_json::from_str(bytes).map_err(|_| invalid())?;
         let mut proof = Self::default();
+        for (destination, target) in wire.aliases {
+            proof.alias(
+                &PathBuf::from(std::ffi::OsString::from_vec(destination)),
+                &PathBuf::from(std::ffi::OsString::from_vec(target)),
+            )?;
+        }
         for bytes in wire.roots {
             let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
             if !absolute(&path) || !proof.roots.insert(path) {
@@ -145,6 +185,26 @@ impl Attestation {
     }
 
     pub(super) fn verify(&self) -> Result<(), SandboxError> {
+        for (destination, expected) in &self.aliases {
+            let link = std::fs::read_link(destination)?;
+            let mut actual = if link.is_absolute() {
+                PathBuf::new()
+            } else {
+                destination.parent().ok_or_else(invalid)?.to_owned()
+            };
+            for component in link.components() {
+                match component {
+                    Component::RootDir => actual.push("/"),
+                    Component::Normal(part) => actual.push(part),
+                    Component::CurDir => {}
+                    Component::ParentDir if actual.pop() => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            if &actual != expected {
+                return Err(invalid());
+            }
+        }
         let mut actual = BTreeMap::new();
         let mut private = true;
         for root in &self.roots {
@@ -157,9 +217,11 @@ impl Attestation {
                 let identity = Identity {
                     device: entry.device,
                     inode: entry.inode,
+                    filesystem: entry.filesystem,
+                    filesystem_magic: entry.filesystem_magic,
                 };
                 if actual
-                    .insert(path, identity)
+                    .insert(path, identity.clone())
                     .is_some_and(|old| old != identity)
                 {
                     return Err(invalid());
@@ -215,6 +277,8 @@ mod tests {
                     relative: relative.into(),
                     device: (1, 2),
                     inode: *inode,
+                    filesystem: "tmpfs".into(),
+                    filesystem_magic: libc::TMPFS_MAGIC as u64,
                 })
                 .collect(),
             private: true,
@@ -222,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_preserves_explicit_nested_binds_and_parent_overlays() {
+    fn proof_rejects_nested_binds_instead_of_overlaying_an_earlier_proof() {
         let mut proof = Attestation::default();
         proof
             .bind(
@@ -230,13 +294,15 @@ mod tests {
                 &source(&[("", 1), ("nested", 2), ("nested/covered", 3)]),
             )
             .unwrap();
-        proof
-            .bind(Path::new("/work/nested"), &source(&[("", 4), ("new", 5)]))
-            .unwrap();
-        assert_eq!(proof.entries.len(), 3);
-        assert_eq!(proof.entries[Path::new("/work/nested")].inode, 4);
         assert!(
-            !proof
+            proof
+                .bind(Path::new("/work/nested"), &source(&[("", 4), ("new", 5)]))
+                .is_err()
+        );
+        assert_eq!(proof.entries.len(), 3);
+        assert_eq!(proof.entries[Path::new("/work/nested")].inode, 2);
+        assert!(
+            proof
                 .entries
                 .contains_key(Path::new("/work/nested/covered"))
         );
@@ -245,10 +311,10 @@ mod tests {
             Attestation::parse(&encoded).unwrap().encode().unwrap(),
             encoded
         );
-        proof.bind(Path::new("/work"), &source(&[("", 6)])).unwrap();
+        assert!(proof.bind(Path::new("/work"), &source(&[("", 6)])).is_err());
         assert_eq!(proof.roots.len(), 1);
-        assert_eq!(proof.entries.len(), 1);
-        assert_eq!(proof.entries[Path::new("/work")].inode, 6);
+        assert_eq!(proof.entries.len(), 3);
+        assert_eq!(proof.entries[Path::new("/work")].inode, 1);
     }
 
     #[test]
