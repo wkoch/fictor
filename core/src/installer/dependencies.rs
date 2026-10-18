@@ -323,6 +323,10 @@ impl Environment {
         );
         let home = root.path().join("core");
         crate::home::prepare(&home).map_err(|_| DependencyError::Storage)?;
+        // This is a newly created disposable core home. Normal supervisor
+        // admission still requires its complete initialized lock, even though
+        // the fixed resolver bootstrap is not an activated extension.
+        super::lock::Lock::initialize_empty(&home).map_err(|_| DependencyError::Storage)?;
         let mut config = Config::create_if_missing(&home).map_err(|_| DependencyError::Storage)?;
         config.providers.clear();
         config.sandbox.home_ro_files.clear();

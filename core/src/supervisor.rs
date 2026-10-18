@@ -1,5 +1,6 @@
 //! Trusted launch, process ownership and lazy crash admission. The installer
 //! supplies a validated bundle and explicit identity; no call is replayed here.
+pub mod controls;
 use crate::{
     config::Config,
     crash_recovery::{
@@ -10,9 +11,13 @@ use crate::{
         bundle::{self, BundleBudget, BundleProfile},
         manifest::{KernelScope, Manifest, Role, RuntimeKind, Scope},
     },
+    instance_recovery::{InstanceJournal, NewInstance, ProcessHandle},
     kernel::{KernelError, KernelIdentity, KernelServer, LogFuture, LogRecord, LogSink},
     proxy::{EgressProxy, ProxyIdentity, ProxyToken, nat64::Nat64Prefixes},
-    sandbox::{ProxyEndpoint, SandboxContext, SandboxPlan, SandboxProfile, Tier},
+    sandbox::{
+        ProxyEndpoint, SandboxContext, SandboxPlan, SandboxProfile, Tier,
+        admission::AdmissionListener,
+    },
     secrets::{RedactionStream, Redactor, SecretStore},
     store::{AppendEvent, Provenance, Store},
 };
@@ -22,6 +27,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    mem::ManuallyDrop,
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::ExitStatusExt,
@@ -70,6 +76,8 @@ pub enum SupervisorError {
     CrashLoop,
     #[error("promoção pendente impede admissão da extensão")]
     PromotionPending,
+    #[error("admissão da extensão bloqueada")]
+    Admission,
 }
 
 pub struct Supervisor {
@@ -87,6 +95,7 @@ pub struct Supervisor {
     logs: Mutex<BTreeMap<String, Arc<Mutex<RotatingLog>>>>,
     crash_clock: Arc<dyn CrashClock>,
     pending_crashes: Arc<Mutex<BTreeMap<RecoveryKey, CrashObservation>>>,
+    controls: controls::ControlRegistry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,12 +105,12 @@ pub struct ProcessExit {
     pub crashed: bool,
 }
 
-/// Dropping this handle kills the sandbox. Its detached owner confirms namespace
-/// exit by reaping bubblewrap before releasing sockets or temporary paths.
+/// Dropping this handle requests termination through pinned processes. Its
+/// detached owner requires launcher and PID 1 exit before releasing paths.
 pub struct ManagedInstance {
     pub instance_id: String,
     pid: u32,
-    group: Arc<Mutex<Option<u32>>>,
+    processes: Arc<Mutex<LiveProcesses>>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     connection: Option<McpConnection>,
@@ -124,6 +133,88 @@ struct LaunchRequest<'a> {
     owner: Option<Arc<dyn Send + Sync>>,
 }
 
+#[derive(Default)]
+struct LiveProcesses {
+    launcher: Option<Arc<ProcessHandle>>,
+    init: Option<Arc<ProcessHandle>>,
+}
+impl LiveProcesses {
+    fn signal(&self, signal: i32) {
+        // PID 1 terminates the entire namespace. Numeric groups are not used:
+        // a reaped launcher's PID may already belong to another process.
+        if let Some(init) = &self.init {
+            let _ = init.signal(signal);
+        }
+        if (signal == libc::SIGKILL || self.init.is_none())
+            && let Some(launcher) = &self.launcher
+        {
+            let _ = launcher.signal(signal);
+        }
+    }
+    fn both_exited(&self) -> bool {
+        matches!((&self.launcher, &self.init), (Some(launcher), Some(init))
+            if launcher.is_exited().is_ok_and(|exited| exited)
+                && init.is_exited().is_ok_and(|exited| exited))
+    }
+}
+
+struct LaunchAssets {
+    journal: InstanceJournal,
+    _smoke_home: Option<tempfile::TempDir>,
+    _smoke_workspace: Option<tempfile::TempDir>,
+    _owner: Option<Arc<dyn Send + Sync>>,
+    plan: Option<SandboxPlan>,
+    _pid_file: Option<PidFile>,
+    kernel: Option<KernelServer>,
+    _control: Option<controls::InstanceControlRegistration>,
+}
+
+// Dropping an owner after fork, including unwind/task cancellation, must not
+// delete any path. ManuallyDrop makes retention the default; only a strict
+// Prepared cleanup or the two pinned exit proofs can enable destruction.
+struct RetainedAssets {
+    assets: ManuallyDrop<LaunchAssets>,
+    spawning: bool,
+    released: bool,
+}
+impl RetainedAssets {
+    fn confirmed_cleanup(&mut self, processes: &LiveProcesses) -> bool {
+        let (Some(launcher), Some(init)) = (&processes.launcher, &processes.init) else {
+            return false;
+        };
+        if self
+            .assets
+            .journal
+            .cleanup_confirmed(launcher, init)
+            .is_ok()
+        {
+            self.released = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+impl Drop for RetainedAssets {
+    fn drop(&mut self) {
+        if let Some(kernel) = self.assets.kernel.take() {
+            kernel.revoke();
+            // defer_socket_cleanup transferred pathname ownership to journal;
+            // dropping transport cannot delete it. Do release service Store
+            // references, or a retained partial attempt could pin its writer
+            // task forever during runtime shutdown.
+            drop(kernel);
+        }
+        if self.released || !self.spawning && self.assets.journal.cleanup_prepared().is_ok() {
+            // SAFETY: this is the sole destruction point and runs exactly once,
+            // after the journal's strict cleanup authorized resource release.
+            unsafe {
+                ManuallyDrop::drop(&mut self.assets);
+            }
+        }
+    }
+}
+
 impl Supervisor {
     pub fn new(
         home: impl AsRef<Path>,
@@ -141,6 +232,7 @@ impl Supervisor {
         let nat64 = Nat64Prefixes::new(&config.egress.nat64_prefixes)
             .map_err(|_| SupervisorError::Invalid)?;
         let fictor_exe = std::env::current_exe().map_err(|_| SupervisorError::Path)?;
+        let controls = controls::ControlRegistry::new(store.owner().clone());
         Ok(Self {
             home,
             home_anchor,
@@ -156,6 +248,7 @@ impl Supervisor {
             logs: Mutex::default(),
             crash_clock: Arc::new(LinuxCrashClock),
             pending_crashes: Arc::default(),
+            controls,
         })
     }
 
@@ -164,6 +257,16 @@ impl Supervisor {
     pub fn with_crash_clock(mut self, clock: Arc<dyn CrashClock>) -> Self {
         self.crash_clock = clock;
         self
+    }
+
+    pub fn control_registry(&self) -> controls::ControlRegistry {
+        self.controls.clone()
+    }
+
+    /// The same boot snapshot used for actual instance grants. Review must not
+    /// reopen a later config to reconstruct what disposable smoke omitted.
+    pub(crate) fn configured_home_ro_files(&self) -> &[String] {
+        &self.config.sandbox.home_ro_files
     }
 
     async fn require_recovery(&self, key: &RecoveryKey) -> Result<(), SupervisorError> {
@@ -455,13 +558,15 @@ impl Supervisor {
             format!("smoke:{id}")
         } else {
             match manifest.scope {
-                Scope::Global if session_id.is_none() && workspace.is_none() => manifest.id.clone(),
+                Scope::Global if session_id.is_none() && workspace.is_none() => {
+                    format!("{}@{key}", manifest.id)
+                }
                 Scope::Session if session_id.is_some() && workspace.is_some() => {
                     let session = session_id.ok_or(SupervisorError::Invalid)?;
                     if session.len() != 26 || session.parse::<ulid::Ulid>().is_err() {
                         return Err(SupervisorError::Invalid);
                     }
-                    format!("{}@{session}", manifest.id)
+                    format!("{}@{key}@{session}", manifest.id)
                 }
                 _ => return Err(SupervisorError::Invalid),
             }
@@ -484,6 +589,11 @@ impl Supervisor {
         {
             return Err(SupervisorError::PromotionPending);
         }
+        if !smoke {
+            self.controls
+                .allow_version(&manifest.id, key)
+                .map_err(|_| SupervisorError::Admission)?;
+        }
         let reservation = Reservation::new(self.active.clone(), logical)?;
         let bundle = canonical_directory(bundle)?;
         let quarantine = self.home.join("extensions/quarantine");
@@ -502,19 +612,30 @@ impl Supervisor {
         {
             return Err(SupervisorError::Path);
         }
-        let temporary = create_temporary(&id)?;
-        let tmp = crate::sandbox::mounts::canonicalize(temporary.path())
-            .map_err(|_| SupervisorError::Path)?;
-        ensure_directory(&tmp, &tmp.join("home"))?;
+        // A smoke workspace is an ordinary fake resource outside FICTOR_HOME,
+        // not a child of the private preparation tree and never its ancestor.
+        let smoke_workspace = if smoke && manifest.scope == Scope::Session {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("fx-work-")
+                    .tempdir_in("/tmp")
+                    .map_err(|_| SupervisorError::Path)?,
+            )
+        } else {
+            None
+        };
         let mut session = if smoke && manifest.scope == Scope::Session {
             Some(ulid::Ulid::generate().to_string())
         } else {
             session_id.map(str::to_owned)
         };
         let workspace = if smoke && manifest.scope == Scope::Session {
-            let path = tmp.join("workspace");
-            ensure_directory(&tmp, &path)?;
-            Some(path)
+            Some(canonical_directory(
+                smoke_workspace
+                    .as_ref()
+                    .ok_or(SupervisorError::Path)?
+                    .path(),
+            )?)
         } else {
             workspace.map(canonical_directory).transpose()?
         };
@@ -565,6 +686,36 @@ impl Supervisor {
         if !smoke {
             self.require_recovery(&recovery).await?;
         }
+        let journal = InstanceJournal::prepare(
+            self.store.owner().clone(),
+            NewInstance {
+                instance_id: id.clone(),
+                ext_id: manifest.id.clone(),
+                key: key.into(),
+                session_id: session.clone(),
+            },
+        )
+        .map_err(|_| SupervisorError::Audit)?;
+        let mut assets = RetainedAssets {
+            assets: ManuallyDrop::new(LaunchAssets {
+                journal,
+                _smoke_home: smoke_home,
+                _smoke_workspace: smoke_workspace,
+                _owner: owner,
+                plan: None,
+                _pid_file: None,
+                kernel: None,
+                _control: None,
+            }),
+            spawning: false,
+            released: false,
+        };
+        let tmp = assets
+            .assets
+            .journal
+            .create_temporary()
+            .map_err(|_| SupervisorError::Path)?;
+        ensure_directory(&tmp, &tmp.join("home"))?;
         let data_base = self.home.join("extensions/data");
         let data = if smoke {
             data_base.join(&manifest.id).join("smoke").join(&id)
@@ -574,7 +725,6 @@ impl Supervisor {
             data_base.join(&manifest.id)
         };
         ensure_directory(&self.home, &data)?;
-        let smoke_data = smoke.then(|| RemoveDirectory(data.clone()));
         let paths = Paths {
             bundle: &bundle,
             data: &data,
@@ -705,7 +855,7 @@ impl Supervisor {
                         .ok_or(SupervisorError::Invalid)
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            let kernel = KernelServer::bind_with_log(
+            let mut kernel = KernelServer::bind_with_log(
                 &self.home,
                 KernelIdentity {
                     ext_id: manifest.id.clone(),
@@ -723,6 +873,7 @@ impl Supervisor {
             )
             .await
             .map_err(|_| SupervisorError::Transport)?;
+            kernel.defer_socket_cleanup();
             redactor
                 .register(kernel.token())
                 .map_err(|_| SupervisorError::Secret)?;
@@ -796,8 +947,12 @@ impl Supervisor {
             &self.home_anchor,
         )
         .map_err(|_| SupervisorError::Sandbox)?;
-        let mut command =
-            tokio::process::Command::from(plan.command().map_err(|_| SupervisorError::Sandbox)?);
+        let barrier = AdmissionListener::bind(&assets.assets.journal.admission_socket_path())
+            .map_err(|_| SupervisorError::Transport)?;
+        let mut command = tokio::process::Command::from(
+            plan.command_with_admission(&barrier)
+                .map_err(|_| SupervisorError::Sandbox)?,
+        );
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -808,18 +963,46 @@ impl Supervisor {
         // belongs to the detached owner; no `?` may release live instance paths.
         let pid_path = self.home.join("run").join(format!("{id}.pid"));
         let (pid_file, mut pid_record) = prepare_pid(&pid_path)?;
+        assets.assets.plan = Some(plan);
+        assets.assets._pid_file = Some(pid_file);
+        assets.assets.kernel = kernel.take();
+        // The durable state covers every fork, including a failing exec in
+        // Command::spawn. An uncertain Spawning record never enables Drop.
+        assets
+            .assets
+            .journal
+            .spawning()
+            .map_err(|_| SupervisorError::Audit)?;
+        assets.spawning = true;
         let mut child = command.spawn().map_err(|_| SupervisorError::Process)?;
         let pid = child.id().unwrap_or(0);
         let mut startup_error = if pid == 0 {
             Some(SupervisorError::Process)
         } else {
-            record_pid(&mut pid_record, pid).err()
+            None
         };
+        let launcher = match ProcessHandle::capture(pid, false) {
+            Ok(launcher) => Some(Arc::new(launcher)),
+            Err(_) => {
+                startup_error.get_or_insert(SupervisorError::Process);
+                None
+            }
+        };
+        if let Some(launcher) = &launcher
+            && assets.assets.journal.record_launcher(launcher).is_err()
+        {
+            startup_error.get_or_insert(SupervisorError::Audit);
+        }
+        if let Err(error) = record_pid(&mut pid_record, pid) {
+            startup_error.get_or_insert(error);
+        }
         drop(pid_record);
-        let group = Arc::new(Mutex::new(Some(pid)));
-        let guard = GroupGuard {
-            pid,
-            group: group.clone(),
+        let processes = Arc::new(Mutex::new(LiveProcesses {
+            launcher,
+            init: None,
+        }));
+        let guard = ProcessGuard {
+            processes: processes.clone(),
         };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -829,6 +1012,20 @@ impl Supervisor {
         }
         let (stop, stop_receiver) = watch::channel(false);
         let catalog_invalidation = CatalogInvalidation::new(stop.clone());
+        if !smoke {
+            match self.controls.register_version(
+                &manifest.id,
+                key,
+                &id,
+                stop.clone(),
+                catalog_invalidation.admission(),
+            ) {
+                Ok(control) => assets.assets._control = Some(control),
+                Err(_) => {
+                    startup_error.get_or_insert(SupervisorError::Admission);
+                }
+            }
+        }
         let (exit_sender, exit) = watch::channel(None);
         let (ready, started) = oneshot::channel();
         let audit = AuditIdentity {
@@ -840,7 +1037,7 @@ impl Supervisor {
         let managed = ManagedInstance {
             instance_id: id.clone(),
             pid,
-            group,
+            processes: processes.clone(),
             stdin,
             stdout,
             connection: None,
@@ -856,7 +1053,6 @@ impl Supervisor {
         tokio::spawn(async move {
             // Mount source descriptors stay pinned until reap, including the
             // interval before __sandbox-init verifies its post-mount proof.
-            let _ownership = (temporary, smoke_data, pid_file, smoke_home, owner, plan);
             let mut reservation = Some(reservation);
             let stderr = tokio::spawn(async move {
                 match stderr {
@@ -864,11 +1060,60 @@ impl Supervisor {
                     None => Err(SupervisorError::Process),
                 }
             });
+            // SO_PEERCRED supplies the host PID only after trusted init's final
+            // attestation. No child-supplied numeric identity is accepted.
+            let pending = match barrier.accept(Duration::from_secs(10)).await {
+                Ok(pending) => Some(pending),
+                Err(_) => {
+                    startup_error.get_or_insert(SupervisorError::Process);
+                    None
+                }
+            };
+            if let Some(pending) = &pending {
+                match ProcessHandle::capture(pending.peer_pid(), true) {
+                    Ok(init) => {
+                        if let Ok(mut processes) = processes.lock() {
+                            processes.init = Some(Arc::new(init));
+                        } else {
+                            startup_error.get_or_insert(SupervisorError::Process);
+                        }
+                    }
+                    Err(_) => {
+                        startup_error.get_or_insert(SupervisorError::Process);
+                    }
+                }
+            }
+            if startup_error.is_none() {
+                let armed = processes.lock().ok().is_some_and(|processes| {
+                    matches!((&processes.launcher, &processes.init), (Some(launcher), Some(init))
+                        if assets.assets.journal.arm(launcher, init).is_ok())
+                });
+                if !armed {
+                    startup_error = Some(SupervisorError::Audit);
+                }
+            }
+            if startup_error.is_none() && ready.is_closed() {
+                startup_error = Some(SupervisorError::Process);
+            }
             if startup_error.is_none() {
                 startup_error = audit_event(&audit, "ext.started", json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key,"pid":pid,"smoke":smoke}), vec![]).await.err();
             }
+            if startup_error.is_none() && ready.is_closed() {
+                startup_error = Some(SupervisorError::Process);
+            }
+            if startup_error.is_none() {
+                if let Some(pending) = pending {
+                    if pending.release().await.is_err() {
+                        startup_error = Some(SupervisorError::Process);
+                    }
+                } else {
+                    startup_error = Some(SupervisorError::Process);
+                }
+            } else {
+                drop(pending);
+            }
             let success = startup_error.is_none();
-            let failed_ready = if success {
+            let mut failed_ready = if success {
                 // The detached owner holds admission across caller cancellation
                 // after fork, but not throughout the process's active lifetime.
                 admission.take();
@@ -877,23 +1122,52 @@ impl Supervisor {
             } else {
                 Some(ready)
             };
-            let outcome = supervise(
-                &mut child,
-                stop_receiver,
-                success,
-                CleanupContext {
-                    kernel: &mut kernel,
-                    guard: &guard,
-                    registration: &registration,
-                    audit: &audit,
-                    reservation: &mut reservation,
-                    catalog_invalidation: &catalog_invalidation,
-                },
-            )
-            .await;
+            let outcome = {
+                let monitor = supervise(
+                    &mut child,
+                    stop_receiver,
+                    success,
+                    CleanupContext {
+                        kernel: &mut assets.assets.kernel,
+                        guard: &guard,
+                        registration: &registration,
+                        audit: &audit,
+                        reservation: &mut reservation,
+                        catalog_invalidation: &catalog_invalidation,
+                    },
+                );
+                tokio::pin!(monitor);
+                if success {
+                    monitor.await
+                } else {
+                    match tokio::time::timeout(Duration::from_secs(10), &mut monitor).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            admission.take();
+                            if let Some(ready) = failed_ready.take() {
+                                let _ = ready.send(Err(SupervisorError::Process));
+                            }
+                            monitor.await
+                        }
+                    }
+                }
+            };
             drop(registration); // Revoke before potentially waiting on inherited pipes.
-            if let Some(kernel) = &kernel {
+            if let Some(kernel) = &assets.assets.kernel {
                 kernel.revoke();
+            }
+            if outcome.is_err() {
+                // A missing/ambiguous PID 1 cannot authorize cleanup. Report
+                // bounded admission failure while this owner retains assets,
+                // including if an inherited stderr pipe never reaches EOF.
+                admission.take();
+                reservation.take();
+                exit_sender.send_replace(Some(Err(())));
+                if let Some(ready) = failed_ready.take() {
+                    let _ = ready.send(Err(startup_error
+                        .take()
+                        .unwrap_or(SupervisorError::Process)));
+                }
             }
             let tail = stderr.await;
             let stderr_failed = !matches!(&tail, Ok(Ok(_)));
@@ -901,11 +1175,24 @@ impl Supervisor {
                 .ok()
                 .and_then(Result::ok)
                 .unwrap_or_else(|| b"[stderr capture unavailable]\n".to_vec());
-            let kernel_failed = if let Some(kernel) = &mut kernel {
+            let kernel_failed = if let Some(kernel) = &mut assets.assets.kernel {
                 kernel.shutdown().await.is_err()
             } else {
                 false
             };
+            let cleanup_failed = !processes
+                .lock()
+                .ok()
+                .is_some_and(|processes| assets.confirmed_cleanup(&processes));
+            if cleanup_failed {
+                let _ = audit_event(
+                    &audit,
+                    "ext.cleanup_failed",
+                    json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key}),
+                    vec![],
+                )
+                .await;
+            }
             // Re-read after namespace/transport shutdown: invalidation can race
             // a manual stop. This task owns both the audit and instance paths.
             let catalog_failed = if catalog_invalidation.is_invalidated() {
@@ -947,7 +1234,9 @@ impl Supervisor {
             if process_failed {
                 payload["process_error"] = true.into();
             }
-            let audited = if outcome.crashed && !smoke {
+            let audited = if process_failed {
+                Ok(())
+            } else if outcome.crashed && !smoke {
                 let observation = CrashObservation {
                     recovery,
                     instance_id: id.clone(),
@@ -991,16 +1280,16 @@ impl Supervisor {
                 && !process_failed
                 && !blob_failed
                 && !catalog_failed
+                && !cleanup_failed
             {
                 Ok(outcome)
             } else {
                 Err(())
             };
             // Observers of completion also observe PID and temporary-path cleanup.
-            drop(kernel);
             drop(reservation);
             drop(guard);
-            drop(_ownership);
+            drop(assets);
             admission.take();
             exit_sender.send_replace(Some(final_result));
             if let Some(ready) = failed_ready {
@@ -1125,17 +1414,15 @@ impl Drop for HandshakeGuard {
 impl Drop for ManagedInstance {
     fn drop(&mut self) {
         self.stop.send_replace(true);
-        if let Ok(group) = self.group.lock()
-            && let Some(pid) = *group
-        {
-            signal_group(pid, libc::SIGKILL);
+        if let Ok(processes) = self.processes.lock() {
+            processes.signal(libc::SIGKILL);
         }
     }
 }
 
 struct CleanupContext<'a> {
     kernel: &'a mut Option<KernelServer>,
-    guard: &'a GroupGuard,
+    guard: &'a ProcessGuard,
     registration: &'a Registration,
     audit: &'a AuditIdentity,
     reservation: &'a mut Option<Reservation>,
@@ -1162,10 +1449,11 @@ async fn supervise(
             kernel.revoke();
         }
         let _ = child.start_kill();
-        signal_group(guard.pid, libc::SIGKILL);
+        guard.signal(libc::SIGKILL);
         let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
             Ok(status) => status,
             Err(_) => {
+                reservation.take();
                 let _ = audit_event(
                     audit,
                     "ext.cleanup_failed",
@@ -1175,7 +1463,6 @@ async fn supervise(
                     vec![],
                 )
                 .await;
-                reservation.take();
                 child.wait().await
             }
         };
@@ -1193,10 +1480,10 @@ async fn supervise(
                             Err(_) => {
                                 let _ = registration.proxy.revoke(&registration.token);
                                 if let Some(kernel) = &kernel { kernel.revoke(); }
-                                signal_group(guard.pid, libc::SIGTERM);
+                                guard.signal(libc::SIGTERM);
                                 match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
                                     Ok(status) => status,
-                                    Err(_) => { signal_group(guard.pid, libc::SIGKILL); child.wait().await }
+                                    Err(_) => { guard.signal(libc::SIGKILL); child.wait().await }
                                 }
                             }
                         }
@@ -1226,14 +1513,14 @@ async fn supervise(
                     Err(_) => {
                         let _ = registration.proxy.revoke(&registration.token);
                         if let Some(kernel) = &kernel { kernel.revoke(); }
-                        signal_group(guard.pid, libc::SIGKILL);
+                        guard.signal(libc::SIGKILL);
+                        reservation.take();
                         let _ = audit_event(audit, "ext.cleanup_failed", json!({
                             "ext_id": audit.ext_id, "instance_id": audit.instance_id,
                             "key": audit.key
                         }), vec![]).await;
                         // A new identity may start, while this owner retains all
                         // resources belonging to the unconfirmed namespace.
-                        reservation.take();
                         child.wait().await
                     }
                 };
@@ -1251,7 +1538,7 @@ async fn supervise(
         // No exit was observed before the core requested cleanup. Do not infer
         // another crash from cleanup_failed or from a forced termination.
         crashed = false;
-        signal_group(guard.pid, libc::SIGKILL);
+        guard.signal(libc::SIGKILL);
         let _ = audit_event(
             audit,
             "ext.cleanup_failed",
@@ -1275,13 +1562,42 @@ async fn supervise(
             }
         }
     };
-    // ADR-029: bubblewrap exit confirms the PID namespace is empty, including
-    // double-forked/setsid descendants. A host process group is not the tree.
-    if let Ok(mut group) = guard.group.lock() {
-        *group = None;
+    let complete = guard
+        .processes
+        .lock()
+        .ok()
+        .is_some_and(|processes| processes.launcher.is_some() && processes.init.is_some());
+    if !complete {
+        // The launcher alone never proves namespace exit. An incomplete
+        // Spawning record and every asset remain retained by the owner guard.
+        return Err(SupervisorError::Process);
     }
-    // The now-empty numeric group must never be signalled again, including Drop
-    // of a caller handle whose stderr/audit completion is still pending.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut reported = false;
+    loop {
+        if guard
+            .processes
+            .lock()
+            .ok()
+            .is_some_and(|processes| processes.both_exited())
+        {
+            break;
+        }
+        if !reported && tokio::time::Instant::now() >= deadline {
+            reported = true;
+            reservation.take();
+            let _ = audit_event(
+                audit,
+                "ext.cleanup_failed",
+                json!({"ext_id":audit.ext_id,"instance_id":audit.instance_id,"key":audit.key}),
+                vec![],
+            )
+            .await;
+        }
+        // A timeout/observation error retains ownership and does not turn a
+        // pidfd or EOF into permission to delete paths.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     Ok(exit(status, crashed))
 }
 fn exit(status: ExitStatus, crashed: bool) -> ProcessExit {
@@ -1291,27 +1607,19 @@ fn exit(status: ExitStatus, crashed: bool) -> ProcessExit {
         crashed,
     }
 }
-struct GroupGuard {
-    pid: u32,
-    group: Arc<Mutex<Option<u32>>>,
+struct ProcessGuard {
+    processes: Arc<Mutex<LiveProcesses>>,
 }
-impl Drop for GroupGuard {
+impl ProcessGuard {
+    fn signal(&self, signal: i32) {
+        if let Ok(processes) = self.processes.lock() {
+            processes.signal(signal);
+        }
+    }
+}
+impl Drop for ProcessGuard {
     fn drop(&mut self) {
-        if let Ok(mut group) = self.group.lock()
-            && let Some(pid) = group.take()
-        {
-            signal_group(pid, libc::SIGKILL);
-        }
-    }
-}
-fn signal_group(pid: u32, signal: i32) {
-    if pid == 0 {
-        return;
-    }
-    if let Ok(pid) = i32::try_from(pid) {
-        unsafe {
-            libc::kill(-pid, signal);
-        }
+        self.signal(libc::SIGKILL);
     }
 }
 struct Registration {
@@ -1344,12 +1652,6 @@ impl Drop for Reservation {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&self.key);
         }
-    }
-}
-struct RemoveDirectory(PathBuf);
-impl Drop for RemoveDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 struct PidFile(PathBuf);
@@ -1464,16 +1766,6 @@ fn ensure_directory(root: &Path, path: &Path) -> Result<(), SupervisorError> {
         }
     }
     Ok(())
-}
-fn create_temporary(id: &str) -> Result<tempfile::TempDir, SupervisorError> {
-    let base = crate::sandbox::mounts::canonicalize(&std::env::temp_dir())
-        .map_err(|_| SupervisorError::Path)?;
-    let root = base.join("fictor");
-    ensure_directory(&base, &root)?;
-    tempfile::Builder::new()
-        .prefix(id)
-        .tempdir_in(root)
-        .map_err(|_| SupervisorError::Path)
 }
 fn expand_home_file(value: &str, home: &Path) -> Result<PathBuf, SupervisorError> {
     let value = value
@@ -1919,7 +2211,7 @@ mod tests {
         let mut instance = ManagedInstance {
             instance_id: "fake".into(),
             pid: 0,
-            group: Arc::new(Mutex::new(None)),
+            processes: Arc::new(Mutex::new(LiveProcesses::default())),
             stdin: None,
             stdout: None,
             connection: None,

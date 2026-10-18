@@ -1,15 +1,19 @@
 //! Phase-0 local receipt, validation and isolated checks. No automatic activation.
 pub mod activation;
 pub mod bundle;
+pub mod cli;
 pub mod control;
+pub mod controls;
 pub mod dependencies;
 pub mod lease;
 pub mod listing;
 pub mod local;
 pub mod lock;
 pub mod manifest;
+pub mod online;
 pub mod overrides;
 pub mod promotion;
+pub mod publication;
 pub mod recovery;
 pub(crate) mod registries;
 

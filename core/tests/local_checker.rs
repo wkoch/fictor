@@ -12,8 +12,19 @@ use fictor::{
 use std::{fs, path::Path, sync::Arc};
 
 async fn setup(home: &Path, real_home: &Path) -> (LocalChecker, Arc<Store>) {
-    fictor::initialize(home).await.unwrap();
-    let store = Arc::new(Store::open(home).await.unwrap());
+    setup_with_home_ro(home, real_home, None).await
+}
+async fn setup_with_home_ro(
+    home: &Path,
+    real_home: &Path,
+    home_ro: Option<&[&str]>,
+) -> (LocalChecker, Arc<Store>) {
+    let owner = fictor::ownership::HomeLease::create_for_init(home).unwrap();
+    fictor::initialize_owned(owner.clone()).await.unwrap();
+    if let Some(home_ro) = home_ro {
+        set_home_ro(home, home_ro);
+    }
+    let store = Arc::new(Store::open_with_lease(owner).await.unwrap());
     let supervisor = test_supervisor(home, real_home, store.clone(), "proxy.sock").await;
     (
         LocalChecker::new(
@@ -25,6 +36,18 @@ async fn setup(home: &Path, real_home: &Path) -> (LocalChecker, Arc<Store>) {
         ),
         store,
     )
+}
+
+fn set_home_ro(home: &Path, files: &[&str]) {
+    let path = home.join("config.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["sandbox"]["home_ro_files"] = toml::Value::Array(
+        files
+            .iter()
+            .map(|path| toml::Value::String((*path).into()))
+            .collect(),
+    );
+    fs::write(path, toml::to_string(&config).unwrap()).unwrap();
 }
 
 async fn test_supervisor(
@@ -479,7 +502,8 @@ async fn review_preserves_requested_permissions_omitted_paths_and_ignored_receip
     fs::write(source.join("node_modules/ignored.js"), b"ignored").unwrap();
     // This test intentionally fails before smoke, proving the review metadata is
     // retained even when the requested executable cannot be started.
-    let (checker, store) = setup(&home, &real).await;
+    let (checker, store) =
+        setup_with_home_ro(&home, &real, Some(&["~/old-z", "~/Documents/x", "~/old-a"])).await;
     let LocalError::Failed {
         proposal_id,
         reason,
@@ -511,6 +535,43 @@ async fn review_preserves_requested_permissions_omitted_paths_and_ignored_receip
     assert_eq!(
         summary["omitted_fs"]["write"],
         serde_json::json!(["~/Documents/output"])
+    );
+    assert_eq!(
+        summary["omitted_home_ro_files"],
+        serde_json::json!(["~/old-z", "~/Documents/x", "~/old-a"])
+    );
+    assert_eq!(
+        summary["omitted_fs_complete"],
+        serde_json::json!([
+            "/opt/private",
+            "~/Documents/output",
+            "~/Documents/x",
+            "~/old-a",
+            "~/old-z"
+        ])
+    );
+    set_home_ro(&home, &["~/new-value"]);
+    assert_eq!(
+        Config::load(&home).unwrap().sandbox.home_ro_files,
+        ["~/new-value"]
+    );
+    let persisted = store.proposal(proposal_id.clone()).await.unwrap();
+    let fixed: serde_json::Value = serde_json::from_str(
+        persisted
+            .checks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|check| check.name == "permissions")
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixed, summary,
+        "later config edits never rewrite a verification snapshot"
     );
     assert!(
         !checks

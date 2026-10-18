@@ -11,7 +11,7 @@ pub(super) fn arguments(
     proof: &MountProof,
 ) -> Result<Vec<OsString>, SandboxError> {
     let normalized = mounts.normalized(proof)?;
-    render(sandbox, command, mounts, proof, &normalized)
+    render(sandbox, command, mounts, proof, &normalized, None)
 }
 
 fn render(
@@ -20,6 +20,7 @@ fn render(
     mounts: &super::plan::MountPlan,
     proof: &MountProof,
     normalized: &[&super::plan::Mount],
+    bootstrap: Option<&super::pre_exec::Prepared>,
 ) -> Result<Vec<OsString>, SandboxError> {
     let mut attestation = Attestation::default();
     let mut args: Vec<OsString> = [
@@ -47,7 +48,7 @@ fn render(
         .iter()
         .filter(|mount| mount.role == super::plan::Role::Base)
     {
-        render_mount(&mut args, &mut attestation, proof, mount)?;
+        render_mount(&mut args, &mut attestation, proof, mount, bootstrap)?;
     }
     for alias in &mounts.aliases {
         attestation.alias(&alias.destination, &alias.target)?;
@@ -66,7 +67,7 @@ fn render(
         .iter()
         .filter(|mount| mount.role != super::plan::Role::Base)
     {
-        render_mount(&mut args, &mut attestation, proof, mount)?;
+        render_mount(&mut args, &mut attestation, proof, mount, bootstrap)?;
     }
     let context = &sandbox.context;
     let profile = &sandbox.profile;
@@ -98,6 +99,12 @@ fn render(
     ]);
     args.extend(["/fx/fictor", "__sandbox-init", "--mount-proof"].map(OsString::from));
     args.push(attestation.encode()?.into());
+    if mounts.mounts.iter().any(|mount| {
+        mount.role == super::plan::Role::Endpoint
+            && mount.destination == Path::new("/fx/admission.sock")
+    }) {
+        args.push("--admission".into());
+    }
     args.push("--".into());
     args.push(context.runtime.as_os_str().into());
     args.extend(runtime_arguments(sandbox, command));
@@ -111,8 +118,16 @@ fn render_mount(
     attestation: &mut Attestation,
     proof: &MountProof,
     mount: &super::plan::Mount,
+    bootstrap: Option<&super::pre_exec::Prepared>,
 ) -> Result<(), SandboxError> {
-    attestation.bind(&mount.destination, proof.source(&mount.source)?)?;
+    let bootstrap = bootstrap.filter(|_| mount.role == super::plan::Role::Bootstrap);
+    attestation.bind(
+        &mount.destination,
+        match bootstrap {
+            Some(prepared) => prepared.bootstrap_snapshot(),
+            None => proof.source(&mount.source)?,
+        },
+    )?;
     let option = if mount.writable {
         "--bind"
     } else if mount.optional {
@@ -122,7 +137,11 @@ fn render_mount(
     };
     args.extend([
         option.into(),
-        mount.source.as_os_str().into(),
+        bootstrap
+            .map(|prepared| prepared.bootstrap_alias())
+            .unwrap_or(&mount.source)
+            .as_os_str()
+            .into(),
         mount.destination.as_os_str().into(),
     ]);
     Ok(())
@@ -197,29 +216,31 @@ pub(super) fn command(
         .ok_or(SandboxError::Invalid(
             "bubblewrap indisponível; execute fictor doctor",
         ))?;
-    let unshare = "/usr/bin/unshare";
-    if !Path::new(unshare).is_file() {
-        return Err(SandboxError::Invalid(
-            "util-linux unshare indisponível; execute fictor doctor",
-        ));
-    }
-    // bubblewrap makes inherited sources slaves, which can still receive host
-    // submounts. Privatize an additional child namespace before its bind setup.
-    // No --fork: unshare execs bwrap and preserves the supervised PID/parent.
-    // This changes no mounts in the core/host namespace and adds no workload caps.
-    let mut command = Command::new(unshare);
-    command
-        .env_clear()
-        .args([
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--propagation",
-            "private",
-            "--",
-            executable,
-        ])
-        .args(arguments(sandbox, child_arguments, mounts, proof)?);
+    let directory = sandbox
+        .context
+        .tmp_dir
+        .join(format!(".bootstrap-{}", ulid::Ulid::generate()));
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    // The outer preparation owner keeps this tree until reap. Command's Drop
+    // must not unlink bootstrap bytes while bwrap is still resolving its SRC.
+    let alias = directory.join("fictor");
+    let prepared =
+        super::pre_exec::Prepared::new(proof.observations(), &sandbox.context.fictor_exe, &alias)?;
+    let normalized = mounts.normalized(proof)?;
+    let arguments = render(
+        sandbox,
+        child_arguments,
+        mounts,
+        proof,
+        &normalized,
+        Some(&prepared),
+    )?;
+    // The syscall-only callback freezes and checks the inherited view before
+    // bwrap's own loader, rather than letting an external helper run first.
+    let mut command = Command::new(executable);
+    command.env_clear().args(arguments);
+    prepared.install(&mut command);
     use std::os::unix::process::CommandExt;
     command.process_group(0);
     Ok(command)
@@ -295,7 +316,14 @@ mod tests {
             |outer, inner, relative| Ok(outer.source.join(relative) == inner.source),
             |_| Ok(false),
         )?;
-        super::render(sandbox, command, &mounts, &test_proof(sandbox), &normalized)
+        super::render(
+            sandbox,
+            command,
+            &mounts,
+            &test_proof(sandbox),
+            &normalized,
+            None,
+        )
     }
 
     #[test]

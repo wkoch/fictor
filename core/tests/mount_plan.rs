@@ -115,6 +115,12 @@ fn destination_reservations_equivalence_and_private_tmp_hold_in_real_sandboxes()
         "run-alias",
         "tmp-helper-parent",
         "tmp-helper-alias",
+        "bootstrap-valid",
+        "bootstrap-original-inplace",
+        "bootstrap-original-replaced",
+        "bootstrap-copy-inplace",
+        "bootstrap-copy-replaced",
+        "bootstrap-system-base",
     ] {
         let output = Command::new("/usr/bin/unshare")
             .args([
@@ -158,6 +164,81 @@ fn mount_plan_child() {
     let mut context = fixture.context();
     let mut profile = fixture.profile();
     let marker = fixture.root.join("workspace/workload-started");
+    if case.starts_with("bootstrap-") {
+        // A fake bootstrap is deliberately executable and writes a canary before
+        // doing any init attestation. A rejection after its first instruction is
+        // too late; the unchanged control proves the marker can be reached.
+        let directory = fixture.root.join("trusted-bin");
+        fs::create_dir(&directory).unwrap();
+        let original = directory.join("init");
+        let bytes = format!("#!/usr/bin/sh\nprintf executed > '{}'\n", marker.display());
+        fs::write(&original, &bytes).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+        context.fictor_exe = original.clone();
+        let plan = SandboxPlan::new(profile, context, vec!["-c".into(), "exit 0".into()]).unwrap();
+        let mut command = plan.command().unwrap();
+        let args = command.get_args().collect::<Vec<_>>();
+        let copy = args
+            .windows(3)
+            .find(|parts| parts[0] == "--ro-bind" && parts[2] == "/fx/fictor")
+            .map(|parts| PathBuf::from(parts[1]))
+            .unwrap();
+        match case.as_str() {
+            "bootstrap-valid" => {}
+            "bootstrap-original-inplace" => {
+                fs::write(&original, format!("{bytes}# altered\n")).unwrap()
+            }
+            "bootstrap-original-replaced" => {
+                fs::rename(&original, directory.join("old-init")).unwrap();
+                fs::write(&original, &bytes).unwrap();
+                fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            "bootstrap-copy-inplace" => {
+                fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(&copy, format!("{bytes}# altered\n")).unwrap();
+                fs::set_permissions(&copy, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            "bootstrap-copy-replaced" => {
+                fs::rename(&copy, copy.with_extension("old")).unwrap();
+                fs::write(&copy, &bytes).unwrap();
+                fs::set_permissions(&copy, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            "bootstrap-system-base" => {
+                // The pending first exec resolves this path. Only this helper's
+                // private namespace is changed; the real host binary is intact.
+                assert!(
+                    Command::new("/usr/bin/mount")
+                        .arg("--bind")
+                        .arg(&original)
+                        .arg("/usr/bin/bwrap")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            _ => unreachable!(),
+        }
+        let result = command.stdin(Stdio::null()).output();
+        if case == "bootstrap-valid" {
+            let output = result.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read(&marker).unwrap(), b"executed");
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(
+                !marker.exists(),
+                "bootstrap executed before checking {case}"
+            );
+        }
+        return;
+    }
     if case != "equivalent" {
         match case.as_str() {
             "proc" => profile.read_paths.push("/proc".into()),

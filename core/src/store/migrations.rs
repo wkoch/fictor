@@ -88,6 +88,57 @@ pub(super) fn confirm_full(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The exact current database must already exist. In particular, do not pass
+/// through open_writer's CREATE, backups, migration, sys repair or WAL switch.
+pub(super) fn open_existing_writer(path: &Path) -> Result<Connection, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(StoreError::Invalid("banco offline inseguro"));
+    }
+    lock(&file)?;
+    let preflight = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    preflight.busy_timeout(Duration::from_secs(5))?;
+    let version: i64 = preflight.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(StoreError::ExistingSchema(version));
+    }
+    let journal: String = preflight.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal != "wal" {
+        return Err(StoreError::Invalid("banco offline requer WAL existente"));
+    }
+    let system: String =
+        preflight.query_row("SELECT kind FROM sessions WHERE id='sys'", [], |row| {
+            row.get(0)
+        })?;
+    if system != "system" {
+        return Err(StoreError::Invalid("sessão sys inválida"));
+    }
+    drop(preflight);
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    confirm_full(&connection)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(connection)
+}
+
 fn lock(file: &File) -> Result<(), io::Error> {
     let start = Instant::now();
     loop {

@@ -1,4 +1,5 @@
 use fictor::{
+    admin::MutationReason,
     gateway::PinnedCatalog,
     installer::{
         BundleBudget, BundleProfile,
@@ -9,19 +10,24 @@ use fictor::{
         manifest::Manifest,
         overrides::Overrides,
         promotion::materialize,
+        publication::{PromotionPublication, PromotionPublicationFuture},
     },
     store::{
-        NewPromotionIntent, NewProposal, PromotionState, Proposal, ProposalCheck, ProposalIdentity,
-        ProposalState, ProposalUpdate, ReviewBase, Store,
+        NewPromotionIntent, NewProposal, PromotionIntent, PromotionState, Proposal, ProposalCheck,
+        ProposalIdentity, ProposalState, ProposalUpdate, ReviewBase, Store,
     },
+    supervisor::controls::ControlRegistry,
 };
 use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 struct Fixture {
@@ -45,7 +51,7 @@ impl Fixture {
         }
     }
     fn coordinator(&self) -> PromotionCoordinator {
-        PromotionCoordinator::new(self.store.clone(), self.lease.clone())
+        PromotionCoordinator::new_offline(self.store.clone(), self.lease.clone())
     }
     async fn reopen(self) -> Self {
         let Self {
@@ -597,4 +603,338 @@ async fn disabled_updates_and_inactive_key_reuse_preserve_old_records_and_refuse
         old_record
     );
     assert_eq!(f.count("ext.promoted").await, 3);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PublicationStep {
+    Block,
+    Publish,
+    Reconcile(PromotionState),
+}
+
+/// Observe real durable boundaries, then delegate to the real admission hook.
+/// Injected publication failures deliberately leave that hook's block intact.
+struct CheckingPublisher {
+    registry: ControlRegistry,
+    store: Arc<Store>,
+    lock_at_block: Option<Vec<u8>>,
+    fail_publication: AtomicBool,
+    steps: Mutex<Vec<PublicationStep>>,
+}
+impl CheckingPublisher {
+    fn new(fixture: &Fixture, fail_publication: bool) -> Arc<Self> {
+        Arc::new(Self {
+            registry: ControlRegistry::new(fixture.store.owner().clone()),
+            store: fixture.store.clone(),
+            lock_at_block: Lock::read_snapshot(&fixture.home).unwrap(),
+            fail_publication: AtomicBool::new(fail_publication),
+            steps: Mutex::new(vec![]),
+        })
+    }
+
+    fn assert_excluded(&self, ext_id: &str) {
+        assert!(self.registry.allow(ext_id).is_err());
+        assert!(
+            self.store
+                .owner()
+                .installer_gate()
+                .try_lock_owned()
+                .is_err()
+        );
+    }
+
+    async fn assert_durable(&self, intent: &PromotionIntent) {
+        self.assert_excluded(&intent.ext_id);
+        let stored = self
+            .store
+            .promotion_intent(intent.operation_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(stored.state, intent.state);
+        let proposal = self
+            .store
+            .proposal(intent.proposal_id.clone())
+            .await
+            .unwrap();
+        let (snapshot, state, event_kind) = match intent.state {
+            PromotionState::Committed => (
+                Some(intent.after_lock.as_bytes()),
+                ProposalState::Promoted,
+                "ext.promoted",
+            ),
+            PromotionState::Aborted => (
+                intent.before_lock.as_deref().map(str::as_bytes),
+                ProposalState::Approved,
+                "ext.promotion_aborted",
+            ),
+            PromotionState::Prepared => panic!("publication preceded the writer commit"),
+        };
+        assert_eq!(proposal.state, state);
+        assert_eq!(
+            Lock::read_snapshot(self.store.owner().home())
+                .unwrap()
+                .as_deref(),
+            snapshot
+        );
+        let events = self
+            .store
+            .event_path("sys".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| {
+                    event.kind == event_kind && event.payload["operation_id"] == intent.operation_id
+                })
+                .count(),
+            1,
+            "the durable event must exist before publication"
+        );
+    }
+}
+impl PromotionPublication for CheckingPublisher {
+    fn block_before_lock(&self, ext_id: &str) -> Result<(), MutationReason> {
+        assert_eq!(ext_id, "sample");
+        assert_eq!(
+            Lock::read_snapshot(self.store.owner().home()).unwrap(),
+            self.lock_at_block,
+            "the lock must not change before the admission block"
+        );
+        self.registry.block_before_lock(ext_id)?;
+        self.assert_excluded(ext_id);
+        self.steps.lock().unwrap().push(PublicationStep::Block);
+        Ok(())
+    }
+
+    fn publish_after_commit<'a>(
+        &'a self,
+        intent: &'a PromotionIntent,
+    ) -> PromotionPublicationFuture<'a> {
+        Box::pin(async move {
+            self.assert_durable(intent).await;
+            self.steps.lock().unwrap().push(PublicationStep::Publish);
+            if self.fail_publication.load(Ordering::SeqCst) {
+                return Err(MutationReason::IoError);
+            }
+            self.registry.publish_after_commit(intent).await
+        })
+    }
+
+    fn reconcile<'a>(&'a self, intent: &'a PromotionIntent) -> PromotionPublicationFuture<'a> {
+        Box::pin(async move {
+            self.assert_durable(intent).await;
+            self.steps
+                .lock()
+                .unwrap()
+                .push(PublicationStep::Reconcile(intent.state));
+            self.registry.reconcile(intent).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn online_promotion_blocks_before_lock_and_publishes_only_after_the_writer_commit() {
+    let f = Fixture::new().await;
+    let p = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let publisher = CheckingPublisher::new(&f, false);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    assert!(publisher.registry.allow("sample").is_ok());
+    let committed = coordinator.promote(p.id.clone()).await.unwrap();
+    assert_eq!(committed.state, PromotionState::Committed);
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [PublicationStep::Block, PublicationStep::Publish]
+    );
+    assert!(publisher.registry.allow("sample").is_ok());
+    assert_eq!(f.count("ext.promoted").await, 1);
+    assert!(f.store.pending_promotion().await.unwrap().is_none());
+    assert!(!f.home.join("extensions/quarantine").join(p.id).exists());
+}
+
+#[tokio::test]
+async fn publication_failure_keeps_the_committed_lock_and_real_admission_block() {
+    let f = Fixture::new().await;
+    let p = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let publisher = CheckingPublisher::new(&f, true);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    assert!(matches!(
+        coordinator.promote(p.id.clone()).await,
+        Err(ActivationError::Publication)
+    ));
+    let history = f.store.event_path("sys".into(), None, None).await.unwrap();
+    let event = history
+        .events
+        .iter()
+        .find(|event| event.kind == "ext.promoted")
+        .unwrap();
+    let intent = f
+        .store
+        .promotion_intent(event.payload["operation_id"].as_str().unwrap().into())
+        .await
+        .unwrap();
+    assert_eq!(intent.state, PromotionState::Committed);
+    assert_eq!(
+        f.store.proposal(p.id.clone()).await.unwrap().state,
+        ProposalState::Promoted
+    );
+    assert_eq!(
+        Lock::read_snapshot(&f.home).unwrap().as_deref(),
+        Some(intent.after_lock.as_bytes())
+    );
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [PublicationStep::Block, PublicationStep::Publish]
+    );
+    assert!(publisher.registry.allow("sample").is_err());
+    assert!(f.store.pending_promotion().await.unwrap().is_none());
+    assert_eq!(f.count("ext.promoted").await, 1);
+    // A read of the committed result cannot claim publication or undo its block.
+    assert_eq!(
+        coordinator
+            .operation(intent.operation_id.clone())
+            .await
+            .unwrap()
+            .state,
+        PromotionState::Committed
+    );
+    assert!(publisher.registry.allow("sample").is_err());
+    assert_eq!(f.count("ext.promoted").await, 1);
+    let lock_file = fs::File::open(f.home.join("extensions/lock.json")).unwrap();
+    let original_inode = lock_file.metadata().unwrap();
+    publisher.fail_publication.store(false, Ordering::SeqCst);
+    let retry = coordinator.admit_promotion(p.id).await.unwrap();
+    assert_eq!(retry.operation_id, intent.operation_id);
+    assert_eq!(retry.state, PromotionState::Committed);
+    assert!(publisher.registry.allow("sample").is_ok());
+    let current_inode = fs::metadata(f.home.join("extensions/lock.json")).unwrap();
+    assert_eq!(
+        (current_inode.dev(), current_inode.ino()),
+        (original_inode.dev(), original_inode.ino()),
+        "retry publication must not replace the durable lock"
+    );
+    assert_eq!(
+        fs::read(f.home.join("extensions/lock.json")).unwrap(),
+        intent.after_lock.as_bytes()
+    );
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [
+            PublicationStep::Block,
+            PublicationStep::Publish,
+            PublicationStep::Publish
+        ]
+    );
+    assert_eq!(f.count("ext.promotion_prepared").await, 1);
+    assert_eq!(f.count("ext.promoted").await, 1);
+}
+
+#[tokio::test]
+async fn recovering_a_published_lock_commits_before_reconciling_real_admissions() {
+    let f = Fixture::new().await;
+    let p = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let intent = f.prepared(&p).await;
+    materialize(&f.home, f.store.clone(), f.lease.clone(), p.id.clone())
+        .await
+        .unwrap();
+    f.publish_snapshot(&intent.after_lock);
+    let f = f.reopen().await;
+    let publisher = CheckingPublisher::new(&f, false);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    let recovered = coordinator.reconcile().await.unwrap().unwrap();
+    assert_eq!(recovered.operation_id, intent.operation_id);
+    assert_eq!(recovered.state, PromotionState::Committed);
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [
+            PublicationStep::Block,
+            PublicationStep::Reconcile(PromotionState::Committed)
+        ]
+    );
+    assert!(publisher.registry.allow("sample").is_ok());
+    assert!(coordinator.reconcile().await.unwrap().is_none());
+    assert_eq!(f.count("ext.promoted").await, 1);
+}
+
+#[tokio::test]
+async fn aborting_an_unpublished_update_restores_the_previous_versions_admission() {
+    let f = Fixture::new().await;
+    let old = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let old_intent = f.coordinator().promote(old.id.clone()).await.unwrap();
+    let p = f.approve(&f.checked("2.0.0").await, json!({})).await;
+    let intent = f.prepared(&p).await;
+    let f = f.reopen().await;
+    let publisher = CheckingPublisher::new(&f, false);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    let recovered = coordinator.reconcile().await.unwrap().unwrap();
+    assert_eq!(recovered.operation_id, intent.operation_id);
+    assert_eq!(recovered.state, PromotionState::Aborted);
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [
+            PublicationStep::Block,
+            PublicationStep::Reconcile(PromotionState::Aborted)
+        ]
+    );
+    assert!(publisher.registry.allow("sample").is_ok());
+    let lock = Lock::load_required(&f.home).unwrap();
+    assert_eq!(lock.extensions["sample"].active, old_intent.key);
+    assert_ne!(lock.extensions["sample"].active, intent.key);
+    assert_eq!(
+        Lock::read_snapshot(&f.home).unwrap().as_deref(),
+        intent.before_lock.as_deref().map(str::as_bytes)
+    );
+    assert_eq!(
+        f.store.proposal(p.id).await.unwrap().state,
+        ProposalState::Approved
+    );
+    assert_eq!(f.count("ext.promoted").await, 1);
+    assert_eq!(f.count("ext.promotion_aborted").await, 1);
+}
+
+#[tokio::test]
+async fn retrying_a_historical_commit_cannot_release_a_newer_versions_publication_block() {
+    let f = Fixture::new().await;
+    let old = f.approve(&f.checked("1.0.0").await, json!({})).await;
+    let old_intent = f.coordinator().promote(old.id.clone()).await.unwrap();
+    let current = f.approve(&f.checked("2.0.0").await, json!({})).await;
+    let publisher = CheckingPublisher::new(&f, true);
+    let coordinator =
+        PromotionCoordinator::with_publication(f.store.clone(), f.lease.clone(), publisher.clone());
+    assert!(matches!(
+        coordinator.promote(current.id.clone()).await,
+        Err(ActivationError::Publication)
+    ));
+    let current_lock = Lock::read_snapshot(&f.home).unwrap().unwrap();
+    let current_key = Lock::parse_snapshot(&current_lock).unwrap().extensions["sample"]
+        .active
+        .clone();
+    assert_ne!(current_key, old_intent.key);
+    assert!(publisher.registry.allow("sample").is_err());
+
+    publisher.fail_publication.store(false, Ordering::SeqCst);
+    let historical = coordinator.admit_promotion(old.id).await.unwrap();
+    assert_eq!(historical.operation_id, old_intent.operation_id);
+    assert!(publisher.registry.allow("sample").is_err());
+    assert_eq!(
+        *publisher.steps.lock().unwrap(),
+        [PublicationStep::Block, PublicationStep::Publish],
+        "historical success must not republish over the newer blocked state"
+    );
+    assert_eq!(Lock::read_snapshot(&f.home).unwrap().unwrap(), current_lock);
+    assert_eq!(f.count("ext.promotion_prepared").await, 2);
+    assert_eq!(f.count("ext.promoted").await, 2);
+
+    let resumed = coordinator.admit_promotion(current.id).await.unwrap();
+    assert_eq!(resumed.key, current_key);
+    assert_eq!(resumed.state, PromotionState::Committed);
+    assert!(publisher.registry.allow("sample").is_ok());
+    assert_eq!(Lock::read_snapshot(&f.home).unwrap().unwrap(), current_lock);
+    assert_eq!(f.count("ext.promotion_prepared").await, 2);
+    assert_eq!(f.count("ext.promoted").await, 2);
 }

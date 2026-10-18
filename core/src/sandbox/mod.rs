@@ -1,9 +1,11 @@
 //! OS confinement. Inputs are constructed by the trusted supervisor, never an extension.
+pub mod admission;
 mod attestation;
 pub mod init;
 pub mod linux;
 pub(crate) mod mounts;
 mod plan;
+mod pre_exec;
 pub mod sensitive;
 
 use std::{
@@ -102,7 +104,7 @@ impl SandboxPlan {
         home: File,
     ) -> Result<Self, SandboxError> {
         let validated = validate(profile, context, &home)?;
-        let (_, proof) = check_mounts(&validated.profile, &validated.context, &home)?;
+        let (_, proof) = check_mounts(&validated.profile, &validated.context, &home, None)?;
         Ok(Self {
             validated,
             arguments,
@@ -111,11 +113,31 @@ impl SandboxPlan {
         })
     }
 
-    /// Keep this plan alive until the private init completes (the supervisor
-    /// retains it through reap). Raw Command alone is not a source-inode lease.
+    /// Legacy raw backend without the durable admission barrier. Production
+    /// callers migrate to command_with_admission before ADR-038 is complete.
+    /// Keep this plan alive until reap; Command alone is not an inode lease.
     pub fn command(&self) -> Result<Command, SandboxError> {
-        let (mounts, proof) =
-            check_mounts(&self.validated.profile, &self.validated.context, &self.home)?;
+        self.command_inner(None)
+    }
+
+    /// Trusted core admission channel, included in the same validated mount
+    /// plan and final proof. The caller retains the listener through accept,
+    /// persists armed for its exact peer, then explicitly releases the init.
+    pub fn command_with_admission(
+        &self,
+        admission: &admission::AdmissionListener,
+    ) -> Result<Command, SandboxError> {
+        admission.verify()?;
+        self.command_inner(Some(admission.socket_path()))
+    }
+
+    fn command_inner(&self, admission: Option<&Path>) -> Result<Command, SandboxError> {
+        let (mounts, proof) = check_mounts(
+            &self.validated.profile,
+            &self.validated.context,
+            &self.home,
+            admission,
+        )?;
         let proof = Arc::new(proof);
         self.proof
             .lock()
@@ -125,8 +147,12 @@ impl SandboxPlan {
     }
 
     pub fn linux_arguments(&self) -> Result<Vec<OsString>, SandboxError> {
-        let (mounts, proof) =
-            check_mounts(&self.validated.profile, &self.validated.context, &self.home)?;
+        let (mounts, proof) = check_mounts(
+            &self.validated.profile,
+            &self.validated.context,
+            &self.home,
+            None,
+        )?;
         let proof = Arc::new(proof);
         self.proof
             .lock()
@@ -179,7 +205,7 @@ fn validate(
         || (overlaps(&context.runtime_root, &context.fictor_home) && !own_bundle_runtime)
         || context.runtime_root == context.real_home
         || context.real_home.starts_with(&context.runtime_root)
-        || overlaps(&context.tmp_dir, &context.fictor_home)
+        || (overlaps(&context.tmp_dir, &context.fictor_home) && !journal_temporary(&context))
         || overlaps(&context.tmp_dir, &context.runtime_root)
         || context.tmp_dir == context.real_home
         || context.real_home.starts_with(&context.tmp_dir)
@@ -309,7 +335,7 @@ fn validate(
             "ambiente contém nome ou valor inválido",
         ));
     }
-    check_mounts(&profile, &context, home)?;
+    check_mounts(&profile, &context, home, None)?;
     let tmp_home = context.tmp_dir.join("home");
     crate::home::private_dir(&tmp_home)?;
     let utf8 = |path: &Path| {
@@ -348,11 +374,15 @@ fn check_mounts(
     profile: &SandboxProfile,
     context: &SandboxContext,
     home: &File,
+    admission: Option<&Path>,
 ) -> Result<(plan::MountPlan, mounts::MountProof), SandboxError> {
     let mut boundary = mounts::Boundary::new(&context.fictor_home, home)?;
     let mut proof = mounts::MountProof::default();
     boundary.protect_temporary(&context.tmp_dir, &mut proof)?;
-    let plan = plan::MountPlan::declare(profile, context)?;
+    let plan = match admission {
+        Some(socket) => plan::MountPlan::declare_with_admission(profile, context, Some(socket))?,
+        None => plan::MountPlan::declare(profile, context)?,
+    };
     let mut done = std::collections::BTreeSet::new();
     for index in 0..plan.mounts.len() {
         prove_mount(index, &plan, context, &boundary, &mut proof, &mut done)?;
@@ -414,6 +444,24 @@ fn prove_mount(
 
 fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn journal_temporary(context: &SandboxContext) -> bool {
+    // ADR-038's exact private preparation directory is not an imported mount.
+    // Boundary::protect_temporary still seals its physical origin against every
+    // ordinary import/alias; no other home descendant gets this exception.
+    let Some(instance) = context.tmp_dir.parent() else {
+        return false;
+    };
+    context.tmp_dir.file_name() == Some("tmp".as_ref())
+        && instance.parent() == Some(context.fictor_home.join("run/instances").as_path())
+        && instance
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.parse::<ulid::Ulid>()
+                    .is_ok_and(|id| id.to_string() == name)
+            })
 }
 fn strictly_below(path: &Path, root: &Path) -> bool {
     path != root && path.starts_with(root)

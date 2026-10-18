@@ -96,6 +96,14 @@ impl MountPlan {
         profile: &SandboxProfile,
         context: &SandboxContext,
     ) -> Result<Self, SandboxError> {
+        Self::declare_with_admission(profile, context, None)
+    }
+
+    pub fn declare_with_admission(
+        profile: &SandboxProfile,
+        context: &SandboxContext,
+        admission: Option<&Path>,
+    ) -> Result<Self, SandboxError> {
         let mut plan = Self {
             mounts: Vec::new(),
             aliases: aliases()?,
@@ -138,6 +146,15 @@ impl MountPlan {
             plan.add(
                 socket.clone(),
                 "/fx/kernel.sock".into(),
+                true,
+                false,
+                Role::Endpoint,
+            )?;
+        }
+        if let Some(socket) = admission {
+            plan.add(
+                socket.into(),
+                "/fx/admission.sock".into(),
                 true,
                 false,
                 Role::Endpoint,

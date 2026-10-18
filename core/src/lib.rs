@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod gateway;
 pub mod home;
 pub mod installer;
+pub mod instance_recovery;
 pub mod kernel;
 pub mod ownership;
 pub mod proxy;
@@ -56,6 +57,28 @@ async fn initialize_worker(owner: std::sync::Arc<ownership::HomeLease>) -> Resul
     let lease = std::sync::Arc::new(installer::lease::InstallerLease::acquire(home)?);
     let store = store::Store::open_with_lease(owner.clone()).await?;
     let store = std::sync::Arc::new(store);
+    // Resource ownership is resolved before any installer recovery can reclaim
+    // bytes. Retained/uncertain instances are diagnosed rather than signalled.
+    let instances = instance_recovery::recover_locked(store.clone()).await?;
+    if instances.legacy.pid_files {
+        tracing::warn!("legacy PID files retained; they cannot authorize signalling or cleanup");
+    }
+    if instances.legacy.temporaries {
+        tracing::warn!("legacy temporary resources retained without ownership records");
+    }
+    if instances.legacy.scan_unavailable {
+        tracing::warn!("legacy resource scan incomplete; no legacy cleanup attempted");
+    }
+    for diagnostic in instances.diagnostics {
+        tracing::warn!(
+            code = ?diagnostic.code,
+            instance_id = diagnostic.instance_id,
+            "instance recovery retained resources"
+        );
+    }
+    installer::activation::PromotionCoordinator::new_offline(store.clone(), lease.clone())
+        .reconcile_locked()
+        .await?;
     let report = installer::recovery::recover(home, store.clone(), lease).await?;
     for diagnostic in report.diagnostics {
         tracing::warn!(
@@ -74,6 +97,10 @@ async fn initialize_worker(owner: std::sync::Arc<ownership::HomeLease>) -> Resul
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
+    #[error(transparent)]
+    Instance(#[from] instance_recovery::InstanceError),
+    #[error(transparent)]
+    Activation(#[from] installer::activation::ActivationError),
     #[error("initialization worker unavailable")]
     Worker,
     #[error(transparent)]

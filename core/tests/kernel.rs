@@ -1062,3 +1062,34 @@ async fn oversized_response_and_disconnected_delivery_preserve_each_committed_fo
         "neither delivery failure may roll back or replay an admitted fork"
     );
 }
+
+#[tokio::test]
+async fn deferred_socket_cleanup_retains_path_after_transport_shutdown_and_drop() {
+    use tokio::io::AsyncReadExt;
+    let fixture = Fixture::new().await;
+    for graceful in [true, false] {
+        let mut server = fixture.server(Some(fixture.session.clone()), &["kv"]).await;
+        server.defer_socket_cleanup();
+        let socket = server.socket_path().to_path_buf();
+        let mut client = Client::new(&server).await;
+        if graceful {
+            server.shutdown().await.unwrap();
+        }
+        drop(server);
+        let mut remainder = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.0.read_to_end(&mut remainder))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            socket.exists(),
+            "only confirmed journal cleanup may unlink it"
+        );
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(UnixStream::connect(&socket).await.is_err());
+        std::fs::remove_file(socket).unwrap();
+    }
+}

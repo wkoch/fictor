@@ -5,16 +5,22 @@ use super::{
     lease::InstallerLease,
     lock::{Approval, Lock, LockedExtension, LockedVersion, Package, approval_at_ms},
     overrides::Overrides,
-    promotion, recovery,
+    promotion,
+    publication::PromotionPublication,
+    recovery,
 };
 use crate::store::{
     HumanDecision, NewPromotionIntent, PromotionAbortReason, PromotionIntent, PromotionState,
     Proposal, ProposalNonce, ProposalState, ProposalUpdate, ReviewBase, Store, StoreError,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivationError {
+    #[error("promotion:publication_incomplete")]
+    Publication,
+    #[error("promotion:busy")]
+    Busy,
     #[error("promotion:stale_base")]
     StaleBase,
     #[error("promotion:already_active")]
@@ -37,6 +43,7 @@ pub enum ActivationError {
 impl From<StoreError> for ActivationError {
     fn from(error: StoreError) -> Self {
         match &error {
+            StoreError::Invalid("administrative admission expired") => Self::Busy,
             StoreError::Invalid("promotion:stale_base") => Self::StaleBase,
             StoreError::Invalid("promotion:already_active") => Self::AlreadyActive,
             StoreError::Invalid("promotion:key_conflict") => Self::KeyConflict,
@@ -51,12 +58,30 @@ impl From<StoreError> for ActivationError {
 pub struct PromotionCoordinator {
     store: Arc<Store>,
     lease: Arc<InstallerLease>,
+    publication: Option<Arc<dyn PromotionPublication>>,
 }
 impl PromotionCoordinator {
     /// The caller shares the installer's existing file lease; acquiring a
     /// second independent flock would exclude its own checker/recovery worker.
-    pub fn new(store: Arc<Store>, lease: Arc<InstallerLease>) -> Self {
-        Self { store, lease }
+    /// Only for exclusive offline work or boot before a runtime registry exists.
+    pub fn new_offline(store: Arc<Store>, lease: Arc<InstallerLease>) -> Self {
+        Self {
+            store,
+            lease,
+            publication: None,
+        }
+    }
+
+    pub fn with_publication(
+        store: Arc<Store>,
+        lease: Arc<InstallerLease>,
+        publication: Arc<dyn PromotionPublication>,
+    ) -> Self {
+        Self {
+            store,
+            lease,
+            publication: Some(publication),
+        }
     }
 
     pub async fn approve(
@@ -113,13 +138,86 @@ impl PromotionCoordinator {
 
     pub async fn promote(&self, proposal_id: String) -> Result<PromotionIntent, ActivationError> {
         let coordinator = self.clone();
+        tokio::spawn(async move { coordinator.promote_owned(proposal_id, None, None).await })
+            .await
+            .map_err(|_| ActivationError::Task)?
+    }
+
+    /// ADR-045 acknowledges the durable intent, while its owned worker keeps
+    /// exclusion through materialization, lock publication and writer commit.
+    pub async fn admit_promotion(
+        &self,
+        proposal_id: String,
+    ) -> Result<PromotionIntent, ActivationError> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        if let Some(intent) = self
+            .store
+            .installation_snapshot(proposal_id.clone())
+            .await?
+            .promotion
+            && matches!(
+                intent.state,
+                PromotionState::Prepared | PromotionState::Committed
+            )
+        {
+            if intent.state == PromotionState::Committed {
+                let coordinator = self.clone();
+                return tokio::spawn(async move {
+                    let _section = tokio::time::timeout_at(
+                        deadline.into(),
+                        coordinator.store.owner().installer_gate().lock_owned(),
+                    )
+                    .await
+                    .map_err(|_| ActivationError::Busy)?;
+                    coordinator.republish_current(&intent).await?;
+                    Ok(intent)
+                })
+                .await
+                .map_err(|_| ActivationError::Task)?;
+            }
+            return Ok(intent);
+        }
+        let coordinator = self.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let _section = coordinator
-                .store
-                .owner()
-                .installer_gate()
-                .lock_owned()
+            let _ = coordinator
+                .promote_owned(proposal_id, Some(sender), Some(deadline))
                 .await;
+        });
+        receiver.await.map_err(|_| ActivationError::Task)?
+    }
+
+    async fn promote_owned(
+        &self,
+        proposal_id: String,
+        admitted: Option<tokio::sync::oneshot::Sender<Result<PromotionIntent, ActivationError>>>,
+        deadline: Option<Instant>,
+    ) -> Result<PromotionIntent, ActivationError> {
+        let coordinator = self.clone();
+        let setup = async {
+            let section = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(
+                    deadline.unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(5)),
+                ),
+                coordinator.store.owner().installer_gate().lock_owned(),
+            )
+            .await
+            .map_err(|_| ActivationError::Busy)?;
+            if let Some(intent) = coordinator
+                .store
+                .installation_snapshot(proposal_id.clone())
+                .await?
+                .promotion
+                && matches!(
+                    intent.state,
+                    PromotionState::Prepared | PromotionState::Committed
+                )
+            {
+                if intent.state == PromotionState::Committed {
+                    coordinator.republish_current(&intent).await?;
+                }
+                return Ok((section, intent, false));
+            }
             coordinator.reconcile_locked().await?;
             coordinator.verify_owner()?;
             let proposal = coordinator.store.proposal(proposal_id.clone()).await?;
@@ -140,78 +238,108 @@ impl PromotionCoordinator {
                 .map_err(|_| ActivationError::Integrity)?;
             let intent = coordinator
                 .store
-                .prepare_promotion(NewPromotionIntent {
-                    proposal_id: proposal_id.clone(),
-                    before_lock: before,
-                    after_lock: after,
-                })
+                .prepare_promotion_before(
+                    NewPromotionIntent {
+                        proposal_id: proposal_id.clone(),
+                        before_lock: before,
+                        after_lock: after,
+                    },
+                    deadline,
+                )
                 .await?;
-            if let Err(error) = promotion::materialize_intent(
-                coordinator.store.owner().home(),
-                coordinator.store.clone(),
-                coordinator.lease.clone(),
-                proposal_id,
-                intent.operation_id.clone(),
-            )
-            .await
-            {
-                let reason = match error {
-                    promotion::PromotionError::Changed
-                    | promotion::PromotionError::UnsafePath
-                    | promotion::PromotionError::Unapproved
-                    | promotion::PromotionError::Bundle(_) => PromotionAbortReason::Integrity,
-                    _ => PromotionAbortReason::Io,
-                };
-                // No lock write was attempted. Still reread exact bytes rather
-                // than assuming a concurrent/external change did not occur.
-                let current = Lock::read_snapshot(coordinator.store.owner().home())
-                    .map_err(|_| ActivationError::RecoveryConflict)?;
-                if current.as_deref() != intent.before_lock.as_deref().map(str::as_bytes) {
-                    return Err(ActivationError::RecoveryConflict);
+            Ok::<_, ActivationError>((section, intent, true))
+        }
+        .await;
+        let (_section, intent, publish) = match setup {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(admitted) = admitted {
+                    let _ = admitted.send(Err(error));
+                    return Err(ActivationError::Task);
                 }
-                coordinator
-                    .store
-                    .abort_promotion(intent.operation_id.clone(), reason)
-                    .await?;
-                coordinator.cleanup(&intent, false).await;
-                return Err(if reason == PromotionAbortReason::Integrity {
-                    ActivationError::Integrity
-                } else {
-                    ActivationError::Io
-                });
+                return Err(error);
             }
-            let owner = coordinator.store.owner().clone();
-            let text = intent.after_lock.clone();
-            let published = tokio::task::spawn_blocking(move || {
-                owner.verify().map_err(|_| ActivationError::Io)?;
-                Lock::write_snapshot(owner.home(), text.as_bytes()).map_err(|_| ActivationError::Io)
-            })
-            .await
-            .map_err(|_| ActivationError::Task)?;
-            if published.is_err() {
-                // rename/fsync outcome may be uncertain. The common recovery
-                // table is the authority; never compensate an unknown lock.
-                return coordinator
-                    .reconcile_locked()
-                    .await?
-                    .ok_or(ActivationError::RecoveryConflict)
-                    .and_then(|reconciled| {
-                        if reconciled.state == PromotionState::Committed {
-                            Ok(reconciled)
-                        } else {
-                            Err(ActivationError::Io)
-                        }
-                    });
+        };
+        if let Some(admitted) = admitted {
+            let _ = admitted.send(Ok(intent.clone()));
+        }
+        if !publish {
+            return Ok(intent);
+        }
+        if let Err(error) = promotion::materialize_intent(
+            coordinator.store.owner().home(),
+            coordinator.store.clone(),
+            coordinator.lease.clone(),
+            proposal_id,
+            intent.operation_id.clone(),
+        )
+        .await
+        {
+            let reason = match error {
+                promotion::PromotionError::Changed
+                | promotion::PromotionError::UnsafePath
+                | promotion::PromotionError::Unapproved
+                | promotion::PromotionError::Bundle(_) => PromotionAbortReason::Integrity,
+                _ => PromotionAbortReason::Io,
+            };
+            // No lock write was attempted. Still reread exact bytes rather
+            // than assuming a concurrent/external change did not occur.
+            let current = Lock::read_snapshot(coordinator.store.owner().home())
+                .map_err(|_| ActivationError::RecoveryConflict)?;
+            if current.as_deref() != intent.before_lock.as_deref().map(str::as_bytes) {
+                return Err(ActivationError::RecoveryConflict);
             }
-            let committed = coordinator
+            coordinator
                 .store
-                .commit_promotion(intent.operation_id.clone())
+                .abort_promotion(intent.operation_id.clone(), reason)
                 .await?;
-            coordinator.cleanup(&committed, true).await;
-            Ok(committed)
+            coordinator.cleanup(&intent, false).await;
+            return Err(if reason == PromotionAbortReason::Integrity {
+                ActivationError::Integrity
+            } else {
+                ActivationError::Io
+            });
+        }
+        if let Some(publication) = &coordinator.publication {
+            publication
+                .block_before_lock(&intent.ext_id)
+                .map_err(|_| ActivationError::Publication)?;
+        }
+        let owner = coordinator.store.owner().clone();
+        let text = intent.after_lock.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            owner.verify().map_err(|_| ActivationError::Io)?;
+            Lock::write_snapshot(owner.home(), text.as_bytes()).map_err(|_| ActivationError::Io)
         })
         .await
-        .map_err(|_| ActivationError::Task)?
+        .map_err(|_| ActivationError::Task)?;
+        if published.is_err() {
+            // rename/fsync outcome may be uncertain. The common recovery
+            // table is the authority; never compensate an unknown lock.
+            return coordinator
+                .reconcile_locked()
+                .await?
+                .ok_or(ActivationError::RecoveryConflict)
+                .and_then(|reconciled| {
+                    if reconciled.state == PromotionState::Committed {
+                        Ok(reconciled)
+                    } else {
+                        Err(ActivationError::Io)
+                    }
+                });
+        }
+        let committed = coordinator
+            .store
+            .commit_promotion(intent.operation_id.clone())
+            .await?;
+        if let Some(publication) = &coordinator.publication {
+            publication
+                .publish_after_commit(&committed)
+                .await
+                .map_err(|_| ActivationError::Publication)?;
+        }
+        coordinator.cleanup(&committed, true).await;
+        Ok(committed)
     }
 
     /// Call after instance recovery, before permitting extension dispatch or
@@ -261,6 +389,32 @@ impl PromotionCoordinator {
         self.store.owner().verify().map_err(|_| ActivationError::Io)
     }
 
+    // An explicit repeated request may finish a failed in-memory publication,
+    // but cannot select a historical version or rewrite the durable lock.
+    async fn republish_current(&self, intent: &PromotionIntent) -> Result<(), ActivationError> {
+        let Some(publication) = &self.publication else {
+            return Ok(());
+        };
+        self.verify_owner()?;
+        let current = Lock::load_required(self.store.owner().home())
+            .map_err(|_| ActivationError::RecoveryConflict)?;
+        let after = Lock::parse_snapshot(intent.after_lock.as_bytes())
+            .map_err(|_| ActivationError::Integrity)?;
+        if current
+            .review_base_hash(&intent.ext_id)
+            .map_err(|_| ActivationError::Integrity)?
+            == after
+                .review_base_hash(&intent.ext_id)
+                .map_err(|_| ActivationError::Integrity)?
+        {
+            publication
+                .publish_after_commit(intent)
+                .await
+                .map_err(|_| ActivationError::Publication)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn reconcile_locked(
         &self,
     ) -> Result<Option<PromotionIntent>, ActivationError> {
@@ -283,6 +437,11 @@ impl PromotionCoordinator {
             }
             return Ok(None);
         };
+        if let Some(publication) = &self.publication {
+            publication
+                .block_before_lock(&intent.ext_id)
+                .map_err(|_| ActivationError::Publication)?;
+        }
         let current = Lock::read_snapshot(self.store.owner().home())
             .map_err(|_| ActivationError::RecoveryConflict)?;
         if current.as_deref() == intent.before_lock.as_deref().map(str::as_bytes) {
@@ -293,6 +452,12 @@ impl PromotionCoordinator {
                     PromotionAbortReason::Interrupted,
                 )
                 .await?;
+            if let Some(publication) = &self.publication {
+                publication
+                    .reconcile(&aborted)
+                    .await
+                    .map_err(|_| ActivationError::Publication)?;
+            }
             self.cleanup(&aborted, false).await;
             Ok(Some(aborted))
         } else if current.as_deref() == Some(intent.after_lock.as_bytes()) {
@@ -305,6 +470,12 @@ impl PromotionCoordinator {
                 .store
                 .commit_promotion(intent.operation_id.clone())
                 .await?;
+            if let Some(publication) = &self.publication {
+                publication
+                    .reconcile(&committed)
+                    .await
+                    .map_err(|_| ActivationError::Publication)?;
+            }
             self.cleanup(&committed, true).await;
             Ok(Some(committed))
         } else {

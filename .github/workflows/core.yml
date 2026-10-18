@@ -98,13 +98,15 @@ jobs:
 
       - name: Test without nested sandbox
         # Real namespace tests (mount_origins, mount_plan, sandbox, sandbox_init,
-        # supervisor, the ownership bind alias and the magic-link unit) run in full on
+        # supervisor, spawn_barrier, instance_recovery_legacy, the ownership bind
+        # alias and the magic-link unit) run in full on
         # Ubuntu and on the user's desktop. The doctor test also invokes bwrap.
         # Most units, protocols, proxies and inert local bundles need no userns.
         run: >-
           cargo test --locked --offline --lib
           --test activation --test admin --test blob_ownership --test bootstrap --test budget
           --test control_files --test crash_recovery --test extension_control
+          --test install_online --test install_status_races --test instance_recovery
           --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
           --test manifest --test migrations --test model_tls --test models --test overrides --test ownership --test proposals
           --test promotion --test promotion_journal --test proposal_recovery

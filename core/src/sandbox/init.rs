@@ -4,6 +4,23 @@ use std::ffi::OsString;
 use super::SandboxError;
 
 pub async fn run(arguments: Vec<OsString>, mount_proof: &str) -> Result<i32, SandboxError> {
+    // Transitional raw backend for direct sandbox tests/doctor. Production
+    // uses the barrier entry once its journal integration is in place.
+    run_inner(arguments, mount_proof, false).await
+}
+
+pub async fn run_with_admission(
+    arguments: Vec<OsString>,
+    mount_proof: &str,
+) -> Result<i32, SandboxError> {
+    run_inner(arguments, mount_proof, true).await
+}
+
+async fn run_inner(
+    arguments: Vec<OsString>,
+    mount_proof: &str,
+    admission: bool,
+) -> Result<i32, SandboxError> {
     // SAFETY: getpid has no arguments or memory-safety preconditions.
     if unsafe { libc::getpid() } != 1 {
         return Err(SandboxError::Invalid(
@@ -13,6 +30,9 @@ pub async fn run(arguments: Vec<OsString>, mount_proof: &str) -> Result<i32, San
     // This is core-generated metadata, consumed before any listener or workload
     // exists. It is never placed in the child's environment or argument list.
     super::attestation::Attestation::parse(mount_proof)?.verify()?;
+    if admission {
+        super::admission::wait_for_authorization().await?;
+    }
     linux::run(arguments).await
 }
 

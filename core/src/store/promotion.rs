@@ -9,7 +9,7 @@ use crate::installer::lock::{Lock, LockedVersion, approval_at_ms};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{fmt, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromotionState {
@@ -82,7 +82,16 @@ impl Store {
         &self,
         input: NewPromotionIntent,
     ) -> Result<PromotionIntent, StoreError> {
+        self.prepare_promotion_before(input, None).await
+    }
+
+    pub(crate) async fn prepare_promotion_before(
+        &self,
+        input: NewPromotionIntent,
+        deadline: Option<Instant>,
+    ) -> Result<PromotionIntent, StoreError> {
         self.with_writer(move |writer| {
+            proposals::check_admission_deadline(deadline)?;
             let operation_id = writer.next_id()?;
             let event_id = writer.next_id()?;
             let timestamp = now_ms()?;
@@ -100,6 +109,7 @@ impl Store {
             tx.execute("INSERT INTO promotion_intents(operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'prepared',?7,?7)",
                 params![intent.operation_id, intent.proposal_id, intent.before_lock, intent.before_hash, intent.after_lock, intent.after_hash, timestamp])?;
             audit(&tx, event_id, timestamp, &intent, None)?;
+            proposals::check_admission_deadline(deadline)?;
             tx.commit()?;
             Ok(intent)
         }).await
@@ -196,7 +206,7 @@ pub(crate) fn read_promotion_intents(
     }
     Ok(pending)
 }
-fn load(db: &Connection, id: &str) -> Result<PromotionIntent, StoreError> {
+pub(super) fn load(db: &Connection, id: &str) -> Result<PromotionIntent, StoreError> {
     let mut statement = db.prepare("SELECT operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at FROM promotion_intents WHERE operation_id=?1")?;
     let mut rows = statement.query([id])?;
     decode(db, rows.next()?.ok_or(StoreError::NotFound)?)
@@ -476,4 +486,196 @@ fn validate_audit(db: &Connection, intent: &PromotionIntent) -> Result<(), Store
         return Err(conflict());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::{
+        gateway::PinnedCatalog,
+        installer::lock::{Approval, LockedExtension},
+        store::{
+            HumanDecision, NewProposal, ProposalCheck, ProposalIdentity, ProposalUpdate, ReviewBase,
+        },
+    };
+    use std::{future::Future, task::Poll, time::Duration};
+
+    async fn candidate(store: &Store) -> NewPromotionIntent {
+        let lock = Lock::default();
+        let review = || ReviewBase {
+            update_of: None,
+            hash: lock.review_base_hash("sample").unwrap(),
+        };
+        let proposal = store
+            .begin_attempt(NewProposal {
+                source: json!({"kind":"local"}),
+                tainted: false,
+            })
+            .await
+            .unwrap();
+        store
+            .transition_proposal(
+                proposal.id.clone(),
+                ProposalState::Received,
+                ProposalState::Checking,
+                ProposalUpdate {
+                    identity: Some(ProposalIdentity {
+                        ext_id: "sample".into(),
+                        version: "0.1.0".into(),
+                        manifest: json!({"schema":1,"id":"sample","version":"0.1.0","description":"admission fixture","scope":"session","runtime":{"kind":"node","entry":"index.mjs"},"mcp":false,"kernel":["kv"]}),
+                        update_of: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let catalog = PinnedCatalog::new(vec![]).unwrap();
+        let checks = [
+            "manifest",
+            "dependencies",
+            "bundle",
+            "declarations",
+            "smoke",
+        ]
+        .into_iter()
+        .map(|name| ProposalCheck {
+            name: name.into(),
+            passed: true,
+            blocking: true,
+            detail: (name == "smoke")
+                .then(|| json!({"tools":catalog.tools(),"tools_hash":catalog.hash()}).to_string()),
+        })
+        .collect();
+        store
+            .transition_proposal(
+                proposal.id.clone(),
+                ProposalState::Checking,
+                ProposalState::Checked,
+                ProposalUpdate {
+                    hash: Some(format!("sha256:{}", "a".repeat(64))),
+                    checks: Some(checks),
+                    packages: Some(vec![]),
+                    review_base: Some(review()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let nonce = store.proposal_nonce(proposal.id.clone()).await.unwrap();
+        let proposal = store
+            .transition_proposal(
+                proposal.id,
+                ProposalState::Checked,
+                ProposalState::Approved,
+                ProposalUpdate {
+                    decision: Some(HumanDecision::User(nonce)),
+                    review_base: Some(review()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let key = "0.1.0-aaaaaaaaaaaa";
+        let candidate = LockedVersion {
+            version: "0.1.0".into(),
+            hash: proposal.hash.clone().unwrap(),
+            path: format!("store/sample/{key}"),
+            source: proposal.source.clone(),
+            approved: Approval {
+                by: "user".into(),
+                at: approval_at_ms(proposal.updated_at).unwrap(),
+                approval_id: None,
+            },
+            overrides: proposal.overrides,
+            privileges: vec![],
+            tools: vec![],
+            tools_hash: catalog.hash().into(),
+            packages: vec![],
+            audit: None,
+        };
+        let mut after = lock.clone();
+        after.extensions.insert(
+            "sample".into(),
+            LockedExtension {
+                enabled: true,
+                active: key.into(),
+                versions: [(key.into(), candidate)].into(),
+            },
+        );
+        NewPromotionIntent {
+            proposal_id: proposal.id,
+            before_lock: Some(lock.encode_snapshot().unwrap()),
+            after_lock: after.encode_snapshot().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_promotion_cannot_commit_after_its_admission_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        crate::home::prepare(&home).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let input = candidate(&store).await;
+        let retry = NewPromotionIntent {
+            proposal_id: input.proposal_id.clone(),
+            before_lock: input.before_lock.clone(),
+            after_lock: input.after_lock.clone(),
+        };
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let barrier = store.with_writer(move |_| {
+            let _ = entered.send(());
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        });
+        tokio::pin!(barrier);
+        std::future::poll_fn(|cx| {
+            assert!(barrier.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        waiting.await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let admission = store.prepare_promotion_before(input, Some(deadline));
+        tokio::pin!(admission);
+        std::future::poll_fn(|cx| {
+            assert!(admission.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(Instant::now() < deadline, "job queued before its deadline");
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        release.send(()).unwrap();
+        barrier.await.unwrap();
+        assert!(matches!(
+            admission.await,
+            Err(StoreError::Invalid("administrative admission expired"))
+        ));
+        let (intents, events) = store
+            .read(|db| {
+                Ok((
+                    db.query_row("SELECT count(*) FROM promotion_intents", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    db.query_row(
+                        "SELECT count(*) FROM events WHERE kind='ext.promotion_prepared'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((intents, events), (0, 0));
+        assert_eq!(
+            store
+                .proposal(retry.proposal_id.clone())
+                .await
+                .unwrap()
+                .state,
+            ProposalState::Approved
+        );
+        store.prepare_promotion(retry).await.unwrap();
+    }
 }

@@ -123,7 +123,7 @@ fn filesystem_magic(file: &File) -> Result<u64, SandboxError> {
     Ok(stat.f_type as u32 as u64)
 }
 
-fn ordinary_filesystem(name: &str, magic: u64) -> bool {
+pub(super) fn ordinary_filesystem(name: &str, magic: u64) -> bool {
     // Both fields are necessary: devtmpfs shares TMPFS_MAGIC. Names such as
     // fuse.ext4 or tmpfs.extra do not inherit another filesystem's admission.
     matches!(
@@ -203,6 +203,19 @@ pub(super) struct ProvenSource {
 }
 
 impl MountProof {
+    /// Compile outside fork; the child launcher observes these same source
+    /// identities/topologies in its private view before executing bootstrap.
+    pub(crate) fn observations(&self) -> Vec<(PathBuf, SourceSnapshot)> {
+        self.sources
+            .iter()
+            .filter_map(|(path, snapshot)| {
+                snapshot
+                    .as_ref()
+                    .map(|snapshot| (path.clone(), snapshot.clone()))
+            })
+            .collect()
+    }
+
     pub(super) fn covers(
         &self,
         outer: &Path,

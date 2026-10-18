@@ -5,6 +5,7 @@ use crate::{gateway::PinnedCatalog, installer::overrides::Overrides};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +86,16 @@ pub struct Proposal {
 /// it only through their separate authenticated decision channel.
 pub struct ProposalNonce(String);
 impl ProposalNonce {
+    pub(crate) fn from_admin(value: String) -> Result<Self, StoreError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(StoreError::Invalid("invalid proposal decision"));
+        }
+        Ok(Self(value))
+    }
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -113,6 +124,14 @@ pub struct ProposalUpdate {
 
 impl Store {
     pub async fn begin_attempt(&self, input: NewProposal) -> Result<Proposal, StoreError> {
+        self.begin_attempt_before(input, None).await
+    }
+
+    pub(crate) async fn begin_attempt_before(
+        &self,
+        input: NewProposal,
+        deadline: Option<Instant>,
+    ) -> Result<Proposal, StoreError> {
         if input.source.get("kind").and_then(Value::as_str) != Some("local")
             || !input.source.is_object()
         {
@@ -120,6 +139,7 @@ impl Store {
         }
         let nonce = nonce()?;
         self.with_writer(move |writer| {
+            check_admission_deadline(deadline)?;
             let id = writer.next_id()?;
             let event_id = writer.next_id()?;
             let timestamp = now_ms()?;
@@ -134,6 +154,9 @@ impl Store {
                 state: ProposalState::Received, reason: None,
             })?;
             let proposal = get(&tx, &id)?;
+            // A queued request must never commit after being refused as busy.
+            // Dropping this transaction rolls back both receipt and audit.
+            check_admission_deadline(deadline)?;
             tx.commit()?;
             Ok(proposal)
         }).await
@@ -372,6 +395,12 @@ impl Store {
         }).await
     }
 }
+pub(super) fn check_admission_deadline(deadline: Option<Instant>) -> Result<(), StoreError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(StoreError::Invalid("administrative admission expired"));
+    }
+    Ok(())
+}
 fn ids_with_states(db: &Connection, states: &str) -> Result<Vec<String>, StoreError> {
     // Only the fixed state lists above reach this helper; no caller-supplied SQL.
     let mut statement = db.prepare(&format!(
@@ -396,7 +425,7 @@ fn validate_identity(identity: &mut ProposalIdentity) -> Result<(), StoreError> 
 /// Replay the stored approval inputs, never a new MCP discovery or a caller's
 /// replacement catalog. Configured NAT64 context is also checked by the
 /// installer; this generic subset validation cannot introduce a new grant.
-pub(super) fn validate_approval(
+pub(crate) fn validate_approval(
     proposal: &Proposal,
     patch: &Overrides,
 ) -> Result<PinnedCatalog, StoreError> {
@@ -590,4 +619,73 @@ fn decode_optional<T: serde::de::DeserializeOwned>(
     index: usize,
 ) -> rusqlite::Result<Option<T>> {
     value.map(|value| decode(&value, index)).transpose()
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::{future::Future, task::Poll, time::Duration};
+
+    #[tokio::test]
+    async fn queued_receipt_cannot_commit_after_its_admission_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        crate::home::prepare(&home).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let barrier = store.with_writer(move |_| {
+            let _ = entered.send(());
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        });
+        tokio::pin!(barrier);
+        std::future::poll_fn(|cx| {
+            assert!(barrier.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        waiting.await.unwrap();
+
+        let input = || NewProposal {
+            source: json!({"kind":"local"}),
+            tainted: false,
+        };
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let receipt = store.begin_attempt_before(input(), Some(deadline));
+        tokio::pin!(receipt);
+        // With an empty bounded channel, this poll enqueues the job and reaches
+        // its reply wait while the writer is held by the explicit barrier.
+        std::future::poll_fn(|cx| {
+            assert!(receipt.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(Instant::now() < deadline, "job queued before its deadline");
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        release.send(()).unwrap();
+        barrier.await.unwrap();
+        assert!(matches!(
+            receipt.await,
+            Err(StoreError::Invalid("administrative admission expired"))
+        ));
+        let (proposals, events) = store
+            .read(|db| {
+                Ok((
+                    db.query_row("SELECT count(*) FROM proposals", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    db.query_row(
+                        "SELECT count(*) FROM events WHERE kind='ext.proposed'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((proposals, events), (0, 0));
+        // The same valid request remains usable only as a new explicit call.
+        store.begin_attempt(input()).await.unwrap();
+    }
 }

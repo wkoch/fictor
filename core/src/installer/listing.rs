@@ -116,6 +116,38 @@ pub async fn snapshot(owner: Arc<HomeLease>) -> Result<Snapshot, ListingError> {
 }
 
 pub(crate) fn read_owned(owner: Arc<HomeLease>) -> Result<Snapshot, ListingError> {
+    let lock = read_lock(&owner, false)?;
+    let mut extensions = Vec::with_capacity(lock.extensions.len());
+    for (id, extension) in lock.extensions {
+        let active = extension
+            .versions
+            .get(&extension.active)
+            .ok_or(ListingError::InvalidSnapshot)?;
+        extensions.push(Extension {
+            id,
+            active: extension.active,
+            version: active.version.clone(),
+            enabled: extension.enabled,
+        });
+    }
+    let snapshot = Snapshot {
+        schema: 1,
+        extensions,
+    };
+    snapshot.validate()?;
+    crate::admin::bounded_json(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Offline mutation preflight validates persisted inputs, independent of how
+/// many configuration rows a listing response could fit into one admin frame.
+pub(crate) fn preflight_owned(
+    owner: Arc<HomeLease>,
+    allow_prepared: bool,
+) -> Result<(), ListingError> {
+    read_lock(&owner, allow_prepared).map(|_| ())
+}
+fn read_lock(owner: &HomeLease, allow_prepared: bool) -> Result<Lock, ListingError> {
     owner.verify().map_err(|_| ListingError::InvalidSnapshot)?;
     let home = owner.anchored_path().join(".");
     // SQLite's NOFOLLOW rejects /proc/self/fd directory aliases too. Use the
@@ -165,32 +197,14 @@ pub(crate) fn read_owned(owner: Arc<HomeLease>) -> Result<Snapshot, ListingError
     if crate::store::read_promotion_intents(&transaction)
         .map_err(|_| ListingError::InvalidSnapshot)?
         .is_some()
+        && !allow_prepared
     {
         return Err(ListingError::RecoveryRequired);
     }
     let lock = Lock::load_required(&home).map_err(lock_error)?;
-    let mut extensions = Vec::with_capacity(lock.extensions.len());
-    for (id, extension) in lock.extensions {
-        let active = extension
-            .versions
-            .get(&extension.active)
-            .ok_or(ListingError::InvalidSnapshot)?;
-        extensions.push(Extension {
-            id,
-            active: extension.active,
-            version: active.version.clone(),
-            enabled: extension.enabled,
-        });
-    }
-    let snapshot = Snapshot {
-        schema: 1,
-        extensions,
-    };
-    snapshot.validate()?;
-    crate::admin::bounded_json(&snapshot)?;
     transaction.commit().map_err(database_error)?;
     owner.verify().map_err(|_| ListingError::InvalidSnapshot)?;
-    Ok(snapshot)
+    Ok(lock)
 }
 
 fn file_error(error: io::Error) -> ListingError {

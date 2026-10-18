@@ -1,8 +1,13 @@
 //! ADR-041: one authenticated local request, one bounded response. This is
 //! separate from Kernel Protocol and does not dispatch to extensions.
+mod protocol;
 use crate::{
     installer::listing::{self, ListingError, MAX_MESSAGE_BYTES, Snapshot, TIMEOUT},
     ownership::HomeLease,
+};
+pub use protocol::{
+    AdminClientError, AdminMutationError, AdminMutationFuture, AdminMutationHandler, Effect,
+    MutationReason,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -22,6 +27,11 @@ use tokio::{
     sync::watch,
     task::{JoinHandle, JoinSet},
 };
+pub(crate) fn valid_method_params(method: &str, params: &Value) -> bool {
+    params
+        .as_object()
+        .is_some_and(|params| protocol::valid_params(method, params))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -115,7 +125,7 @@ fn uid() -> u32 {
 }
 fn private_directory(file: &File) -> Result<(), AdminError> {
     let metadata = file.metadata().map_err(|_| AdminError::Identity)?;
-    if !metadata.is_dir() || metadata.uid() != uid() || metadata.mode() & 0o077 != 0 {
+    if !metadata.is_dir() || metadata.uid() != uid() || metadata.mode() & 0o7777 != 0o700 {
         return Err(AdminError::Identity);
     }
     Ok(())
@@ -150,8 +160,39 @@ pub struct AdminServer {
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
 }
+#[derive(Clone, Default)]
+struct Services {
+    controls: Option<Arc<dyn AdminMutationHandler>>,
+    installer: Option<Arc<dyn AdminMutationHandler>>,
+}
+pub struct AdminServerBuilder {
+    owner: Arc<HomeLease>,
+    services: Services,
+}
+impl AdminServerBuilder {
+    pub fn with_controls(mut self, service: Arc<dyn AdminMutationHandler>) -> Self {
+        self.services.controls = Some(service);
+        self
+    }
+    pub fn with_installer(mut self, service: Arc<dyn AdminMutationHandler>) -> Self {
+        self.services.installer = Some(service);
+        self
+    }
+    pub async fn bind(self) -> Result<AdminServer, AdminError> {
+        AdminServer::bind_services(self.owner, self.services).await
+    }
+}
 impl AdminServer {
+    pub fn builder(owner: Arc<HomeLease>) -> AdminServerBuilder {
+        AdminServerBuilder {
+            owner,
+            services: Services::default(),
+        }
+    }
     pub async fn bind(owner: Arc<HomeLease>) -> Result<Self, AdminError> {
+        Self::builder(owner).bind().await
+    }
+    async fn bind_services(owner: Arc<HomeLease>, services: Services) -> Result<Self, AdminError> {
         owner.verify().map_err(|_| AdminError::Identity)?;
         let run = Run::open(&owner.anchored_path().join("."))?;
         let listener = UnixListener::bind(run.path()).map_err(|_| AdminError::Transport)?;
@@ -174,7 +215,7 @@ impl AdminServer {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         if authenticate(&stream, uid()).is_err() { continue; }
-                        connections.spawn(serve(stream, owner.clone()));
+                        connections.spawn(serve(stream, owner.clone(),services.clone()));
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
@@ -271,10 +312,13 @@ fn parse(bytes: &[u8]) -> Parsed {
     if request.jsonrpc != "2.0" || request.id.is_empty() || request.id.len() > 128 {
         return Parsed::Error(rpc_error(id, -32600, "Invalid Request"));
     }
-    if request.method != "ext.list" {
+    if request.method != "ext.list"
+        && !protocol::CONTROLS.contains(&request.method.as_str())
+        && !protocol::INSTALL.contains(&request.method.as_str())
+    {
         return Parsed::Error(rpc_error(id, -32601, "Method not found"));
     }
-    if !request.params.is_empty() {
+    if !protocol::valid_params(&request.method, &request.params) {
         return Parsed::Error(rpc_error(id, -32602, "Invalid params"));
     }
     Parsed::Request(request)
@@ -289,22 +333,74 @@ fn response_bytes(response: &Value) -> Result<Vec<u8>, ListingError> {
     }
 }
 
-async fn serve(stream: UnixStream, owner: Arc<HomeLease>) {
+async fn serve(stream: UnixStream, owner: Arc<HomeLease>, services: Services) {
     let mut reader = BufReader::new(stream);
     let Ok(bytes) = line(&mut reader).await else {
         return;
     };
-    let response = match parse(&bytes) {
+    let parsed = parse(&bytes);
+    let method = match &parsed {
+        Parsed::Request(request) => Some(request.method.clone()),
+        _ => None,
+    };
+    let response = match parsed {
         Parsed::Ignore => return,
         Parsed::Error(error) => error,
-        Parsed::Request(request) => match listing::snapshot(owner).await {
-            Ok(snapshot) => json!({"jsonrpc":"2.0","id":request.id,"result":snapshot}),
-            Err(reason) => failure(&request.id, reason),
-        },
+        Parsed::Request(request) if request.method == "ext.list" => {
+            match listing::snapshot(owner).await {
+                Ok(snapshot) => json!({"jsonrpc":"2.0","id":request.id,"result":snapshot}),
+                Err(reason) => failure(&request.id, reason),
+            }
+        }
+        Parsed::Request(request) => {
+            let handler = if protocol::CONTROLS.contains(&request.method.as_str()) {
+                services.controls
+            } else {
+                services.installer
+            };
+            let result = if let Some(handler) = handler {
+                let method = request.method.clone();
+                let params = Value::Object(request.params);
+                // Once a trusted request reaches admission, disconnect/shutdown
+                // cannot cancel its owner. The service enforces its 5s gate.
+                tokio::spawn(async move { handler.call_mutation(&method, &params).await })
+                    .await
+                    .unwrap_or_else(|_| Err(AdminMutationError::unknown(MutationReason::IoError)))
+            } else {
+                Err(AdminMutationError::none(MutationReason::InvalidState))
+            };
+            match result {
+                Ok(value) => json!({"jsonrpc":"2.0","id":request.id,"result":value}),
+                Err(error) => {
+                    json!({"jsonrpc":"2.0","id":request.id,"error":{"code":-32000,"message":format!("{} failed",request.method),"data":error}})
+                }
+            }
+        }
     };
-    if let Ok(mut bytes) = response_bytes(&response) {
+    let encoded = match method.as_deref() {
+        Some(method) if method != "ext.list" => mutation_response_bytes(&response, method),
+        _ => response_bytes(&response),
+    };
+    if let Ok(mut bytes) = encoded {
         bytes.push(b'\n');
         let _ = tokio::time::timeout(TIMEOUT, reader.get_mut().write_all(&bytes)).await;
+    }
+}
+fn mutation_response_bytes(response: &Value, method: &str) -> Result<Vec<u8>, ListingError> {
+    match bounded_json(response) {
+        Ok(bytes) => Ok(bytes),
+        Err(reason) => {
+            // The generic transport cannot infer whether an admitted mutation
+            // committed from an oversized result. Queries are always effectless.
+            let effect = if matches!(method, "ext.install.status" | "secrets.list") {
+                Effect::None
+            } else {
+                Effect::Unknown
+            };
+            bounded_json(
+                &json!({"jsonrpc":"2.0","id":response.get("id").cloned().unwrap_or(Value::Null),"error":{"code":-32000,"message":format!("{method} failed"),"data":{"reason":MutationReason::from(reason),"effect":effect}}}),
+            )
+        }
     }
 }
 
@@ -376,6 +472,88 @@ pub async fn request(home: &Path) -> Result<Snapshot, AdminError> {
         != 0
     {
         return Err(AdminError::Transport);
+    }
+    result
+}
+
+/// Authenticate before transmitting administrative parameters (including a new
+/// secret). A failed attempt after any write may have taken effect: never retry.
+pub async fn request_method(
+    home: &Path,
+    method: &str,
+    params: &Value,
+) -> Result<Value, AdminClientError> {
+    if !valid_method_params(method, params) {
+        return Err(AdminClientError::Protocol {
+            effect: Effect::None,
+        });
+    }
+    let before_send = || AdminClientError::Transport {
+        effect: Effect::None,
+    };
+    let after_send = || AdminClientError::Transport {
+        effect: Effect::Unknown,
+    };
+    let malformed = || AdminClientError::Protocol {
+        effect: Effect::Unknown,
+    };
+    let run = Run::open(home).map_err(|_| AdminClientError::Identity)?;
+    let before = run.socket().map_err(|_| AdminClientError::Identity)?;
+    let stream = tokio::time::timeout(TIMEOUT, UnixStream::connect(run.path()))
+        .await
+        .map_err(|_| before_send())?
+        .map_err(|_| before_send())?;
+    authenticate(&stream, uid()).map_err(|_| AdminClientError::Identity)?;
+    let after = run.socket().map_err(|_| AdminClientError::Identity)?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+        return Err(AdminClientError::Identity);
+    }
+    let mut bytes =
+        bounded_json(&json!({"jsonrpc":"2.0","id":"cli-1","method":method,"params":params}))
+            .map_err(|_| {
+                AdminClientError::Domain(AdminMutationError::none(MutationReason::TooLarge))
+            })?;
+    bytes.push(b'\n');
+    let mut reader = BufReader::new(stream);
+    tokio::time::timeout(TIMEOUT, reader.get_mut().write_all(&bytes))
+        .await
+        .map_err(|_| after_send())?
+        .map_err(|_| after_send())?;
+    let bytes = line(&mut reader).await.map_err(|_| after_send())?;
+    let response = crate::strict_json::parse(&bytes).map_err(|_| malformed())?;
+    let object = response.as_object().ok_or_else(malformed)?;
+    if object.len() != 3
+        || object.get("jsonrpc") != Some(&json!("2.0"))
+        || object.get("id") != Some(&json!("cli-1"))
+    {
+        return Err(malformed());
+    }
+    let result = if let Some(result) = object.get("result") {
+        Ok(result.clone())
+    } else if let Some(error) = object.get("error") {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Domain {
+            code: i32,
+            message: String,
+            data: AdminMutationError,
+        }
+        let error: Domain = serde_json::from_value(error.clone()).map_err(|_| malformed())?;
+        if error.code != -32000 || error.message != format!("{method} failed") {
+            return Err(malformed());
+        }
+        Err(AdminClientError::Domain(error.data))
+    } else {
+        return Err(malformed());
+    };
+    let mut extra = [0; 1];
+    if tokio::time::timeout(TIMEOUT, reader.read(&mut extra))
+        .await
+        .map_err(|_| after_send())?
+        .map_err(|_| after_send())?
+        != 0
+    {
+        return Err(malformed());
     }
     result
 }
@@ -469,5 +647,19 @@ mod tests {
             authenticate(&left, uid().wrapping_add(1)),
             Err(AdminError::Identity)
         ));
+    }
+
+    #[test]
+    fn admin_paths_require_exact_private_directory_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = File::open(directory.path()).unwrap();
+        private_directory(&file).unwrap();
+        for mode in [0o000, 0o600, 0o750, 0o1700, 0o2700, 0o4700] {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            assert!(private_directory(&file).is_err(), "mode {mode:o}");
+        }
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

@@ -23,6 +23,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::OnceCell;
 
@@ -88,6 +89,10 @@ impl LocalChecker {
         self.dependency_resolver = Some(resolver);
         self
     }
+    pub(crate) fn control_registry(&self) -> crate::supervisor::controls::ControlRegistry {
+        self.supervisor.control_registry()
+    }
+
     /// Admit durably before opening source; all objective refusals retain their ID.
     pub async fn check_local(&self, source: &Path) -> Result<LocalReport, LocalError> {
         // Dropping the caller must not strand an identified proposal in checking.
@@ -96,35 +101,95 @@ impl LocalChecker {
         // retain a lease clone until their filesystem work has actually ended.
         let checker = self.clone();
         let source = source.to_path_buf();
-        tokio::spawn(async move { checker.check_owned(&source).await })
+        tokio::spawn(async move { checker.check_owned(&source, None, None).await })
             .await
             .map_err(|_| LocalError::Task)?
     }
 
-    async fn check_owned(&self, source: &Path) -> Result<LocalReport, LocalError> {
+    /// ADR-045: acknowledge only the durable receipt. The owned checker keeps
+    /// copying/checking after the observer disconnects, without approving it.
+    pub async fn prepare_local(&self, source: &Path) -> Result<String, LocalError> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        self.prepare_local_before(source, deadline).await
+    }
+
+    pub(crate) async fn prepare_local_before(
+        &self,
+        source: &Path,
+        deadline: Instant,
+    ) -> Result<String, LocalError> {
+        let checker = self.clone();
+        let source = source.to_path_buf();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = checker
+                .check_owned(&source, Some(sender), Some(deadline))
+                .await;
+        });
+        receiver.await.map_err(|_| LocalError::Task)?
+    }
+
+    pub(crate) async fn shared_lease(&self) -> Result<Arc<InstallerLease>, LocalError> {
+        let _section = self.store.owner().installer_gate().lock_owned().await;
+        self.admission().await
+    }
+
+    async fn check_owned(
+        &self,
+        source: &Path,
+        admitted: Option<tokio::sync::oneshot::Sender<Result<String, LocalError>>>,
+        deadline: Option<Instant>,
+    ) -> Result<LocalReport, LocalError> {
         let owner = self.store.owner().clone();
-        owner.verify().map_err(|_| LocalError::Admission)?;
-        if self
-            .home
-            .canonicalize()
-            .map_err(|_| LocalError::Admission)?
-            != owner.home()
-        {
-            return Err(LocalError::Admission);
+        let setup = async {
+            owner.verify().map_err(|_| LocalError::Admission)?;
+            if self
+                .home
+                .canonicalize()
+                .map_err(|_| LocalError::Admission)?
+                != owner.home()
+            {
+                return Err(LocalError::Admission);
+            }
+            let section = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(
+                    deadline.unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(5)),
+                ),
+                owner.installer_gate().lock_owned(),
+            )
+            .await
+            .map_err(|_| LocalError::Admission)?;
+            if self.store.pending_promotion().await?.is_some() {
+                return Err(LocalError::Admission);
+            }
+            let lease = self.admission().await?;
+            // No source access, including metadata or canonicalization, precedes this commit.
+            let proposal = self
+                .store
+                .begin_attempt_before(
+                    NewProposal {
+                        source: json!({"kind":"local"}),
+                        tainted: false,
+                    },
+                    deadline,
+                )
+                .await?;
+            Ok::<_, LocalError>((section, lease, proposal))
         }
-        let _section = owner.installer_gate().lock_owned().await;
-        if self.store.pending_promotion().await?.is_some() {
-            return Err(LocalError::Admission);
+        .await;
+        let (_section, lease, proposal) = match setup {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(admitted) = admitted {
+                    let _ = admitted.send(Err(error));
+                    return Err(LocalError::Task);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(admitted) = admitted {
+            let _ = admitted.send(Ok(proposal.id.clone()));
         }
-        let lease = self.admission().await?;
-        // No source access, including metadata or canonicalization, precedes this commit.
-        let proposal = self
-            .store
-            .begin_attempt(NewProposal {
-                source: json!({"kind":"local"}),
-                tainted: false,
-            })
-            .await?;
         let pending = self
             .home
             .join("extensions/quarantine")
@@ -289,6 +354,19 @@ impl LocalChecker {
             .extensions
             .get(&manifest.id)
             .map(|ext| ext.active.clone());
+        let omitted_home_ro_files = self.supervisor.configured_home_ro_files().to_vec();
+        let mut omitted_fs_complete: Vec<String> = manifest
+            .permissions
+            .fs
+            .read
+            .iter()
+            .chain(&manifest.permissions.fs.write)
+            .filter(|path| !path.starts_with("${"))
+            .chain(&omitted_home_ro_files)
+            .cloned()
+            .collect();
+        omitted_fs_complete.sort();
+        omitted_fs_complete.dedup();
         checks.extend([
             passed("manifest", None),
             informative(
@@ -298,7 +376,9 @@ impl LocalChecker {
                     "omitted_fs": {
                         "read":manifest.permissions.fs.read.iter().filter(|path| !path.starts_with("${")).collect::<Vec<_>>(),
                         "write":manifest.permissions.fs.write.iter().filter(|path| !path.starts_with("${")).collect::<Vec<_>>()
-                    }
+                    },
+                    "omitted_home_ro_files": omitted_home_ro_files,
+                    "omitted_fs_complete": omitted_fs_complete
                 }),
             ),
         ]);

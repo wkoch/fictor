@@ -1,6 +1,7 @@
 //! MCP stdio client, rmcp 3.5.1 (protocol 2026-07-28 compatibility).
 //! https://docs.rs/rmcp/3.5.1/rmcp/
 //! Tools are pinned using RFC 8785; annotations never authorize execution.
+pub(crate) mod admission;
 pub mod registry;
 mod transport;
 use crate::store::{AppendEvent, Provenance, Store};
@@ -190,13 +191,18 @@ struct Client {
 pub(crate) struct CatalogInvalidation {
     invalidated: Arc<AtomicBool>,
     stop: watch::Sender<bool>,
+    admission: admission::InstanceAdmission,
 }
 impl CatalogInvalidation {
     pub(crate) fn new(stop: watch::Sender<bool>) -> Self {
         Self {
             invalidated: Arc::new(AtomicBool::new(false)),
+            admission: admission::InstanceAdmission::new(stop.clone()),
             stop,
         }
+    }
+    pub(crate) fn admission(&self) -> admission::InstanceAdmission {
+        self.admission.clone()
     }
     pub(crate) fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
@@ -251,6 +257,7 @@ pub struct McpConnection {
     pinned: bool,
     disabled: Arc<AtomicBool>,
     watcher: JoinHandle<()>,
+    admission: Option<admission::InstanceAdmission>,
 }
 impl McpConnection {
     pub async fn connect<R, W>(
@@ -327,6 +334,7 @@ impl McpConnection {
             let initial = generation.load(Ordering::Acquire);
             disabled.store(initial != 0, Ordering::Release);
         }
+        let admission = invalidation.as_ref().map(CatalogInvalidation::admission);
         let watcher = tokio::spawn(async move {
             loop {
                 if *changes.borrow_and_update() == 0 && changes.changed().await.is_err() {
@@ -374,6 +382,7 @@ impl McpConnection {
             pinned,
             disabled,
             watcher,
+            admission,
         })
     }
     pub fn catalog(&self) -> &PinnedCatalog {
@@ -398,6 +407,11 @@ impl McpConnection {
         if !self.pinned || self.is_disabled() {
             return Err(GatewayError::Unavailable);
         }
+        let _call = self
+            .admission
+            .as_ref()
+            .map(|admission| admission.admit())
+            .transpose()?;
         // A cancelled session must not acquire a fresh external side effect.
         // Only requests already issued may receive notifications/cancelled.
         if *cancelled.borrow() || cancelled.has_changed().is_err() {
@@ -450,6 +464,11 @@ impl McpConnection {
         }
     }
     pub async fn resources(&self) -> Result<Vec<Resource>, GatewayError> {
+        let _call = self
+            .admission
+            .as_ref()
+            .map(|admission| admission.admit())
+            .transpose()?;
         let peer = self
             .service
             .as_ref()

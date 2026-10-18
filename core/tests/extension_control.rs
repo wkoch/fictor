@@ -121,7 +121,7 @@ fn disable_and_enable_change_only_the_requested_flag_and_preserve_versions_and_m
     assert!(disabled.status.success(), "{:?}", disabled);
     assert_eq!(
         serde_json::from_slice::<Value>(&disabled.stdout).unwrap(),
-        json!({"ext_id":"sample","enabled":false,"changed":true})
+        json!({"schema":1,"ext_id":"sample","key":original["extensions"]["sample"]["active"],"enabled":false,"changed":true})
     );
     assert_eq!(fixture.value(), expected);
     let before_noop = fixture.bytes();
@@ -130,7 +130,7 @@ fn disable_and_enable_change_only_the_requested_flag_and_preserve_versions_and_m
     assert!(unchanged.status.success(), "{:?}", unchanged);
     assert_eq!(
         serde_json::from_slice::<Value>(&unchanged.stdout).unwrap(),
-        json!({"ext_id":"sample","enabled":false,"changed":false})
+        json!({"schema":1,"ext_id":"sample","key":original["extensions"]["sample"]["active"],"enabled":false,"changed":false})
     );
     assert_eq!(fixture.bytes(), before_noop);
     assert_eq!(fs::metadata(fixture.path()).unwrap().ino(), inode);
@@ -138,7 +138,7 @@ fn disable_and_enable_change_only_the_requested_flag_and_preserve_versions_and_m
     assert!(enabled.status.success(), "{:?}", enabled);
     assert_eq!(
         serde_json::from_slice::<Value>(&enabled.stdout).unwrap(),
-        json!({"ext_id":"sample","enabled":true,"changed":true})
+        json!({"schema":1,"ext_id":"sample","key":original["extensions"]["sample"]["active"],"enabled":true,"changed":true})
     );
     assert_eq!(fixture.value(), original);
     assert!(fixture.home.join("fictor.db").is_file());
@@ -199,7 +199,9 @@ fn admin_socket_or_any_admin_marker_refuses_control_before_parsing_the_lock() {
     for action in ["enable", "disable"] {
         let result = fixture.cli(action);
         assert!(!result.status.success(), "{:?}", result);
-        assert!(String::from_utf8_lossy(&result.stderr).contains("endpoint administrativo"));
+        // Offline controls now validate the existing database/lock first; an
+        // unrelated socket marker grants no authority and repairs nothing.
+        assert!(String::from_utf8_lossy(&result.stderr).contains("invalid_snapshot"));
         assert_eq!(fixture.bytes(), before);
     }
     drop(listener);

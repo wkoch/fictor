@@ -1,7 +1,6 @@
 use fictor::{
     config::{Config, Mode},
     gateway::PinnedCatalog,
-    home,
     installer::manifest::{KernelScope, Manifest, ManifestError, Role},
     proxy::EgressProxy,
     secrets::{BackendKind, Redactor, SecretStore},
@@ -40,7 +39,8 @@ impl Fixture {
             .unwrap();
         let base = root.path().canonicalize().unwrap();
         let home = base.join("core");
-        home::prepare(&home).unwrap();
+        let owner = fictor::ownership::HomeLease::create_for_init(&home).unwrap();
+        fictor::initialize_owned(owner.clone()).await.unwrap();
         let workspace = base.join("work");
         fs::create_dir(&workspace).unwrap();
         let real_home = base.join("user");
@@ -48,7 +48,7 @@ impl Fixture {
         let mut config = Config::create_if_missing(&home).unwrap();
         config.providers.clear();
         config.sandbox.home_ro_files.clear();
-        let store = Arc::new(Store::open(&home).await.unwrap());
+        let store = Arc::new(Store::open_with_lease(owner).await.unwrap());
         let secrets = Arc::new(
             SecretStore::open_with_lease(
                 store.owner().clone(),
@@ -198,6 +198,32 @@ fn launch_pid(home: &Path) -> (PathBuf, u32) {
     (records[0].clone(), pid)
 }
 
+async fn wait_armed(home: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let armed = fs::read_dir(home.join("run/instances")).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let id = entry.file_name().to_string_lossy().into_owned();
+                    fs::read(entry.path().join("state.json"))
+                        .ok()
+                        .and_then(|bytes| {
+                            fictor::instance_recovery::StateRecord::parse(&bytes, &id).ok()
+                        })
+                        .is_some_and(|record| {
+                            record.state == fictor::instance_recovery::InstanceState::Armed
+                        })
+                })
+            });
+            if armed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 struct PausedAdmissionClock {
     entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -297,7 +323,11 @@ async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resou
     });
     admission.await.unwrap();
     let (release, writer) = hold_store_writer(fixture.store.clone(), Some(resume)).await;
-    wait_file(&fixture.workspace.join("launch.started")).await;
+    wait_armed(&fixture.home).await;
+    assert!(
+        !fixture.workspace.join("launch.started").exists(),
+        "workload remains blocked while startup audit cannot commit"
+    );
     let (pid_path, pid) = launch_pid(&fixture.home);
     assert!(retained.upgrade().is_some());
     assert!(external_path.exists());
@@ -349,7 +379,8 @@ async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped
     });
     admission.await.unwrap();
     let (release, writer) = hold_store_writer(fixture.store.clone(), Some(resume)).await;
-    wait_file(&fixture.workspace.join("launch.started")).await;
+    wait_armed(&fixture.home).await;
+    assert!(!fixture.workspace.join("launch.started").exists());
     let (pid_path, pid) = launch_pid(&fixture.home);
     launch.abort();
     assert!(matches!(launch.await, Err(error) if error.is_cancelled()));
@@ -368,6 +399,65 @@ async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped
     .unwrap();
     assert!(!external_path.exists());
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+}
+
+#[tokio::test]
+async fn production_launch_persists_both_identities_before_workload_and_confirms_them_before_cleanup()
+ {
+    use fictor::instance_recovery::{InstanceState, ProcessHandle, StateRecord};
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf started > "$FICTOR_WORKSPACE/journal.started"
+/bin/sleep 60"#,
+    );
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let external = Arc::new(tempfile::tempdir().unwrap());
+    let retained = Arc::downgrade(&external);
+    let mut instance = fixture
+        .supervisor
+        .spawn_with_owner(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+            external,
+        )
+        .await
+        .unwrap();
+    wait_file(&fixture.workspace.join("journal.started")).await;
+    let directory = fixture
+        .home
+        .join("run/instances")
+        .join(&instance.instance_id);
+    let record = StateRecord::parse(
+        &fs::read(directory.join("state.json")).unwrap(),
+        &instance.instance_id,
+    )
+    .unwrap();
+    assert_eq!(record.state, InstanceState::Armed);
+    assert_eq!(record.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(record.owner_id, fixture.store.owner().owner_id());
+    let launcher = ProcessHandle::capture(instance.pid(), false).unwrap();
+    let init = ProcessHandle::capture(record.init.unwrap().pid, true).unwrap();
+    assert_eq!(record.launcher.unwrap(), launcher.identity());
+    assert_eq!(record.init.unwrap(), init.identity());
+    assert_eq!(record.sandbox_pidns.unwrap(), init.namespace());
+    assert_ne!(record.observer_pidns, init.namespace());
+    assert!(directory.join("tmp/home").is_dir());
+    assert!(directory.join("admission.sock").exists());
+    assert!(retained.upgrade().is_some());
+    assert!(!instance.shutdown().await.unwrap().crashed);
+    assert!(launcher.is_exited().unwrap());
+    assert!(init.is_exited().unwrap());
+    assert!(!directory.exists());
+    assert!(retained.upgrade().is_none());
 }
 
 #[tokio::test]
@@ -856,7 +946,7 @@ exit 0"#,
     );
     fixture
         .supervisor
-        .smoke(&manifest, &bundle, "key")
+        .smoke(&manifest, &bundle, "1.0.0-000000000000")
         .await
         .unwrap();
     assert_eq!(
@@ -898,7 +988,10 @@ done"#);
     assert_eq!(report.resources.len(), 1);
     fs::write(bundle.join("server"), "#!/bin/sh\nexit 0\n").unwrap();
     assert!(matches!(
-        fixture.supervisor.smoke(&manifest, &bundle, "key").await,
+        fixture
+            .supervisor
+            .smoke(&manifest, &bundle, "1.0.0-000000000000")
+            .await,
         Err(SupervisorError::Mcp)
     ));
 }
@@ -2027,7 +2120,9 @@ const status = await new Promise((resolve, reject) => {
   socket.on('end', () => resolve(response.split('\r\n')[0]));
   socket.on('connect', () => {
     const basic = Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64');
-    socket.end(`GET ${target.href} HTTP/1.1\r\nHost: ${target.host}\r\nProxy-Authorization: Basic ${basic}\r\nConnection: close\r\n\r\n`);
+    // Keep the request side open until the response. Hyper's configured
+    // half-close policy otherwise races the durable denial audit against EOF.
+    socket.write(`GET ${target.href} HTTP/1.1\r\nHost: ${target.host}\r\nProxy-Authorization: Basic ${basic}\r\nConnection: close\r\n\r\n`);
   });
 });
 assert.match(status, /^HTTP\/1\.[01] 403 /);
@@ -2109,6 +2204,72 @@ assert.match(status, /^HTTP\/1\.[01] 403 /);
     let log = fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap();
     assert_eq!(outcome.unwrap().unwrap().code, Some(0), "{log}");
     assert_eq!(fs::read_to_string(canary).unwrap(), "original data");
+}
+
+#[tokio::test]
+async fn launcher_exit_without_identified_init_retains_spawning_resources_and_never_runs_workload()
+{
+    use fictor::instance_recovery::{InstanceState, StateRecord};
+    let mut fixture = Fixture::new().await;
+    // Trusted test override deliberately cannot speak the private init channel.
+    // It exercises a real post-fork partial attempt without production hooks.
+    fixture.supervisor = fixture
+        .supervisor
+        .with_fictor_exe("/usr/bin/true".into())
+        .unwrap();
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf unexpected > "$FICTOR_WORKSPACE/partial.started""#,
+    );
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let external = Arc::new(tempfile::tempdir().unwrap());
+    let retained = Arc::downgrade(&external);
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        fixture.supervisor.spawn_with_owner(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+            external,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(SupervisorError::Process)));
+    assert!(!fixture.workspace.join("partial.started").exists());
+    let directories: Vec<_> = fs::read_dir(fixture.home.join("run/instances"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(directories.len(), 1);
+    let directory = directories[0].path();
+    let id = directories[0].file_name().to_string_lossy().into_owned();
+    let record = StateRecord::parse(&fs::read(directory.join("state.json")).unwrap(), &id).unwrap();
+    assert_eq!(record.state, InstanceState::Spawning);
+    assert!(record.init.is_none());
+    assert!(directory.join("tmp/home").is_dir());
+    assert!(retained.upgrade().is_some());
+    assert!(
+        fixture
+            .store
+            .query_events(EventQuery {
+                kinds: vec!["ext.started".into(), "ext.crashed".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Retention is the expected result, not an automatic test-fixture cleanup.
+    // A same-boot Spawning record must survive even after its launcher exits.
+    let _ = fixture._root.keep();
 }
 
 mod crash_admission {
@@ -2426,5 +2587,290 @@ exit 0"#,
         assert!(report.catalog.tools().is_empty());
         assert!(events(&fixture, "ext.crashed").await.is_empty());
         drop(gate);
+    }
+}
+
+mod hot_swap {
+    use super::*;
+    use fictor::{
+        gateway::GatewayError,
+        installer::{
+            controls::ControlPublication,
+            lock::{Approval, Lock, LockedExtension, LockedVersion},
+            overrides::Overrides,
+            publication::PromotionPublication,
+        },
+        store::{PromotionIntent, PromotionState},
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    const OLD: &str = "1.0.0-000000000000";
+    const NEW: &str = "2.0.0-111111111111";
+
+    fn locked(version: &str, key: &str, digit: char) -> LockedVersion {
+        let catalog = fixed_catalog();
+        LockedVersion {
+            version: version.into(),
+            hash: format!("sha256:{}", digit.to_string().repeat(64)),
+            path: format!("store/test-extension/{key}"),
+            source: json!({"kind":"local"}),
+            approved: Approval {
+                by: "user".into(),
+                at: "2026-10-18T00:00:00.000Z".into(),
+                approval_id: None,
+            },
+            overrides: Overrides::default(),
+            privileges: vec![],
+            tools: catalog.tools().to_vec(),
+            tools_hash: catalog.hash().into(),
+            packages: vec![],
+            audit: None,
+        }
+    }
+
+    fn intent(before: &str, after: &str) -> PromotionIntent {
+        let hash = |value: &str| {
+            let hex: String = Sha256::digest(value.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("sha256:{hex}")
+        };
+        // This trusted callback fixture isolates runtime publication. Real
+        // journal/approval transactions are exercised in tests/activation.rs.
+        PromotionIntent {
+            operation_id: ulid::Ulid::generate().to_string(),
+            proposal_id: ulid::Ulid::generate().to_string(),
+            ext_id: "test-extension".into(),
+            key: NEW.into(),
+            before_lock: Some(before.into()),
+            before_hash: Some(hash(before)),
+            after_lock: after.into(),
+            after_hash: hash(after),
+            state: PromotionState::Prepared,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_swap_drains_admitted_call_and_routes_new_calls_only_to_new_version() {
+        let fixture = Fixture::new().await;
+        let session = fixture.session().await;
+        let old_bundle = fixture.bundle(false, r#"
+while IFS= read -r line; do
+case "$line" in
+*'"id":'*) id=$(printf '%s' "$line" | /usr/bin/sed -E 's/.*"id":([0-9]+).*/\1/') ;;
+*) continue ;;
+esac
+case "$line" in
+*'"method":"initialize"'*) result='{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"drain-fixture","version":"1"}}' ;;
+*'"method":"tools/list"'*) result='{"tools":[{"name":"echo","description":"fixed","inputSchema":{"type":"object"}}]}' ;;
+*'"method":"tools/call"'*)
+printf 'entered\n' > "$FICTOR_WORKSPACE/entered-$REPLY"
+while [ ! -f "$FICTOR_WORKSPACE/release" ]; do /bin/sleep 0.01; done
+result=$(printf '{"content":[{"type":"text","text":"%s"}]}' "$REPLY") ;;
+*) continue ;;
+esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+/bin/sleep 60
+"#);
+        let new_bundle = fixture
+            .home
+            .join("extensions/store/test-extension")
+            .join(NEW);
+        fs::create_dir(&new_bundle).unwrap();
+        fs::copy(old_bundle.join("server"), new_bundle.join("server")).unwrap();
+        let old_manifest = manifest(
+            json!({"spawn":true,"fs":{"write":["${workspace}"]},"env":{"REPLY":"old"}}),
+            true,
+            true,
+        );
+        let mut new_manifest = old_manifest.clone();
+        new_manifest.version = "2.0.0".into();
+        new_manifest
+            .permissions
+            .env
+            .insert("REPLY".into(), "new".into());
+        let mut before = Lock::default();
+        before.extensions.insert(
+            "test-extension".into(),
+            LockedExtension {
+                enabled: true,
+                active: OLD.into(),
+                versions: BTreeMap::from([(OLD.into(), locked("1.0.0", OLD, '0'))]),
+            },
+        );
+        fs::write(
+            fixture.home.join("extensions/lock.json"),
+            before.encode_snapshot().unwrap(),
+        )
+        .unwrap();
+        let before_text =
+            String::from_utf8(Lock::read_snapshot(&fixture.home).unwrap().unwrap()).unwrap();
+        let mut after = before.clone();
+        let extension = after.extensions.get_mut("test-extension").unwrap();
+        extension.active = NEW.into();
+        extension
+            .versions
+            .insert(NEW.into(), locked("2.0.0", NEW, '1'));
+        let after_text = after.encode_snapshot().unwrap();
+        let mut promotion = intent(&before_text, &after_text);
+        let registry = fixture.supervisor.control_registry();
+        let mut old = fixture
+            .supervisor
+            .spawn(
+                &old_manifest,
+                &old_bundle,
+                OLD,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        old.connect_mcp(Some(fixed_catalog())).await.unwrap();
+        let old = Arc::new(old);
+        let caller = old.clone();
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let call = tokio::spawn(async move {
+            caller
+                .connection()
+                .unwrap()
+                .call("echo", json!({}), Duration::from_secs(10), cancelled)
+                .await
+        });
+        wait_file(&fixture.workspace.join("entered-old")).await;
+
+        registry.block_before_lock("test-extension").unwrap();
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            old.connection()
+                .unwrap()
+                .call("echo", json!({}), Duration::from_secs(1), cancelled)
+                .await,
+            Err(GatewayError::Unavailable)
+        ));
+        assert!(
+            fixture
+                .supervisor
+                .spawn(
+                    &new_manifest,
+                    &new_bundle,
+                    NEW,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await
+                .is_err()
+        );
+        // Even a durable after_lock cannot release runtime admission while the
+        // journal remains prepared. Nor can a failed publication release it.
+        assert!(registry.publish_after_commit(&promotion).await.is_err());
+        promotion.state = PromotionState::Committed;
+        assert!(registry.publish_after_commit(&promotion).await.is_err());
+        assert!(registry.allow("test-extension").is_err());
+        fs::write(
+            fixture.home.join("extensions/lock.json"),
+            after_text.as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .supervisor
+                .spawn(
+                    &new_manifest,
+                    &new_bundle,
+                    NEW,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await
+                .is_err()
+        );
+        registry.publish_after_commit(&promotion).await.unwrap();
+        assert!(
+            !call.is_finished(),
+            "the admitted old call is not cancelled by publication"
+        );
+
+        let mut new = fixture
+            .supervisor
+            .spawn(
+                &new_manifest,
+                &new_bundle,
+                NEW,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        new.connect_mcp(Some(fixed_catalog())).await.unwrap();
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            old.connection()
+                .unwrap()
+                .call("echo", json!({}), Duration::from_secs(1), cancelled)
+                .await,
+            Err(GatewayError::Unavailable)
+        ));
+        fs::write(fixture.workspace.join("release"), b"release").unwrap();
+        let old_result = call.await.unwrap().unwrap();
+        assert!(serde_json::to_string(&old_result).unwrap().contains("old"));
+        let mut old = Arc::try_unwrap(old).ok().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), old.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let new_result = new
+            .connection()
+            .unwrap()
+            .call("echo", json!({}), Duration::from_secs(1), cancelled)
+            .await
+            .unwrap();
+        assert!(serde_json::to_string(&new_result).unwrap().contains("new"));
+
+        registry.block_admissions("test-extension").unwrap();
+        after.extensions.get_mut("test-extension").unwrap().enabled = false;
+        fs::write(
+            fixture.home.join("extensions/lock.json"),
+            after.encode_snapshot().unwrap(),
+        )
+        .unwrap();
+        registry
+            .publish_enabled("test-extension", NEW, false)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .supervisor
+                .spawn(
+                    &new_manifest,
+                    &new_bundle,
+                    NEW,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), new.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let crashes = fixture
+            .store
+            .query_events(EventQuery {
+                kinds: vec!["ext.crashed".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            crashes.is_empty(),
+            "draining and administrative stops are requested stops"
+        );
     }
 }

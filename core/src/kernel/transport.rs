@@ -104,6 +104,12 @@ impl KernelServer {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+    /// Transfer pathname cleanup to the durable instance journal. Closing or
+    /// dropping this transport then leaves the socket until both pidfds prove
+    /// exit. Call immediately after bind, before launching any child.
+    pub fn defer_socket_cleanup(&mut self) {
+        self.cleanup = None;
+    }
     pub fn url(&self) -> String {
         format!("unix://{}", self.socket_path.display())
     }

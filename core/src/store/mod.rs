@@ -2,7 +2,9 @@ pub mod blobs;
 mod budget;
 mod crashes;
 mod events;
+mod installations;
 mod kv;
+pub(crate) use proposals::validate_approval;
 mod migrations;
 pub(crate) use migrations::SCHEMA_VERSION;
 mod promotion;
@@ -66,6 +68,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("banco com versão {0} mais nova que este core")]
     NewerSchema(i64),
+    #[error("schema incompatível com operação offline: {0}")]
+    ExistingSchema(i64),
     #[error("task de escrita indisponível")]
     Closed,
     #[error("relógio fora do intervalo suportado")]
@@ -115,6 +119,21 @@ impl Store {
     pub async fn open_with_lease(
         owner: Arc<crate::ownership::HomeLease>,
     ) -> Result<Self, StoreError> {
+        Self::open_mode(owner, false).await
+    }
+
+    /// Offline mutations never create a database, run a migration, repair sys,
+    /// or clean capture files as an incidental effect of opening their writer.
+    pub async fn open_existing_with_lease(
+        owner: Arc<crate::ownership::HomeLease>,
+    ) -> Result<Self, StoreError> {
+        Self::open_mode(owner, true).await
+    }
+
+    async fn open_mode(
+        owner: Arc<crate::ownership::HomeLease>,
+        existing_only: bool,
+    ) -> Result<Self, StoreError> {
         let writer_lease = owner.claim_writer()?;
         let home = owner.home();
         let path = home.join("fictor.db");
@@ -128,8 +147,14 @@ impl Store {
             // another writer, even when the opening future was cancelled.
             let _writer_lease = writer_lease;
             let setup = (|| -> Result<_, StoreError> {
-                let db = open_writer(&path)?;
-                writer_blobs.cleanup_captures()?;
+                let db = if existing_only {
+                    migrations::open_existing_writer(&path)?
+                } else {
+                    open_writer(&path)?
+                };
+                if !existing_only {
+                    writer_blobs.cleanup_captures()?;
+                }
                 let last: Option<String> = db
                     .query_row("SELECT id FROM events ORDER BY seq DESC LIMIT 1", [], |r| {
                         r.get(0)
@@ -143,8 +168,10 @@ impl Store {
                     .transpose()?;
                 let mut readers = Vec::new();
                 for _ in 0..2 {
-                    let connection =
-                        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                    let connection = Connection::open_with_flags(
+                        &path,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                    )?;
                     connection.busy_timeout(Duration::from_millis(5000))?;
                     connection.pragma_update(None, "foreign_keys", "ON")?;
                     readers.push(Mutex::new(connection));
