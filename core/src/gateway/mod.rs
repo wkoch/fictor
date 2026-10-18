@@ -24,7 +24,10 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::watch,
     task::JoinHandle,
+    time::Instant,
 };
+
+const CANCEL_ATTEMPT_BUDGET: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -391,6 +394,7 @@ impl McpConnection {
         timeout: Duration,
         mut cancelled: watch::Receiver<bool>,
     ) -> Result<CallToolResult, GatewayError> {
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(600));
         if !self.pinned || self.is_disabled() {
             return Err(GatewayError::Unavailable);
         }
@@ -407,23 +411,38 @@ impl McpConnection {
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(
             CallToolRequestParams::new(name.to_owned()).with_arguments(args),
         ));
-        let handle = self
+        if Instant::now() >= deadline {
+            return Err(GatewayError::Timeout);
+        }
+        let peer = self
             .service
             .as_ref()
             .ok_or(GatewayError::Unavailable)?
-            .peer()
-            .send_cancellable_request(
-                request,
-                PeerRequestOptions::with_timeout(timeout.min(Duration::from_secs(600))),
-            )
-            .await?;
+            .peer();
+        // rmcp's response timer excludes queueing and waits indefinitely for a
+        // cancellation write. Own the single deadline and cancellation instead.
+        let handle = tokio::select! { biased;
+            _ = call_cancelled(&mut cancelled) => return Err(GatewayError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return Err(GatewayError::Timeout),
+            handle = peer.send_cancellable_request(request, PeerRequestOptions::no_options()) => handle?,
+        };
         let id = handle.id.clone();
-        let result = tokio::select! {
-            result=handle.await_response()=>result?,
-            _=async {if !*cancelled.borrow(){let _=cancelled.changed().await;}}=>{
-                let _=self.service.as_ref().ok_or(GatewayError::Unavailable)?.peer().notify_cancelled(CancelledNotificationParam::new(Some(id),Some("session cancelled".into()))).await;
-                return Err(GatewayError::Cancelled);
+        let result = tokio::select! { biased;
+            _ = call_cancelled(&mut cancelled) => Err(GatewayError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => Err(GatewayError::Timeout),
+            result = handle.await_response() => result.map_err(GatewayError::from),
+        };
+        let result = match result {
+            Err(error @ (GatewayError::Cancelled | GatewayError::Timeout)) => {
+                let reason = if matches!(error, GatewayError::Cancelled) {
+                    "session cancelled"
+                } else {
+                    "request timeout"
+                };
+                cancel_before_deadline(peer, id, reason, deadline).await;
+                return Err(error);
             }
+            result => result?,
         };
         match result {
             ServerResult::CallToolResult(result) => Ok(result),
@@ -491,6 +510,44 @@ impl McpConnection {
                 .map_err(|_| GatewayError::Unavailable)?;
         }
         Ok(())
+    }
+}
+
+async fn call_cancelled(cancelled: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancelled.borrow_and_update() {
+            return;
+        }
+        if cancelled.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn cancel_before_deadline(
+    peer: &rmcp::Peer<RoleClient>,
+    id: RequestId,
+    reason: &str,
+    deadline: Instant,
+) {
+    let notification = peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(id),
+        Some(reason.into()),
+    ));
+    tokio::pin!(notification);
+    let now = Instant::now();
+    if now >= deadline {
+        // Best effort: poll exactly once to enqueue a known ID if space exists.
+        // Delivery cannot be guaranteed under backpressure without extending
+        // the tool's deadline; rmcp owns any notification already enqueued.
+        std::future::poll_fn(|context| {
+            let _ = notification.as_mut().poll(context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    } else {
+        let until = deadline.min(now + CANCEL_ATTEMPT_BUDGET);
+        let _ = tokio::time::timeout_at(until, notification).await;
     }
 }
 impl Drop for McpConnection {
@@ -645,6 +702,246 @@ mod tests {
                 Some(())=change.recv()=>{description="changed";writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n").await.unwrap();}
             }
         }
+    }
+
+    #[derive(Default)]
+    struct WriteGate {
+        blocked: AtomicBool,
+        entered: tokio::sync::Notify,
+        waker: Mutex<Option<std::task::Waker>>,
+    }
+    struct BlockedWrite(Arc<WriteGate>);
+    impl Drop for BlockedWrite {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    impl WriteGate {
+        fn block(self: &Arc<Self>) -> BlockedWrite {
+            self.blocked.store(true, Ordering::Release);
+            BlockedWrite(self.clone())
+        }
+        fn release(&self) {
+            let waker = {
+                let mut waker = self.waker.lock().unwrap();
+                self.blocked.store(false, Ordering::Release);
+                waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        fn poll(&self, context: &std::task::Context<'_>) -> bool {
+            let mut waker = self.waker.lock().unwrap();
+            if self.blocked.load(Ordering::Acquire) {
+                *waker = Some(context.waker().clone());
+                self.entered.notify_one();
+                true
+            } else {
+                false
+            }
+        }
+    }
+    struct GatedWrite<W> {
+        inner: W,
+        gate: Arc<WriteGate>,
+    }
+    impl<W: AsyncWrite + Unpin> AsyncWrite for GatedWrite<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.gate.poll(context) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(context, bytes)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.gate.poll(context) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(context)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+    struct BackpressureFixture {
+        _root: tempfile::TempDir,
+        connection: McpConnection,
+        gate: Arc<WriteGate>,
+        received: tokio::sync::mpsc::Receiver<Value>,
+        server: JoinHandle<()>,
+    }
+    impl BackpressureFixture {
+        async fn new() -> Self {
+            let (root, audit) = audit().await;
+            let (client, server) = tokio::io::duplex(65536);
+            let (_change, changes) = tokio::sync::mpsc::channel(1);
+            let (seen, mut received) = tokio::sync::mpsc::channel(2048);
+            let server = tokio::spawn(mock_server(server, changes, seen));
+            let (read, write) = tokio::io::split(client);
+            let gate = Arc::new(WriteGate::default());
+            let connection = McpConnection::connect(
+                read,
+                GatedWrite {
+                    inner: write,
+                    gate: gate.clone(),
+                },
+                None,
+                Some(PinnedCatalog::new(vec![tool("fixed")]).unwrap()),
+                audit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(received.recv().await.unwrap()["method"], "initialize");
+            Self {
+                _root: root,
+                connection,
+                gate,
+                received,
+                server,
+            }
+        }
+        async fn finish(mut self) {
+            self.gate.release();
+            self.connection.resources().await.unwrap();
+            assert_eq!(
+                self.received.recv().await.unwrap()["method"],
+                "resources/list"
+            );
+            self.connection.shutdown().await.unwrap();
+            self.server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn call_timeout_is_bounded_while_request_and_cancel_writes_are_blocked() {
+        let mut fixture = BackpressureFixture::new().await;
+        let _blocked = fixture.gate.block();
+        let (_cancel, cancelled) = watch::channel(false);
+        let mut call = Box::pin(fixture.connection.call(
+            "echo",
+            json!({"text":"wait"}),
+            Duration::from_millis(20),
+            cancelled,
+        ));
+        tokio::select! {
+            result = &mut call => panic!("request did not reach the controlled writer: {result:?}"),
+            _ = fixture.gate.entered.notified() => {}
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), &mut call).await,
+            Ok(Err(GatewayError::Timeout))
+        ));
+        fixture.gate.release();
+        let request = fixture.received.recv().await.unwrap();
+        assert_eq!(request["method"], "tools/call");
+        let cancel = fixture.received.recv().await.unwrap();
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], request["id"]);
+        drop(call);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn call_cancellation_is_bounded_while_the_cancel_write_is_blocked() {
+        let mut fixture = BackpressureFixture::new().await;
+        let (cancel, cancelled) = watch::channel(false);
+        let mut call = Box::pin(fixture.connection.call(
+            "echo",
+            json!({"text":"wait"}),
+            Duration::from_secs(5),
+            cancelled,
+        ));
+        let request = tokio::select! {
+            result = &mut call => panic!("call completed before dispatch: {result:?}"),
+            request = fixture.received.recv() => request.unwrap()
+        };
+        assert_eq!(request["method"], "tools/call");
+        let _blocked = fixture.gate.block();
+        cancel.send(true).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), &mut call).await,
+            Ok(Err(GatewayError::Cancelled))
+        ));
+        fixture.gate.release();
+        let notification = fixture.received.recv().await.unwrap();
+        assert_eq!(notification["method"], "notifications/cancelled");
+        assert_eq!(notification["params"]["requestId"], request["id"]);
+        drop(call);
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn queue_backpressure_cannot_bypass_cancellation_or_an_expired_deadline() {
+        let mut fixture = BackpressureFixture::new().await;
+        let peer = fixture.connection.service.as_ref().unwrap().peer();
+        // rmcp 3.5.1 has a 1024-entry peer queue. Do not yield/cooperate while
+        // filling it, so the service cannot consume entries before the checks.
+        let handles = tokio::task::unconstrained(async {
+            let mut handles = Vec::new();
+            for _ in 0..1024 {
+                handles.push(
+                    peer.send_cancellable_request(
+                        ClientRequest::ListResourcesRequest(ListResourcesRequest::default()),
+                        PeerRequestOptions::no_options(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            handles
+        })
+        .await;
+        let (cancel, cancelled) = watch::channel(false);
+        let mut call = Box::pin(tokio::task::unconstrained(fixture.connection.call(
+            "echo",
+            json!({"text":"wait"}),
+            Duration::from_secs(5),
+            cancelled,
+        )));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        cancel.send(true).unwrap();
+        assert!(matches!(
+            call.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(GatewayError::Cancelled))
+        ));
+        drop(call);
+        let (_cancel, cancelled) = watch::channel(false);
+        let mut expired = Box::pin(tokio::task::unconstrained(fixture.connection.call(
+            "echo",
+            json!({"text":"wait"}),
+            Duration::from_millis(20),
+            cancelled,
+        )));
+        assert!(expired.as_mut().poll(&mut context).is_pending());
+        // The call already passed preflight and is waiting for queue capacity.
+        // Keep it unpolled until its positive deadline expires; a newly free
+        // queue slot must not turn that expired request into a late dispatch.
+        tokio::time::sleep_until(Instant::now() + Duration::from_millis(20)).await;
+        assert!(matches!(
+            expired.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(GatewayError::Timeout))
+        ));
+        drop(expired);
+        fixture.connection.resources().await.unwrap();
+        for _ in 0..1025 {
+            assert_eq!(
+                fixture.received.recv().await.unwrap()["method"],
+                "resources/list"
+            );
+        }
+        drop(handles);
+        fixture.finish().await;
     }
     #[tokio::test]
     async fn mcp_pins_catalog_announces_only_roots_validates_and_disables_on_changes() {
