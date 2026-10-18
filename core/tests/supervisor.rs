@@ -1561,6 +1561,244 @@ esac"#,
 }
 
 #[tokio::test]
+async fn provider_credential_is_absent_from_native_extension_observations() {
+    use fictor::{config::Provider, proxy::model_proxy::ModelProxy};
+    use std::collections::BTreeMap;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let fixture = Fixture::new().await;
+    let credential = format!("i4-provider-key-{}", ulid::Ulid::generate());
+    fixture.secrets.set("i4_provider_key", &credential).unwrap();
+    let environment_control = format!("I4_ENV_CONTROL_{}", ulid::Ulid::generate());
+    let file_control = format!("I4_FILE_CONTROL_{}", ulid::Ulid::generate());
+    let control_file = fixture.workspace.join("file-control");
+    fs::write(&control_file, &file_control).unwrap();
+    fs::create_dir(fixture.real_home.join(".aws")).unwrap();
+    fs::write(
+        fixture.real_home.join(".aws/credentials"),
+        "private fixture data, never a real credential",
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let mut config = Config::load(&fixture.home).unwrap();
+    config.providers.clear();
+    config.sandbox.home_ro_files.clear();
+    config.providers.insert(
+        "i4".into(),
+        Provider {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            auth_header: Some("x-api-key".into()),
+            auth_prefix: None,
+            secret: Some("i4_provider_key".into()),
+            extra_headers: BTreeMap::new(),
+        },
+    );
+    fixture
+        .proxy
+        .set_model_proxy(
+            ModelProxy::new(
+                fixture.store.clone(),
+                config.providers.clone(),
+                fixture.secrets.clone(),
+                fictor::config::Budget {
+                    max_model_requests_per_day: 10,
+                    max_model_requests_per_session: 10,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let supervisor = Supervisor::new(
+        &fixture.home,
+        &fixture.real_home,
+        Arc::new(config),
+        fixture.secrets.clone(),
+        fixture.store.clone(),
+        fixture.proxy.clone(),
+    )
+    .unwrap()
+    .with_fictor_exe(PathBuf::from(env!("CARGO_BIN_EXE_fictor")))
+    .unwrap();
+
+    let bundle = fixture.bundle(false, "exit 0");
+    assert!(
+        Command::new("cc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/provider_secret_probe.c")
+            )
+            .arg("-o")
+            .arg(bundle.join("server"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    // The random key stays in core-owned SecretStore/modelproxy state. It is
+    // never passed to the compiler, manifest, child arguments or environment.
+    let contains =
+        |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|part| part == needle);
+    assert!(!contains(
+        &fs::read(bundle.join("server")).unwrap(),
+        credential.as_bytes()
+    ));
+    let session = fixture.session().await;
+    let data = fixture
+        .home
+        .join("extensions/data/test-extension/sessions")
+        .join(&session);
+    let mut manifest = manifest(
+        json!({"models":["i4"], "fs":{"write":["${workspace}"]},
+            "env":{"VISIBLE_CONTROL":environment_control}}),
+        true,
+        false,
+    );
+    manifest.runtime.args = [&fixture.home, &fixture.real_home, &data]
+        .map(|path| path.to_str().unwrap().to_owned())
+        .into();
+
+    let expected_credential = credential.clone();
+    let upstream = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 8192, "upstream header bound");
+                head.push(client.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+            let lines: BTreeMap<_, _> = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                .collect();
+            assert!(lines.get("x-api-key").is_some_and(|value| value == &expected_credential));
+            assert!(!lines.contains_key("authorization"));
+            assert!(!lines.contains_key("proxy-authorization"));
+            assert!(!head.contains("extension-placeholder"));
+            assert_eq!(lines["content-length"], "14");
+            let mut body = [0; 14];
+            client.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"public-request");
+            client
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\nI4_PUBLIC_MODEL_REPLY")
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    });
+    let mut instance = supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(20), instance.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exit.code,
+        Some(0),
+        "native probe failed: {}",
+        fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap_or_default()
+    );
+    upstream.await.unwrap();
+
+    let observations = fixture.workspace.join("i4-observations");
+    for name in [
+        "environment",
+        "files",
+        "descriptors",
+        "memory",
+        "response-wire",
+        "report.json",
+    ] {
+        let bytes = fs::read(observations.join(name)).unwrap();
+        assert!(
+            !contains(&bytes, credential.as_bytes()),
+            "credential leaked into {name}"
+        );
+    }
+    let environment = fs::read(observations.join("environment")).unwrap();
+    assert!(contains(&environment, environment_control.as_bytes()));
+    let files = fs::read(observations.join("files")).unwrap();
+    for control in [
+        file_control.as_str(),
+        "I4_EXT_DATA_CONTROL",
+        "I4_TMP_CONTROL",
+    ] {
+        assert!(contains(&files, control.as_bytes()), "missing file control");
+    }
+    let memory = fs::read(observations.join("memory")).unwrap();
+    assert!(contains(&memory, environment_control.as_bytes()));
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(observations.join("report.json")).unwrap()).unwrap();
+    let memory_control = report["memory_control"].as_str().unwrap();
+    assert_eq!(memory_control.len(), 42);
+    assert!(memory_control.starts_with("I4_MEMORY_"));
+    assert!(contains(&memory, memory_control.as_bytes()));
+    assert!(!contains(&environment, memory_control.as_bytes()));
+    assert!(!contains(&files, memory_control.as_bytes()));
+    let descriptor_control = report["fd_control"].as_str().unwrap();
+    let descriptors = fs::read(observations.join("descriptors")).unwrap();
+    assert!(contains(&descriptors, descriptor_control.as_bytes()));
+    assert!(!contains(&files, descriptor_control.as_bytes()));
+    assert!(!contains(&environment, descriptor_control.as_bytes()));
+    assert!(report["fd_control_fd"].as_u64().unwrap() >= 128);
+    assert!(report["fd_entries"].as_u64().unwrap() <= 128);
+    assert!(report["memory_bytes"].as_u64().unwrap() > 65536);
+    assert!(report["memory_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024);
+    assert!(report["memory_regions"].as_u64().unwrap() >= 5);
+    assert!(report["files"].as_u64().unwrap() >= 3);
+    assert!(report["fd_files"].as_u64().unwrap() >= 1);
+    assert_eq!(report["denied_paths"], 3);
+    let wire = fs::read(observations.join("response-wire")).unwrap();
+    let body_at = wire
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    // Modelproxy streams the public body using chunked HTTP/1.1 framing.
+    let mut body = Vec::new();
+    let head = String::from_utf8_lossy(&wire[..body_at]).to_ascii_lowercase();
+    if head.contains("transfer-encoding: chunked") {
+        let mut remaining = &wire[body_at..];
+        loop {
+            let end = remaining
+                .windows(2)
+                .position(|part| part == b"\r\n")
+                .unwrap();
+            let size =
+                usize::from_str_radix(std::str::from_utf8(&remaining[..end]).unwrap(), 16).unwrap();
+            remaining = &remaining[end + 2..];
+            if size == 0 {
+                assert_eq!(remaining, b"\r\n");
+                break;
+            }
+            body.extend_from_slice(&remaining[..size]);
+            assert_eq!(&remaining[size..size + 2], b"\r\n");
+            remaining = &remaining[size + 2..];
+        }
+    } else {
+        body.extend_from_slice(&wire[body_at..]);
+    }
+    assert_eq!(body, b"I4_PUBLIC_MODEL_REPLY");
+    println!("I4 native probe coverage: {report}");
+}
+#[tokio::test]
 async fn same_extension_sessions_keep_kernel_kv_and_data_private_after_the_other_session_writes() {
     let fixture = Fixture::new().await;
     let session_a = fixture.session().await;
