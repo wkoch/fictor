@@ -991,7 +991,7 @@ async fn local_pipeline_persists_installed_packages_and_smokes_the_final_bundle(
             config.clone(),
             secrets,
             store.clone(),
-            proxy,
+            proxy.clone(),
         )
         .unwrap()
         .with_fictor_exe(env!("CARGO_BIN_EXE_fictor").into())
@@ -1050,6 +1050,20 @@ for await (const line of createInterface({ input: process.stdin })) {
     assert!(!source.join("node_modules").exists());
     assert!(!home.join("extensions/lock.json").exists());
     drop(checker);
+    // The CLI is an offline owner. End the in-process core, including the
+    // proxy's audit tasks and SQLite writer, before handing it the same home.
+    Arc::try_unwrap(proxy)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
     let config_path = home.join("config.toml");
     let mut persisted: toml::Value =
         toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1076,6 +1090,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     assert_eq!(cli["bundle_hash"], inspected.bundle_hash);
     let cli_id = cli["proposal_id"].as_str().unwrap();
     assert_ne!(cli_id, proposal.id);
+    let store = Store::open(&home).await.unwrap();
     let cli_proposal = store.proposal(cli_id.into()).await.unwrap();
     let cli_packages = cli_proposal.packages.unwrap();
     assert_eq!(cli_packages.len(), 1);
@@ -1083,6 +1098,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     assert_eq!(cli_packages[0].version, "1.0.0");
     assert!(!source.join("node_modules").exists());
     assert!(!home.join("extensions/lock.json").exists());
+    store.shutdown().await.unwrap();
 }
 
 fn wheel() -> Vec<u8> {
