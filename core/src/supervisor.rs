@@ -107,6 +107,7 @@ struct LaunchRequest<'a> {
     workspace: Option<&'a Path>,
     smoke: bool,
     smoke_home: Option<tempfile::TempDir>,
+    owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Supervisor {
@@ -166,6 +167,31 @@ impl Supervisor {
             workspace,
             smoke: false,
             smoke_home: None,
+            owner: None,
+        })
+        .await
+    }
+
+    /// Retain trusted caller resources through namespace confirmation, including
+    /// startup failure or cancellation. This changes no grants or child inputs.
+    pub async fn spawn_with_owner(
+        &self,
+        manifest: &Manifest,
+        bundle: &Path,
+        key: &str,
+        session_id: Option<&str>,
+        workspace: Option<&Path>,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<ManagedInstance, SupervisorError> {
+        self.launch(LaunchRequest {
+            manifest,
+            bundle,
+            key,
+            session_id,
+            workspace,
+            smoke: false,
+            smoke_home: None,
+            owner: Some(owner),
         })
         .await
     }
@@ -281,6 +307,7 @@ impl Supervisor {
                 workspace: None,
                 smoke: true,
                 smoke_home: Some(disposable),
+                owner: None,
             })
             .await?;
         let result = if manifest.mcp_enabled() {
@@ -320,6 +347,7 @@ impl Supervisor {
             workspace,
             smoke,
             smoke_home,
+            owner,
         } = request;
         manifest
             .validate_with_nat64(&self.nat64)
@@ -658,8 +686,18 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let stream = redactor.stream().map_err(|_| SupervisorError::Secret)?;
+        // Reserve the path before a process exists. After spawn every failure
+        // belongs to the detached owner; no `?` may release live instance paths.
+        let pid_path = self.home.join("run").join(format!("{id}.pid"));
+        let (pid_file, mut pid_record) = prepare_pid(&pid_path)?;
         let mut child = command.spawn().map_err(|_| SupervisorError::Process)?;
-        let pid = child.id().ok_or(SupervisorError::Process)?;
+        let pid = child.id().unwrap_or(0);
+        let mut startup_error = if pid == 0 {
+            Some(SupervisorError::Process)
+        } else {
+            record_pid(&mut pid_record, pid).err()
+        };
+        drop(pid_record);
         let group = Arc::new(Mutex::new(Some(pid)));
         let guard = GroupGuard {
             pid,
@@ -667,9 +705,10 @@ impl Supervisor {
         };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
-        let stderr = child.stderr.take().ok_or(SupervisorError::Process)?;
-        let pid_path = self.home.join("run").join(format!("{id}.pid"));
-        let pid_file = create_pid(&pid_path, pid)?;
+        let stderr = child.stderr.take();
+        if stdin.is_none() || stdout.is_none() || stderr.is_none() {
+            startup_error.get_or_insert(SupervisorError::Process);
+        }
         let (stop, stop_receiver) = watch::channel(false);
         let (exit_sender, exit) = watch::channel(None);
         let (ready, started) = oneshot::channel();
@@ -692,12 +731,24 @@ impl Supervisor {
             exit,
         };
         tokio::spawn(async move {
-            let _ownership = (temporary, smoke_data, pid_file, smoke_home);
+            let _ownership = (temporary, smoke_data, pid_file, smoke_home, owner);
             let mut reservation = Some(reservation);
-            let stderr = tokio::spawn(drain_stderr(stderr, log, stream));
-            let started_result = audit_event(&audit, "ext.started", json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key,"pid":pid,"smoke":smoke}), vec![]).await;
-            let success = started_result.is_ok();
-            let _ = ready.send(success);
+            let stderr = tokio::spawn(async move {
+                match stderr {
+                    Some(stderr) => drain_stderr(stderr, log, stream).await,
+                    None => Err(SupervisorError::Process),
+                }
+            });
+            if startup_error.is_none() {
+                startup_error = audit_event(&audit, "ext.started", json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key,"pid":pid,"smoke":smoke}), vec![]).await.err();
+            }
+            let success = startup_error.is_none();
+            let failed_ready = if success {
+                let _ = ready.send(Ok(()));
+                None
+            } else {
+                Some(ready)
+            };
             let outcome = supervise(
                 &mut child,
                 stop_receiver,
@@ -780,10 +831,16 @@ impl Supervisor {
             drop(guard);
             drop(_ownership);
             exit_sender.send_replace(Some(final_result));
+            if let Some(ready) = failed_ready {
+                // An error hands control back only after bwrap has been reaped
+                // and every internal/external resource has completed cleanup.
+                let _ = ready.send(Err(startup_error.unwrap_or(SupervisorError::Audit)));
+            }
         });
         match started.await {
-            Ok(true) => Ok(managed),
-            _ => Err(SupervisorError::Audit),
+            Ok(Ok(())) => Ok(managed),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SupervisorError::Process),
         }
     }
 
@@ -897,8 +954,29 @@ async fn supervise(
         reservation,
     } = cleanup;
     let (status, crashed) = if !started {
+        let _ = registration.proxy.revoke(&registration.token);
+        if let Some(kernel) = &kernel {
+            kernel.revoke();
+        }
+        let _ = child.start_kill();
         signal_group(guard.pid, libc::SIGKILL);
-        (child.wait().await, false)
+        let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                let _ = audit_event(
+                    audit,
+                    "ext.cleanup_failed",
+                    json!({
+                        "ext_id":audit.ext_id,"instance_id":audit.instance_id,"key":audit.key
+                    }),
+                    vec![],
+                )
+                .await;
+                reservation.take();
+                child.wait().await
+            }
+        };
+        (status, false)
     } else {
         tokio::select! { biased;
             _ = stop.changed() => {
@@ -1053,19 +1131,21 @@ impl Drop for PidFile {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn create_pid(path: &Path, pid: u32) -> Result<PidFile, SupervisorError> {
-    let mut file = OpenOptions::new()
+fn prepare_pid(path: &Path) -> Result<(PidFile, File), SupervisorError> {
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|_| SupervisorError::Path)?;
-    let guard = PidFile(path.into());
+    Ok((PidFile(path.into()), file))
+}
+fn record_pid(file: &mut File, pid: u32) -> Result<(), SupervisorError> {
     writeln!(file, "{pid}")
         .and_then(|_| file.sync_all())
         .map_err(|_| SupervisorError::Path)?;
-    Ok(guard)
+    Ok(())
 }
 async fn audit_event(
     audit: &AuditIdentity,
@@ -1442,6 +1522,21 @@ async fn append_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_pid_write_retains_the_record_until_its_owner_releases_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("instance.pid");
+        let (owner, record) = prepare_pid(&path).unwrap();
+        drop(record);
+        let mut read_only = File::open(&path).unwrap();
+        assert!(matches!(
+            record_pid(&mut read_only, 1234),
+            Err(SupervisorError::Path)
+        ));
+        assert!(path.exists());
+        drop(owner);
+        assert!(!path.exists());
+    }
     #[test]
     fn stderr_rotation_keeps_each_log_within_ten_mebibytes() {
         let directory = tempfile::tempdir().unwrap();

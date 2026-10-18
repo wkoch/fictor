@@ -175,6 +175,147 @@ async fn wait_file(path: &Path) {
     .unwrap();
 }
 
+fn launch_pid(home: &Path) -> (PathBuf, u32) {
+    let records: Vec<_> = fs::read_dir(home.join("run"))
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "pid"))
+        .collect();
+    assert_eq!(records.len(), 1);
+    let pid = fs::read_to_string(&records[0])
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (records[0].clone(), pid)
+}
+
+async fn hold_store_writer(
+    store: Arc<Store>,
+) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let task = tokio::spawn(async move {
+        store
+            .write(move |_| {
+                let _ = entered.send(());
+                // Dropping the sender on a test failure also releases the writer.
+                let _ = held.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    waiting.await.unwrap();
+    (release, task)
+}
+
+#[tokio::test]
+async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resources() {
+    let fixture = Arc::new(Fixture::new().await);
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf 'ready\n' > "$FICTOR_WORKSPACE/launch.started"
+/bin/sleep 60"#,
+    );
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let database = rusqlite::Connection::open(fixture.home.join("fictor.db")).unwrap();
+    database.execute_batch("CREATE TRIGGER reject_extension_start BEFORE INSERT ON events WHEN NEW.kind='ext.started' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+    let (release, writer) = hold_store_writer(fixture.store.clone()).await;
+    let external = Arc::new(tempfile::tempdir().unwrap());
+    let external_path = external.path().to_owned();
+    let retained = Arc::downgrade(&external);
+    let task_fixture = fixture.clone();
+    let launch = tokio::spawn(async move {
+        task_fixture
+            .supervisor
+            .spawn_with_owner(
+                &manifest,
+                &bundle,
+                "1.0.0-000000000000",
+                Some(&session),
+                Some(&task_fixture.workspace),
+                external,
+            )
+            .await
+    });
+    wait_file(&fixture.workspace.join("launch.started")).await;
+    let (pid_path, pid) = launch_pid(&fixture.home);
+    assert!(retained.upgrade().is_some());
+    assert!(external_path.exists());
+    release.send(()).unwrap();
+    writer.await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), launch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(SupervisorError::Audit)));
+    assert!(!pid_path.exists());
+    assert!(retained.upgrade().is_none());
+    assert!(!external_path.exists());
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+}
+
+#[tokio::test]
+async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped() {
+    let fixture = Arc::new(Fixture::new().await);
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf 'ready\n' > "$FICTOR_WORKSPACE/launch.started"
+/bin/sleep 60"#,
+    );
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        false,
+    );
+    let (release, writer) = hold_store_writer(fixture.store.clone()).await;
+    let external = Arc::new(tempfile::tempdir().unwrap());
+    let external_path = external.path().to_owned();
+    let retained = Arc::downgrade(&external);
+    let task_fixture = fixture.clone();
+    let launch = tokio::spawn(async move {
+        task_fixture
+            .supervisor
+            .spawn_with_owner(
+                &manifest,
+                &bundle,
+                "1.0.0-000000000000",
+                Some(&session),
+                Some(&task_fixture.workspace),
+                external,
+            )
+            .await
+    });
+    wait_file(&fixture.workspace.join("launch.started")).await;
+    let (pid_path, pid) = launch_pid(&fixture.home);
+    launch.abort();
+    assert!(matches!(launch.await, Err(error) if error.is_cancelled()));
+    assert!(retained.upgrade().is_some());
+    assert!(pid_path.exists());
+    assert!(external_path.exists());
+    release.send(()).unwrap();
+    writer.await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pid_path.exists() || retained.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!external_path.exists());
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+}
+
 fn namespace_members(namespace: &str) -> Vec<u32> {
     fs::read_dir("/proc")
         .unwrap()
