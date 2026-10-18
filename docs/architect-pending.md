@@ -1,7 +1,15 @@
 # Pendências para o arquiteto
 
-Nenhuma pendência arquitetural aberta em 2026-10-18. ARQ-020–028 resolvidas pelos ADRs 036–044.
+ARQ-029 aberta em 2026-10-18. ARQ-020–028 resolvidas pelos ADRs 036–044.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-029 — Contrato administrativo das mutações da Fase 0
+
+- **Status: aberta em 2026-10-18.**
+- **Referências:** `spec/02-core.md`, CLI, Reabilitação humana e Canal administrativo mínimo; ADRs 038/039/041.
+- **Dúvida:** a CLI encaminha mutações ao core ativo e `ext reset-crashes` deve funcionar online. Entretanto, o canal mínimo define somente `ext.list` e determina que outros métodos exigem contrato próprio. Não há método/envelope/parâmetros/resultados de reset, enable/disable ou instalação autorizados para esse canal. A semântica de comandos e o transporte não determinam por si sós seu protocolo de mutação.
+- **Necessário:** ADR com os métodos administrativos da Fase 0 que podem mutar estado, campos exatos, autoridade/decisão humana, erros e limites; especificar seleção de versão/sessão no reset, sem permitir comandos equivalentes por Kernel Protocol. Aprovação de proposta e segredo pelo TTY precisam conservar suas fronteiras, caso façam parte desse contrato.
+- **Impacto:** implementar normalmente estado durável de crash, APIs internas de promoção e listagem `ext.list`; não inventar handlers administrativos de mutação. O trecho online dos comandos afetados aguarda o ADR. As demais entregas do M0.5 continuam.
 
 ## ARQ-028 — Grants sobre mounts internos e fontes de pseudo-filesystems
 
