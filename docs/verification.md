@@ -1,5 +1,65 @@
 # Verificação da implementação
 
+## Contratos do M0.5 — 2026-10-18
+
+Código validado: `28981eda6387b0d67b29febfb8b6d48ad7d76f66`. Entregas diretamente
+na `main`: migrações/FULL (`1641ec0`), registros/transporte (`f0b757e`), controles
+globais (`afa6153`), overrides (`554d6cb`) e aliases/atestação (`28981ed`).
+A questão de mounts internos foi registrada separadamente em `c60e339`.
+
+Execução na máquina do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, **Toolbx `fictor-dev`, Fedora 44**, kernel
+`7.2.9-ogc3.1.fc44.x86_64`. Rust/Cargo 1.99.0, Node 24.18.0 LTS/npm 11.16.0,
+uv 0.12.24/Python 3.14.8, bubblewrap 0.12.0 e util-linux 2.41.5. Caches no workspace,
+dependências Cargo fixadas/offline, dados falsos e servidores locais nos testes.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **369 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| Imagem de desenvolvimento | Reconstruída; ferramentas conferidas. Nenhuma instalação no host. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente; sem passe semântico remoto. |
+| Matriz e roadmap | 28 referências exatas de testes; 75 critérios ativos, com M0.5 parcial. |
+| `git diff --check` | Passou. |
+
+Os testes de migração cobrem backup incluindo WAL, preservação de recibos/nonces
+e eventos, constraints novas, rollback conjunto e recusa após perda de FULL.
+As regressões reais npm de bypass do proxy e TLS foram reproduzidas antes do fix
+e passaram depois; redirects não ampliam autoridades. Overrides exercitam o
+snapshot no catálogo e em Node/sandbox/proxy. Controles cobrem links, metadados,
+publicação concorrente, retargeting do home e erros sem conteúdo/caminhos privados.
+
+Na primeira integração de mounts, a prova confundia o dispositivo topológico com
+o dev/ino de arquivo no OverlayFS e recusava perfis legítimos. A comparação foi
+separada, preservando ambas as identidades. A atestação seguinte detectou binds
+com propagação externa no Toolbx; o wrapper privado corrigiu a origem, mantendo
+a verificação. Cenários em namespaces novos incluem troca de fonte e inserção
+de submount depois de construir o Command, sem executar o canário do workload.
+Nenhuma proteção foi removida para fazer as suítes passar.
+
+Logs finais: `.fictor/logs/m05-contracts-final-{fmt,clippy,test,release,trail-build,trail-check,tools}.log`
+e `m05-contracts-final-code-head.log`. Regressões/dirigidos:
+`adr040-npm-{tls,proxy}-before.log`, `adr040-dependencies-local-final.log`,
+`adr042-integration-direct.log`, `adr042-static-positive-final.log`,
+`adr042-attestation-diagnosis-direct.log` e `adr042-attestation-after-private-direct.log`.
+
+As suítes rodaram no Toolbx existente, imagem
+`65e9e051ef66b1905fbe70de87d8f9f6ebe52662e90a424d5ed2457299a45b2b`.
+A imagem reconstruída `localhost/fictor-dev:44` é
+`74ef96f4bb8e59b7221bbedde634688d980793319977206279998dcab49cd2d8`;
+teve build e versões das ferramentas conferidos, incluindo `unshare` já presente.
+Logs `m05-contracts-image-{build,id,tools}.log` e `m05-contracts-active-image-id.log`.
+`AGENTS.md` e `.trail/` preexistentes foram preservados fora dos commits.
+
+**Diagnóstico no Bazzite, sem gate de release no Fedora COSMIC Atomic ou execução
+da CI remota.** A CI agora declara util-linux e inclui os novos testes de controles
+e overrides no subset Fedora. Promoção, posse/recuperação de instâncias, crash loop
+e listagem administrativa continuam incompletos; a existência das tabelas não
+substitui esses fluxos. ARQ-027 (IDs) e ARQ-028 (mounts internos/pseudo-filesystems)
+aguardam ADR; nenhuma delas é considerada resolvida por esta execução.
+
 ## Integração na main — 2026-10-18
 
 Código validado: `de9a82f47008a1c1a1a212f104592b6cb2e809f3`.

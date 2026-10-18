@@ -1,7 +1,7 @@
 # Caminho até a v1.0
 
-Atualizado em 2026-10-18, após integrar implementação e arquitetura na `main`
-(`de9a82f`). O projeto está no **M0.5 parcial**, ainda antes do agente funcional
+Atualizado em 2026-10-18, após as entregas dos contratos do M0.5 na `main`
+(`28981ed`). O projeto está no **M0.5 parcial**, ainda antes do agente funcional
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
@@ -21,13 +21,17 @@ diferentes e não enumeram cada item de implementação.
 
 ## Próxima sequência
 
-1. Implementar e testar os contratos dos [ADRs 036–042](../spec/11-decisions.md):
-   promoção recuperável e overrides, posse/recuperação de instâncias, crash loop,
-   autoridades exatas para dependências, listagem administrativa e origem protegida
-   dos controles. ARQ-020–026 estão resolvidas no spec; isso ainda não fecha M0.5.
-2. Resolver a [ARQ-027](architect-pending.md#arq-027--correlação-de-ids-no-limite-de-mensagem-do-kernel-protocol)
-   sobre correlação de IDs no limite de mensagem do Kernel. Essa parte aguarda ADR,
-   conforme a regra 4 de [AGENTS.md](../AGENTS.md).
+1. Fechar os contratos dos [ADRs 036–042](../spec/11-decisions.md): promoção
+   recuperável com aprovação persistida, posse/recuperação de instâncias, crash
+   loop e listagem administrativa. Migrações/FULL, autoridades exatas, overrides
+   efetivos e leitura protegida dos controles já têm entregas no produto; falta
+   integrar os fluxos completos. ARQ-020–026 estão resolvidas no spec; o M0.5
+   permanece parcial.
+2. Resolver [ARQ-027](architect-pending.md#arq-027--correlação-de-ids-no-limite-de-mensagem-do-kernel-protocol)
+   (IDs no limite de mensagem) e
+   [ARQ-028](architect-pending.md#arq-028--grants-sobre-mounts-internos-e-fontes-de-pseudo-filesystems)
+   (mounts internos e pseudo-filesystems). Essas partes aguardam ADR, conforme
+   a regra 4 de [AGENTS.md](../AGENTS.md).
 3. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
@@ -38,9 +42,9 @@ sem decompor e medir as entregas restantes.
 
 ## Evidência e release
 
-A base tem diagnóstico de **326 testes passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **369 testes passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 326 critérios de produto aceitos.
+Esse resultado não representa 369 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates
