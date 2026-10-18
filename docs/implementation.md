@@ -228,6 +228,43 @@ hooks e `session.input` ainda não existem nesta base; aplicar overrides e defin
 reinício/crash loop depende das ARQ-021/023. Não há timers ou caminhos alternativos
 que contornem esses contratos pendentes.
 
+## Limites de leitura e revisão do inventário — 2026-10-18
+
+- As leituras do Kernel Protocol contam o JSON escapado de KV e eventos antes
+  de reter cada entrada, incluindo wrappers, vírgulas e o booleano `truncated`.
+  Ao atingir 16 MiB, retornam `TOO_LARGE` sem resultado parcial nem decodificação
+  das linhas seguintes. Os limites de quantidade, autorização, linhagem e ordem
+  permanecem os mesmos. As APIs gerais do Store conservam sua semântica; só os
+  caminhos usados pelo Kernel recebem esse orçamento de resposta.
+- `blobs.get` considera a expansão base64 antes de carregar o arquivo. A leitura
+  exige que o tamanho do descritor caiba no orçamento e usa `take(limite + 1)`
+  para cobrir crescimento concorrente; nunca retorna prefixo ou dispensa o hash.
+  Blobs de até 256 MiB continuam disponíveis ao restante do core.
+- `config.get instructions` limita a leitura do `AGENTS.md` global antes de
+  carregar ou decodificar o arquivo. Ausência continua retornando `null`, texto
+  válido permanece intacto e a serialização final também limita o JSON escapado.
+- A materialização compara o inventário atual da cópia privada com os pacotes
+  aprovados. Checks antigos e hash correto não bastam quando a lista de revisão
+  omite pacotes físicos ou informa versões divergentes. Não há nova resolução,
+  rede, execução de código nem alteração da proposta. Um único prazo cobre cópia,
+  inspeção, inventário, congelamento e verificação de uma versão já publicada.
+- A invalidação terminal do catálogo MCP é ligada ao dono do processo. Divergência
+  inicial ou durante a execução cancela o MCP, revoga kernel/proxy e encerra o
+  sandbox. A task dona confirma o reap e tenta registrar `ext.tools_changed`
+  antes do evento de encerramento, mantendo a posse dos recursos nesse intervalo.
+  Suspensão temporária durante a confirmação de uma notificação idêntica não
+  encerra a instância. Não há task observadora separada nem alteração do lock.
+  Reutilizar a conexão com `Some(pin)` exige o mesmo pin usado na sua criação;
+  fixar depois da descoberta sem pin ou trocar o hash encerra a instância.
+  O bloqueio persistente da extensão e a integração com o gerenciador continuam
+  pendentes; essa correção não declara o critério 13 completo.
+
+`fictor ext list` não foi exposto: o texto sobre comandos disponíveis sem servidor
+exclui a listagem, enquanto a tabela a prevê na Fase 0. A ARQ-025 registra a
+contradição e pede esclarecer intenção no lock versus saúde de processos e o
+caminho administrativo, se necessário. Nenhum comando offline ou protocolo novo
+foi presumido.
+
 ## Próxima sequência no Fedora
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;

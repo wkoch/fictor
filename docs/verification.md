@@ -1,5 +1,67 @@
 # Verificação da implementação
 
+## Limites de leitura e integridade do M0.5 no Bazzite — 2026-10-18
+
+Código validado: `0ec1e418d2d5883cc4138219121f161dc105d8b4`.
+Execução no computador do usuário, **Bazzite 44.20261012.0 (Kinoite), x86-64,
+SELinux Enforcing**, dentro do **Toolbx `fictor-dev`, Fedora 44**. Mesma imagem
+e versões das ferramentas registradas abaixo. Cargo usou `--locked --offline`,
+com cache no workspace. Nenhuma instalação no host ou ferramenta global no
+`$HOME` foi necessária nesta continuação.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **316 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+São 15 testes novos desde os 301 do diagnóstico seguinte:
+
+- KV e eventos têm orçamento cumulativo de JSON escapado antes da retenção de
+  cada entrada. A regressão usa chaves cujo tamanho cru cabe, mas a representação
+  escapada ultrapassa 16 MiB, seguidas de uma linha SQLite malformada: o Kernel
+  retorna `TOO_LARGE` antes de tentar decodificá-la. Uma leitura geral do Store
+  encontra essa linha, demonstrando que o teste distingue interrupção antecipada
+  de uma checagem posterior. Autorização, ordem, truncamento, resultados pequenos
+  e os limites exatos de wrappers/booleanos também foram verificados.
+- `blobs.get` limita bytes antes de carregar/base64. Testes preservam acesso
+  geral do Store, tamanho exato, conteúdo vazio e verificação do hash; um arquivo
+  esparso acima de 256 MiB é recusado. Instruções locais grandes são recusadas
+  antes da decodificação, enquanto ausência, Unicode e erro UTF-8 pequeno
+  conservam o comportamento esperado. `kernel_read_limits` passou com quatro
+  testes e entrou na seleção Fedora da CI sem namespaces.
+- A materialização revalida o inventário aprovado na cópia privada. Duas
+  regressões falharam antes da correção: pacote físico omitido e versão aprovada
+  divergente eram publicados apesar de hash correto e checks completos. Também
+  é recusada a árvore npm física sem declaração de dependências. Candidato npm
+  íntegro continua materializando sem resolução, rede ou execução de código.
+  O alvo `promotion` passou com nove testes; `dependencies`, com 12.
+- A invalidação terminal MCP chega à task dona da instância. As duas regressões
+  iniciais falharam antes da correção: fechar o MCP deixava um servidor hostil
+  dormindo no namespace. Agora mismatch inicial ou em runtime encerra processos,
+  kernel e proxy e produz um único `ext.tools_changed` antes de `ext.stopped`.
+  Com o writer bloqueado, o reap e a revogação ocorrem antes da auditoria; PID e
+  owner externo permanecem retidos. A falha forçada da auditoria é reportada como
+  erro, sem declarar persistência concluída. Notificação idêntica conserva a
+  instância; trocar pin ou fixar depois de uma conexão sem pin é recusado, e o
+  mesmo pin permite reutilização. O alvo `supervisor` passou com 25 testes reais.
+
+Logs locais: `.fictor/logs/m05-integrity-{fmt,clippy,test,release,trail-build,trail-check}.log`
+e `m05-integrity-code-head.log`; testes dirigidos adicionais em
+`m05-bounded-reads-{kernel,blobs}.log`. Toda a suíte usa dados falsos, sem chaves
+reais nem rede externa. npm/uv e sandbox rodaram no Toolbx real. Não há workspace
+TypeScript/`vp` nesta base; a CI remota não foi executada nesta entrega.
+
+**Este diagnóstico no Bazzite não satisfaz o gate de release no COSMIC Atomic.**
+Não houve ativação, mudança de formatos persistidos, avanço ao M0.6 ou conclusão
+integral do critério 13: lock e gerenciador ainda precisam de integração. As
+ARQ-020–024 continuam abertas. A nova ARQ-025 registra a contradição de
+disponibilidade offline de `ext list`; o comando não foi exposto presumindo um
+contrato administrativo ou uma exceção ao spec.
+
 ## Catálogo e correções de integração no Bazzite — 2026-10-18
 
 Código validado: `b629fe03c8fead863a915979cf61d7faf6c0f340`.
