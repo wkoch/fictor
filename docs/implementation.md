@@ -13,11 +13,11 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 lacunas de cobertura funcional e de release.
 O [caminho até a v1.0](release-path.md) reúne as etapas restantes e os gates.
 
-Os ADRs 036–042 estão disponíveis e ARQ-020–026 estão resolvidas no spec. O produto
+Os ADRs 036–044 estão disponíveis e ARQ-020–028 estão resolvidas no spec. O produto
 já aplica as migrações 0004/0005, FULL no writer, registros exatos de dependências,
 snapshots de overrides e leitura protegida dos controles. Promoção recuperável,
 posse/recuperação de instâncias, crash loop e listagem administrativa continuam
-pendentes. ARQ-027/028 seguem abertas. Os registros anteriores abaixo descrevem os
+pendentes. As ARQ-027/028 foram decididas nos ADRs 043/044; sua implementação e seus testes continuam pendentes. Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
 
 | Marco | Estado | Entrega e restante |
@@ -26,7 +26,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações e origem dos controles disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, posse/recuperação de instâncias, crash loop, listagem administrativa, ARQ-027/028 e integração first-party. |
+| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações e origem dos controles disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, posse/recuperação de instâncias, crash loop, listagem administrativa, contratos de IDs/montagens dos ADRs 043/044 e integração first-party. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
@@ -363,13 +363,13 @@ de origem que a checagem de tipo não oferece.
 
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;
    os diagnósticos no Bazzite constam em [verification.md](verification.md).
-2. Completar M0.5, incluindo aplicação/testes dos ADRs 036–042 e dos requisitos Atomic;
+2. Completar M0.5, incluindo aplicação/testes dos ADRs 036–044 e dos requisitos Atomic;
    promoção recuperável, overrides, posse/limpeza de instâncias, crash loop,
    registros exatos, listagem administrativa e origem protegida dos controles.
    Recebimento, resolução, materialização, listagens do Kernel e logs já têm
-   implementações e testes. O tratamento da ARQ-027 aguarda ADR.
+   implementações e testes. Aplicar os ADRs 043/044 para correlação de IDs e fronteiras de montagens; os critérios novos ainda exigem testes do produto.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
-4. Seguir M0.6–M0.10 e os **56 critérios da Fase 0**, incluindo autossuficiência,
+4. Seguir M0.6–M0.10 e os **65 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
 
 ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural não implica
@@ -377,11 +377,11 @@ implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
 2026-10-18, com recebimento e recuperação implementados em M0.5; consulte
 [architect-pending.md](architect-pending.md).
 
-ARQ-020–026 foram resolvidas pelos ADRs 036–042 e seguem como trabalho de
-implementação. `spec/` permanece sob autoria do arquiteto. A ARQ-027 registra o ID JSON-RPC que cabe na requisição, mas
-não no envelope de erro correlacionado: o fallback atual troca o ID por `null`.
-Definir um teto de ID ou um encerramento de transporte exige decisão de protocolo;
-o limite de 16 MiB não foi relaxado e essa parte não foi alterada sem ADR.
+ARQ-020–028 foram resolvidas pelos ADRs 036–044; a implementação restante segue
+com o dev. `spec/` permanece sob autoria do arquiteto, e somente o dev integra e
+commita as alterações. O ADR-043 fixa admissão de IDs e falha de transporte sem
+correlação inventada; o ADR-044 fixa reservas de destinos e origens de mounts.
+O limite de 16 MiB e as invariantes permanecem.
 
 ## Recebimento durável — ADR-035
 
@@ -518,8 +518,8 @@ e controles existentes são validados, sem chmod/chown ou reparo automático.
 Passaram 31 testes dirigidos no Toolbx Fedora 44 sobre Bazzite: primitiva (7),
 integração de controles (4), limites/releituras do Kernel (7) e bootstrap (13).
 A proteção de aliases de montagem foi integrada conforme a seção abaixo.
-Os limites de política registrados na ARQ-028 continuam abertos; não se declara
-encerrado o gate completo dos critérios 51–56.
+Nesta entrega, os limites de política da ARQ-028 ainda estavam abertos. O ADR-044
+agora os define; sua implementação e o gate completo dos critérios 51–56 continuam pendentes.
 
 ## Overrides humanos — base do ADR-037
 
@@ -572,4 +572,14 @@ sobre Bazzite. Incluem binds/submounts da árvore privada, raiz do home montada,
 exceções próprias legítimas e seis cenários tardios após construir o Command:
 controle seguro aninhado, fonte trocada, submount novo e provas inválida, ausente
 e excessiva. Topologia coberta que não possa ser observada falha conservadoramente.
-Pseudo-filesystems e sobreposição de mounts internos aguardam o ADR da ARQ-028.
+A política antes pendente na ARQ-028 foi definida pelo ADR-044; aplicar reservas
+e tipos de origem ao plano/prova existentes ainda é trabalho do implementador.
+
+## Contratos de IDs e montagens — ADRs 043/044
+
+ARQ-027/028 resolvidas no spec em 2026-10-18. O Kernel deve preservar IDs admitidos,
+recusar excesso antes de dispatch e tratar resposta perdida sem repetir efeitos.
+O sandbox deve proteger os destinos e o bootstrap antes do init, admitir somente
+as origens definidas e manter as exceções do Toolbx restritas às bases fixas.
+Critérios 57–65 definidos; nenhuma implementação é afirmada por esta resolução.
+As edições de arquitetura ficam na main sem commit para integração pelo dev.

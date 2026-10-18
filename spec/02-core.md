@@ -44,7 +44,7 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 | variáveis de `permissions.env` | valores estáticos do resultado efetivo aprovado |
 | variáveis de `permissions.secrets` | ver [05-security.md](05-security.md#segredos) |
 
-5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap, cumprindo a sequência `spawning` → `armed` e a barreira durável antes de liberar a extensão.
+5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap, cumprindo a sequência `spawning` → `armed` e a barreira durável antes de liberar a extensão. O [plano de montagens do ADR-044](05-security.md#árvores-de-montagem-e-origens-admitidas) valida reservas, tipos/origens e bootstrap confiável antes da execução do init; a prova no namespace final é conferida antes de liberar a carga.
 6. Conectar stdin/stdout ao cliente MCP (se `mcp: true`). Stderr vai para `logs/ext/<ext_id>.log`, com rotação a 10 MiB.
 7. Gravar o evento `ext.started` na sessão `sys`.
 

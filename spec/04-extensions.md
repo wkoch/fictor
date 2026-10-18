@@ -160,7 +160,7 @@ O executável de cada runtime vem do gerenciador de runtimes ([02-core.md](02-co
 | `${store}` | `$FICTOR_HOME/extensions/store` (somente leitura) | só `role: harness` |
 | `${tmp}` | tmpfs/diretório temporário da instância | todas |
 
-Também são aceitos caminhos absolutos e `~/...`. Qualquer caminho fora dos templates impede promoção automática.
+Também são aceitos caminhos absolutos e `~/...`. Qualquer caminho fora dos templates impede promoção automática. Caminhos e templates continuam sujeitos às [reservas e origens admitidas](05-security.md#árvores-de-montagem-e-origens-admitidas) do ADR-044: aprovação não autoriza sobrepor mounts internos nem importar um tipo de filesystem recusado. `${tmp}` é o temporário interno, sem importar conteúdo do `/tmp` do host; referências compatíveis a recursos já montados são normalizadas sem bind adicional.
 
 Regras de validação por escopo (bloqueantes no pipeline):
 
@@ -316,6 +316,7 @@ Responsabilidades do SDK:
 
 - Subir o servidor MCP no stdio e registrar tools, hooks (`hook_*`) e resources.
 - Conectar ao Kernel Protocol se `FICTOR_KERNEL_URL` existir e expor `ctx.kv`, `ctx.events`, `ctx.ui`, `ctx.timers`, `ctx.tools` conforme os escopos.
+- Gerar IDs String dentro do [teto do Kernel Protocol](03-kernel-protocol.md#ids-admissão-e-correlação) de 256 bytes UTF-8 (por exemplo, contador decimal em string ou ULID), sem reutilizar um ID na mesma conexão, e correlacionar respostas por ID. EOF ou resposta que viole o protocolo encerra o transporte e conclui todas as pendências locais com falha/resultado desconhecido. Timeout conclui a chamada correspondente com resultado desconhecido; resposta tardia desse ID é descartada, sem reassociá-la a outro pedido. Não repetir automaticamente chamadas sem resposta ou que receberam `TOO_LARGE`, pois efeitos podem ter ocorrido. Reconectar/hello não reenvia chamadas anteriores. Essa regra é do cliente Kernel Protocol, sem mudar os IDs do servidor MCP.
 - `ctx.exec`: subprocesso com timeout e truncamento de saída.
 - Validar que hooks implementados batem com `hooks` do manifest na inicialização.
 

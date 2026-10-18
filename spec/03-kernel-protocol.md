@@ -7,9 +7,47 @@ Protocolo entre o core e extensões para serviços do kernel. Ferramentas, resou
 - JSON-RPC 2.0, uma mensagem JSON UTF-8 por linha.
 - Endereço em `FICTOR_KERNEL_URL` (sempre `tcp://127.0.0.1:3129`), token em `FICTOR_KERNEL_TOKEN`.
 - `__sandbox-init` escuta nesse endereço, dentro do namespace de rede isolado da instância, e repassa para o Unix socket da instância no host. Assim a carga de trabalho não precisa de sockets Unix por caminho, e a Fase 3 pode bloqueá-los com seccomp ([05-security.md](05-security.md#linux-bubblewrap)).
-- Tamanho máximo de mensagem: 16 MiB.
+- Tamanho máximo de mensagem: 16 MiB (16.777.216 bytes do JSON codificado em UTF-8, excluindo o LF delimitador). Conta a serialização real, inclusive escapes e envelope. JSON de exatamente esse tamanho é permitido; a linha pode ter um byte adicional de LF. Não existe exceção para erro, hello ou notificação.
 - A primeira requisição DEVE ser `kernel.hello`. Antes dela, qualquer outra requisição recebe `UNAUTHENTICATED` e a conexão é fechada.
 - Só existe canal se o manifest declarar pelo menos um escopo em `kernel`.
+
+### IDs, admissão e correlação
+
+O perfil do Kernel Protocol admite um único objeto JSON-RPC por linha. Array no topo, inclusive batch vazio ou com apenas um membro, recebe `INVALID_REQUEST` (`-32600`, `id: null`) e nenhum membro é autenticado, admitido ou executado. O limite do frame é verificado antes; frame excessivo encerra sem resposta. Não há respostas agregadas nem execução parcial de lote.
+
+Os IDs de requisição seguem os tipos do JSON-RPC: String, Number ou Null. Ausência do campo `id` indica notificação; `"id": null` é uma requisição com ID Null e recebe resposta como tal. Boolean, objeto e array não são IDs válidos.
+
+| Tipo | Teto | Preservação |
+|---|---|---|
+| String | 256 bytes UTF-8 do valor depois de decodificar escapes JSON; vazio permitido | Mesma sequência de caracteres; sem truncamento, hashing ou normalização Unicode. Grafias equivalentes de escapes podem ser reserializadas. |
+| Number | 256 bytes do token JSON original, sem whitespace que o rodeia | Mesmo valor numérico, sem arredondamento/conversão destrutiva. Sinais, frações e expoentes válidos continuam aceitos; preservar o token original validado evita perda de precisão. |
+| Null | Token `null` | Responder com `id: null` porque esse era o ID, não como fallback. |
+
+ID String deve decodificar para uma sequência de escalares Unicode. Par surrogate válido, como `\uD83D\uDE00`, representa um escalar de quatro bytes UTF-8; surrogate isolado é recusado antes de dispatch com `INVALID_REQUEST` (`-32600`, `id: null`). Se o parser rejeitar o JSON inteiro antes de identificar o campo, aplica-se `Parse error` (`-32700`, `id: null`). Esses são os dois erros admitidos para essa entrada; nenhum caminho substitui o escalar inválido por U+FFFD nem envia seu valor alterado. O problema de interoperabilidade é descrito na [RFC 8259, seção 8.2](https://www.rfc-editor.org/rfc/rfc8259#section-8.2).
+
+O limite numérico é lexical, não uma faixa de inteiros ou regra de arredondamento. Não converter IDs arbitrários em `f64`/Number JavaScript e depois usar o valor arredondado como correlação. O ID é opaco para o dispatch. Nenhum limite novo de números em parâmetros ou resultados decorre desta regra.
+
+Verificar o limite da mensagem e a identidade de correlação antes de `kernel.hello`, de usar o token de autenticação e de qualquer admissão de método, reserva, escrita ou efeito da requisição. Um ID acima do teto fecha o transporte sem resposta JSON-RPC e sem executar essa requisição, mesmo que uma resposta específica com esse ID ainda pudesse caber. Não enviar erro com ID nulo, truncado ou reescrito. Isso é recusa pelo perfil de transporte, não execução seguida de erro de aplicação. Outras requisições já admitidas não são desfeitas pela recusa.
+
+Para uma mensagem JSON completa cujo ID seja válido, único e dentro do teto, o ID permanece conhecido mesmo quando outro campo do envelope/parâmetros é inválido: o erro conserva esse ID. `id: null` por erro de identificação fica restrito aos casos em que não há um ID válido e unívoco: JSON não decodificável, ID de tipo inválido ou campo `id` duplicado, por exemplo. Duplicatas são comparadas depois de decodificar o nome da chave (`id` e `i\u0064` são a mesma chave), inclusive quando os valores repetidos seriam iguais. Não procurar ID por regex, por prefixo truncado ou por análise permissiva de JSON incompleto. Duplicação de outro campo rejeita o envelope; se o JSON completo estabelece um ID único e válido, esse ID continua sendo a correlação do erro.
+
+Notificação reconhecida não recebe resposta, inclusive para erro de método ou parâmetros. Isso não transforma envelope inválido ou ID de tipo inválido em notificação. As regras de autenticação permanecem: somente uma requisição `kernel.hello` válida autentica a conexão; uma notificação não autentica. Rejeição pelo limite de mensagem/ID pode encerrar o transporte antes de qualquer resposta de autenticação.
+
+### Limite da resposta e resultado desconhecido
+
+Montar a resposta completa em memória limitada e conferir o tamanho codificado antes de transmitir qualquer byte dela. Se a resposta original exceder 16 MiB, substituí-la por este erro mínimo em JSON compacto, preservando o ID admitido:
+
+```json
+{"jsonrpc":"2.0","id":"<mesmo ID>","error":{"code":-32010,"message":"TOO_LARGE"}}
+```
+
+O exemplo usa String somente para ilustrar; Number e Null preservam seus próprios tipos/valores. Não anexar ao fallback o resultado, parâmetros ou detalhes grandes. Com o teto de ID definido acima, o pior String de 256 bytes exige no máximo 1.538 bytes JSON de ID quando cada byte é um controle escapado; esse envelope mínimo ocupa no máximo 1.607 bytes JSON. Number preservado ocupa até 256 bytes de token. O fallback cabe sem ampliar o limite.
+
+Se nem a resposta mínima puder ser serializada dentro do limite, ou se houver falha de escrita, encerrar a conexão. Nunca enviar uma resposta posterior usando `id: null` para substituir ID conhecido. Não iniciar a resposta normal e depois concatenar um erro ao prefixo: o cliente só considera resposta completa e válida terminada por LF. Uma notificação de saída que exceder o limite não pode virar resposta JSON-RPC sem requisição; falhar/encerrar o transporte, sem criar ID.
+
+`TOO_LARGE` pode significar que o método foi admitido e produziu resultado que não cabe. O cliente não pode inferir “nenhum efeito ocorreu” desse erro, de EOF, timeout ou falha de entrega. Os efeitos seguem o contrato de cada método e sua auditoria; entrega malsucedida não autoriza rollback adivinhado, remoção de eventos ou repetição. Nenhuma promessa nova de execução exatamente uma vez é criada por IDs: repetir o mesmo ID não é mecanismo de deduplicação de efeitos.
+
+Decisão e compatibilidade: [ADR-043](11-decisions.md#adr-043--ids-limitados-e-respostas-correlacionadas-no-kernel-protocol-resolve-arq-027). Este contrato é do Kernel Protocol; os limites próprios de MCP, WebSocket e do [canal administrativo](02-core.md#canal-administrativo-mínimo) permanecem separados.
 
 ## Escopos
 

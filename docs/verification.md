@@ -1,5 +1,47 @@
 # Verificação da implementação
 
+## Resoluções arquiteturais dos ADRs 043/044 — 2026-10-18
+
+Base inspecionada: `e459a27040e5655a5b6a46d8c87b56aacdfefe65`, main. ARQ-027/028
+resolvidas no spec; critérios 57–65 definidos. Isso não certifica implementação.
+As execuções históricas abaixo descrevem os commits em que ocorreram; menções
+anteriores a essas ARQs abertas não substituem a resolução atual.
+
+Diagnósticos desta revisão: Toolbx `fictor-dev`, Fedora Linux 44 sobre Bazzite
+`44.20261012.0` (Kinoite), Linux x86-64 `7.2.9-ogc3.1.fc44.x86_64`.
+Somente arquivos descartáveis, dados falsos e metadados de filesystem.
+
+- Contagem/serialização do ADR-043: o ID String admitido de pior tamanho ocupa
+  1.538 bytes JSON e seu fallback compacto 1.607 bytes, excluindo LF. Conferidas
+  fronteiras UTF-8/escapes, token numérico 256/257, fração/expoente e inteiro que
+  perderia precisão em float, preservado por token/Decimal. Par surrogate válido
+  codificou quatro bytes UTF-8; surrogates isolados falharam no encoder estrito.
+  A requisição original
+  mede 16.777.215 bytes JSON; os erros correlacionados ultrapassam 16 MiB.
+  Esse diagnóstico não fez dispatch nem exercitou efeitos, auditoria ou SDK.
+- Metadados do ambiente: `/usr` e `/etc` em OverlayFS, `/tmp` em tmpfs e
+  checkout/home conhecidos em btrfs. O tipo do filesystem é somente parte da
+  prova; não substitui identidade, topologia, separação nem a função da base.
+- Em namespaces novos de usuário, montagem e PID, com propagação privada,
+  overlay sobre diretório tmpfs fictício funcionou; sobre procfs recém-criado
+  no mesmo namespace foi recusado. Nenhum conteúdo de procfs foi lido. Esse
+  resultado local não prova que todos os pseudoFS sejam recusados pelo OverlayFS;
+  o ADR-044 por isso não admite overlays arbitrários de dados.
+- Revisão independente do ADR-043 fechou as bordas de batches, timeout/EOF do
+  SDK e surrogates isolados. IDs conhecidos não são substituídos por `null`.
+- Revisão independente do ADR-044 conferiu as bases por metadados e encontrou
+  somente o submount adicional `/usr/bin/toolbox`, agora uma exceção nominal RO.
+  O timezone instalado do Toolbx resolve via `/run/host/usr/share/zoneinfo/`; a
+  exceção limita-se à base fixa `/etc/localtime`, sem conceder `/run/host` a grants.
+  Não se executou workload nem teste do produto nessa revisão.
+- Checagem documental: 237 links/âncoras locais, 65 critérios consecutivos
+  da Fase 0 e `git diff --check`. O total das fases ativas é 84 critérios.
+
+Nenhuma suíte do core ou aceitação ponta a ponta foi executada nesta revisão.
+Implementação, testes adversariais dos critérios novos, CI e gate no Fedora
+COSMIC Atomic permanecem pendentes. As alterações de arquitetura ficam sem
+commit para integração pelo dev, conforme o fluxo de Git vigente.
+
 ## Contratos do M0.5 — 2026-10-18
 
 Código validado: `28981eda6387b0d67b29febfb8b6d48ad7d76f66`. Entregas diretamente

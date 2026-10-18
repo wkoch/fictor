@@ -1,15 +1,15 @@
 # Pendências para o arquiteto
 
-ARQ-027/028 abertas em 2026-10-18. ARQ-020–026 resolvidas pelos ADRs 036–042.
+Nenhuma pendência arquitetural aberta em 2026-10-18. ARQ-020–028 resolvidas pelos ADRs 036–044.
 Resolução do spec não significa implementação concluída.
 
 ## ARQ-028 — Grants sobre mounts internos e fontes de pseudo-filesystems
 
-- **Status: aberta.**
+- **Status: resolvida em 2026-10-18 — [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028).**
 - **Referência:** I2/I4/I11; `spec/05-security.md`, regras comuns, origem
   protegida dos controles e perfil bubblewrap; `core/src/sandbox/mod.rs`,
   `validate_grant`; `core/src/sandbox/linux.rs`, ordem dos mounts.
-- **Dúvida:** o perfil gera proc/dev privados e caminhos internos em `/fx`, mas
+- **Dúvida original:** o perfil gera proc/dev privados e caminhos internos em `/fx`, mas
   grants explícitos são aplicados depois e não há contrato reservando esses
   destinos. A revisão estática encontrou um grant host `/proc` que não é recusado
   pelas verificações de prefixos/sensíveis e é renderizado sobre o proc gerado.
@@ -17,26 +17,28 @@ Resolução do spec não significa implementação concluída.
   sob outro nome pode oferecer magic links para raízes/FDs do processo do host.
   Identidade dev/ino e coordenadas de bind/submount não demonstram separação
   dessas referências dinâmicas da árvore privada do core.
-- **Necessário:** ADR definindo destinos internos que não podem ser sobrepostos,
+- **Necessário originalmente:** ADR definindo destinos internos que não podem ser sobrepostos,
   ancestrais/descendentes abrangidos e tratamento de fontes procfs/pseudo-FS
   (inclusive aliases) em grants. Fixar a recusa ou prova exigida antes do spawn,
   a relação com mounts implícitos legítimos e critérios com dados falsos, sem
   conceder acesso aos processos/arquivos do host para fazer o teste passar.
-- **Implementação atual:** novos controles por descritor e prova de binds comuns
+- **Implementação ao abrir a pendência:** novos controles por descritor e prova de binds comuns
   não alteram essa política. A atestação anterior ao workload deve detectar troca
   das fontes aprovadas; não transforma uma fonte inadequada em segura.
   Não foi executada tentativa de leitura de segredos ou memória do core.
-- **Impacto:** a conformidade do perfil geral e o gate de M0.5 permanecem abertos.
+- **Impacto ao abrir a pendência:** a conformidade do perfil geral e o gate de M0.5 permanecem abertos.
   A parte afetada aguarda ADR, conforme a regra 4 de AGENTS.md; as demais entregas
   podem avançar sem ampliar grants ou modificar o spec.
+- **Resolução:** Plano único reserva destinos internos, protege bootstrap antes do init e confere a árvore final. Imports ordinários restritos a ext2/3/4, btrfs, xfs e tmpfs; overlay só nas bases RO fixas do sistema/Toolbx e bootstrap já coberto. Recusar magic links na resolução original e pseudoFS/aliases/submounts inadequados. /tmp e aliases de roteamento conservam filhos de dados autorizados e disjuntos.
+- **Entrega ao implementador:** Aplicar a política ao perfil, renderer e prova/barreira existentes, inclusive recursos implícitos e smoke; não ampliar grants nem confiar só na atestação de um init já substituído. Critérios 61–65; implementação e gate continuam pendentes.
 
 ## ARQ-027 — Correlação de IDs no limite de mensagem do Kernel Protocol
 
-- **Status: aberta.**
+- **Status: resolvida em 2026-10-18 — [ADR-043](../spec/11-decisions.md#adr-043--ids-limitados-e-respostas-correlacionadas-no-kernel-protocol-resolve-arq-027).**
 - **Referência:** `spec/03-kernel-protocol.md`, transporte (JSON-RPC 2.0 e mensagem
   máxima de 16 MiB); [JSON-RPC 2.0, seções 4 e 5](https://www.jsonrpc.org/specification),
   consultado em 2026-10-18; `core/src/kernel/transport.rs`, `write_value`.
-- **Dúvida:** o limite atual admite uma requisição cujo ID ocupa quase todo o
+- **Dúvida original:** o limite atual admite uma requisição cujo ID ocupa quase todo o
   frame, mas o envelope de erro com esse mesmo ID pode exceder 16 MiB. JSON-RPC
   exige repetir o ID conhecido. No socket real, após `kernel.hello` válido,
   `{"jsonrpc":"2.0","id":"<x repetido 16.777.177 vezes>","method":"x"}`
@@ -46,17 +48,19 @@ Resolução do spec não significa implementação concluída.
   o fallback de 74 bytes com `id: null`, embora o ID original tenha sido detectado.
   Não é possível preservar o ID e o erro obrigatório dentro do limite para todos
   os IDs hoje admitidos.
-- **Necessário:** ADR definindo um limite/formato de ID que reserve espaço para
+- **Necessário originalmente:** ADR definindo um limite/formato de ID que reserve espaço para
   o envelope de erro, ou a semântica de falha de transporte quando a resposta
   correlacionada não couber. Definir validação antes do dispatch, resposta ou
   encerramento permitido e o tratamento de efeitos já admitidos. A decisão deve
   preservar o limite de 16 MiB e esclarecer a compatibilidade com JSON-RPC.
-- **Impacto:** o cliente pode continuar aguardando uma requisição que recebeu
+- **Impacto ao abrir a pendência:** o cliente pode continuar aguardando uma requisição que recebeu
   erro com outro ID. O comportamento foi reproduzido com credenciais falsas e
   socket local no Toolbx Fedora 44/Bazzite; a asserção de correlação falhou.
   Não foi criado teto de ID, aumentado o frame nem alterado o protocolo sem ADR.
   O teste temporário de investigação foi removido; transcript em
   `.fictor/logs/kernel-large-id-before-transcript.log`.
+- **Resolução:** ID String até 256 bytes UTF-8 decodificados ou Number de token até 256 bytes, com eco sem arredondamento; Null distinto de ausência. Excesso encerra antes de hello/dispatch. Resposta grande usa TOO_LARGE com o mesmo ID; falha de entrega não troca ID, desfaz efeitos nem autoriza retry. Um objeto por frame, sem batches; 16 MiB exclui LF.
+- **Entrega ao implementador:** Aplicar admissão e writer do Kernel, mantendo MCP/admin/WS separados; SDK futuro conclui pendências e não repete chamadas. Critérios 57–60; implementação e testes do produto pendentes.
 
 ## ARQ-026 — Destinos de links dos arquivos de controle do core
 
