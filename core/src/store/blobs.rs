@@ -20,7 +20,7 @@ pub struct BlobStore {
 pub enum BlobError {
     #[error("hash de blob inválido")]
     InvalidHash,
-    #[error("blob excede 256 MiB")]
+    #[error("blob excede o limite de tamanho")]
     TooLarge,
     #[error("conteúdo do blob difere do hash")]
     Corrupt,
@@ -112,11 +112,20 @@ impl BlobStore {
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>, BlobError> {
+        self.get_bounded(hash, MAX_BLOB_BYTES)
+    }
+
+    /// A caller with a smaller response budget must reject before loading the
+    /// entire blob. The descriptor and bounded read also cover concurrent growth.
+    pub(crate) fn get_bounded(&self, hash: &str, max_bytes: usize) -> Result<Vec<u8>, BlobError> {
+        let max_bytes = max_bytes.min(MAX_BLOB_BYTES);
+        let file = fs::File::open(self.path(hash)?)?;
+        if file.metadata()?.len() > max_bytes as u64 {
+            return Err(BlobError::TooLarge);
+        }
         let mut bytes = Vec::new();
-        fs::File::open(self.path(hash)?)?
-            .take(MAX_BLOB_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_BLOB_BYTES {
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
             return Err(BlobError::TooLarge);
         }
         if hash_bytes(&bytes) != hash {
@@ -256,6 +265,36 @@ impl BlobStore {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    #[test]
+    fn limited_blob_reads_preserve_full_store_access_and_hash_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(root.path().join("blobs"));
+        let hash = store.put(b"original").unwrap();
+        assert!(matches!(
+            store.get_bounded(&hash, 7),
+            Err(BlobError::TooLarge)
+        ));
+        assert_eq!(store.get_bounded(&hash, 8).unwrap(), b"original");
+        assert_eq!(store.get(&hash).unwrap(), b"original");
+        // The limit does not permit returning an unverified prefix or corrupt bytes.
+        fs::write(store.path(&hash).unwrap(), b"modified").unwrap();
+        assert!(matches!(
+            store.get_bounded(&hash, 8),
+            Err(BlobError::Corrupt)
+        ));
+        let empty = store.put(b"").unwrap();
+        assert_eq!(store.get_bounded(&empty, 0).unwrap(), b"");
+        let oversized = fs::OpenOptions::new()
+            .write(true)
+            .open(store.path(&hash).unwrap())
+            .unwrap();
+        oversized.set_len(MAX_BLOB_BYTES as u64 + 1).unwrap();
+        assert!(matches!(
+            store.get_bounded(&hash, usize::MAX),
+            Err(BlobError::TooLarge)
+        ));
+    }
+
     #[test]
     fn independent_captures_exclude_cleanup_until_the_last_owner_releases() {
         let root = tempfile::tempdir().unwrap();

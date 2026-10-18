@@ -4,6 +4,7 @@ mod events;
 mod kv;
 mod migrations;
 mod proposals;
+mod read_budget;
 pub use proposals::{
     HumanDecision, NewProposal, Proposal, ProposalCheck, ProposalIdentity, ProposalNonce,
     ProposalState, ProposalUpdate, ResolvedPackage,
@@ -208,6 +209,21 @@ impl Store {
         tokio::task::spawn_blocking(move || blobs.get(&hash).map_err(StoreError::from))
             .await
             .map_err(|_| StoreError::Closed)?
+    }
+
+    pub(crate) async fn get_blob_bounded(
+        &self,
+        hash: String,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        let blobs = self.blobs.clone();
+        tokio::task::spawn_blocking(move || {
+            blobs
+                .get_bounded(&hash, max_bytes)
+                .map_err(StoreError::from)
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?
     }
 
     pub async fn shutdown(self) -> Result<(), StoreError> {

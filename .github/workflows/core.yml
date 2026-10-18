@@ -98,7 +98,7 @@ jobs:
         run: >-
           cargo test --locked --offline --lib
           --test bootstrap --test budget --test extension_control
-          --test kernel --test kernel_catalog --test kernel_tools --test local_checker
+          --test kernel --test kernel_catalog --test kernel_read_limits --test kernel_tools --test local_checker
           --test manifest --test migrations --test model_tls --test models --test proposals
           --test promotion --test proposal_recovery
           --test proxy --test store
