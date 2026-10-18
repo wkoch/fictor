@@ -26,7 +26,7 @@ Atacante com acesso à conta local do usuário ou root; exploits de kernel do SO
 ## Camadas de defesa
 
 1. Sandbox do SO por processo de extensão (fronteira principal).
-2. Permissões do runtime (Deno) derivadas do manifest (defesa em profundidade).
+2. Permissões do runtime (modelo de permissões do Node) derivadas do manifest (defesa em profundidade).
 3. Egress proxy: toda rede passa pelo core, com allowlist e registro.
 4. Política no core: classificação de tools, flags U/P, Rule of Two, modos, aprovações.
 5. Pipeline de extensões: nada roda sem checagens, aprovação e hash fixado.
@@ -63,7 +63,6 @@ Regras comuns:
     - `DOCKER_HOST` e `DBUS_SESSION_BUS_ADDRESS` quando apontam para Unix socket; `/run/docker.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, `/run/podman/podman.sock`, `/run/dbus/system_bus_socket`.
 - Sockets Unix que não estão na lista, criados dentro de um diretório montado (por exemplo, no workspace): montagem somente leitura não impede `connect()` em socket. Ficam alcançáveis até a Fase 3, quando o seccomp nega `socket(AF_UNIX, …)` à carga de trabalho. Risco residual documentado no fim deste arquivo.
 - Destinos proibidos para escrita (persistência fora do sandbox): o diretório do executável do core (por padrão `~/.local/bin`), `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.config/autostart`, `~/.config/systemd/user`, `~/.config/environment.d`, `~/.local/share/applications`. Montar qualquer um deles, ou um diretório que os contenha, com escrita é recusado.
-- As mesmas regras valem para `[sandbox.toolchains].mounts`. Montar `~/.cargo` inteiro é recusado (contém credenciais); monte `~/.cargo/bin`. As variáveis de `[sandbox.toolchains].env` não podem usar nomes reservados e só aceitam `~/` e `${workspace}` como templates; caminhos graváveis (como `CARGO_HOME`) DEVEM ficar dentro do workspace. Erro em qualquer regra impede o core de subir.
 - Não existe rede direta. Só o proxy.
 - O ambiente é construído do zero ([02-core.md](02-core.md#spawn)).
 
@@ -101,7 +100,7 @@ No Fedora Atomic:
 
 - Montagens usam sempre o caminho canônico (`/var/home/<usuário>/...`). Para cada um de `/home`, `/opt`, `/srv`, `/mnt` e `/root` que no host seja symlink para `var/...`, o sandbox recebe o mesmo symlink (`--symlink var/home /home` etc.). Assim, `/home/<usuário>/Projetos/x` funciona dentro do sandbox quando o caminho canônico está montado; o resto de `/var` continua invisível.
 - `/etc/crypto-policies` e `/etc/nsswitch.conf` são necessários para o OpenSSL do Fedora (git, curl).
-- Pacotes sobrepostos com `rpm-ostree` aparecem em `/usr` e ficam disponíveis no sandbox. Toolchains em `$HOME` entram só por `[sandbox.toolchains]`.
+- Nada é sobreposto em `/usr` (R8). Runtimes vêm de `$FICTOR_HOME/runtime/`. Na instância de desenvolvimento, que roda dentro do toolbx, o `/usr` montado é o do container, com as ferramentas de desenvolvimento.
 - SELinux: processos do usuário rodam como `unconfined_t`, e o bubblewrap funciona sem política extra. O `doctor` reporta negações que afetem o sandbox quando conseguir detectá-las.
 
 Sandbox aninhado: os testes do próprio core que criam sandboxes reais, rodados dentro de uma sessão Fictor, dependem de user namespaces aninhados. Até a Fase 3 isso DEVERIA funcionar; o seccomp da Fase 3 nega `unshare`. Esses testes DEVEM continuar executáveis fora do Fictor (terminal e CI). A Fase 3 decide, por ADR, se haverá permissão para sandbox aninhado.
@@ -110,10 +109,10 @@ Sandbox aninhado: os testes do próprio core que criam sandboxes reais, rodados 
 
 1. Escuta em `127.0.0.1:3128` e repassa cada conexão para `/fx/proxy.sock`.
 2. Se houver kernel, escuta em `127.0.0.1:3129` e repassa cada conexão para `/fx/kernel.sock`. Os dois listeners sobem antes do comando, então a carga de trabalho não consegue ocupar essas portas.
-3. (Fase 3) No processo filho, antes do `execve`, aplica Landlock (somente os caminhos do perfil) e um filtro seccomp que nega: `ptrace`, `mount`, `umount2`, `pivot_root`, `bpf`, `keyctl`, `add_key`, `request_key`, `unshare`, `setns`, `perf_event_open`; `socket()` com domínio diferente de `AF_INET`/`AF_INET6` (inclui `AF_UNIX`, `AF_NETLINK`, `AF_PACKET`), mantendo `socketpair(AF_UNIX)`; e `execve`/`execveat` depois do primeiro, se `spawn: false`. O próprio init não recebe o filtro. Validar com Deno, Node e Python; ajustes exigem ADR.
+3. (Fase 3) No processo filho, antes do `execve`, aplica Landlock (somente os caminhos do perfil) e um filtro seccomp que nega: `ptrace`, `mount`, `umount2`, `pivot_root`, `bpf`, `keyctl`, `add_key`, `request_key`, `unshare`, `setns`, `perf_event_open`; `socket()` com domínio diferente de `AF_INET`/`AF_INET6` (inclui `AF_UNIX`, `AF_NETLINK`, `AF_PACKET`), mantendo `socketpair(AF_UNIX)`; e `execve`/`execveat` depois do primeiro, se `spawn: false`. O próprio init não recebe o filtro. Validar com Node e Python; ajustes exigem ADR.
 4. Inicia o comando, repassa sinais, recolhe zumbis e sai com o código do filho.
 
-Até a Fase 3, `spawn: false` só é aplicado pelo Deno (`--allow-run` ausente). Para `node` e `python` é apenas declarativo. Isso DEVE aparecer na UI de aprovação.
+Até a Fase 3, `spawn: false` é aplicado pelo modelo de permissões do Node (sem `--allow-child-process`). Para `python` é apenas declarativo. Isso DEVE aparecer na UI de aprovação.
 
 ### Tiers de isolamento
 
@@ -233,7 +232,7 @@ Adaptação consciente: escrita local (`write_local`) não conta como C. Ela é 
   - `net.allow` DEVE ser não vazio e sem `*`;
   - a UI marca a extensão como "segredo exposto ao processo";
   - os valores são mascarados nos logs.
-- (Fase 3) O proxy termina TLS só para hosts com regra de injeção, usando uma CA local confiada apenas dentro do sandbox (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `DENO_CERT`), e injeta o cabeçalho. Com isso a exceção deixa de ser necessária.
+- (Fase 3) O proxy termina TLS só para hosts com regra de injeção, usando uma CA local confiada apenas dentro do sandbox (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`), e injeta o cabeçalho. Com isso a exceção deixa de ser necessária.
 - Servidores MCP remotos (`runtime.kind: remote`) não precisam da exceção: o core é o cliente HTTP e injeta o cabeçalho.
 
 ## Endurecimento web
@@ -291,6 +290,7 @@ Senão, o resultado é `untrusted`. Valores fechados não carregam instruções;
 | Linux: sockets Unix fora da lista de caminhos sensíveis, dentro de diretórios montados, ficam alcançáveis | Lista de caminhos sensíveis e descoberta; seccomp nega `socket(AF_UNIX)` | 3 |
 | Rede com prefixo NAT64 específico não configurado: o IPv4 embutido não é avaliado e pode alcançar um destino privado via gateway | `fictor doctor` detecta e sugere `[egress] nat64_prefixes`; o prefixo bem conhecido e o de uso local já são cobertos | — |
 | Segredo via env visível para a extensão | Allowlist de rede obrigatória; injeção no proxy | 3 |
-| `spawn: false` não aplicado para node/python no Linux | Documentado na aprovação; seccomp | 3 |
+| `spawn: false` não aplicado para python | Documentado na aprovação; seccomp | 3 |
+| Atualização de runtime confia no que o upstream publica no momento | Checksum da mesma origem; (Fase 3) assinatura ou atestação; smoke com as extensões ativas; aprovação humana; rollback | 0 / 3 |
 | Instruções maliciosas dentro de skills | Revisão no pipeline; skills só de bundles promovidos | 3 |
 | Fadiga de aprovação | Grants por sessão; motivo explícito; modo `auto` com Rule of Two | — |

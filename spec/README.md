@@ -17,6 +17,7 @@ Fictor é um runtime pessoal de agentes de IA. O core é um kernel de confiança
 | R5 | Nada de terceiros (MCP, skills, plugins) roda sem passar pelo pipeline de verificação e sem versão fixada por hash. |
 | R6 | Defesa estrutural contra prompt injection, sem depender de filtros. |
 | R7 | Uso pessoal: um usuário, uma máquina, UI em localhost. |
+| R8 | A instalação de uso funciona num Fedora COSMIC Atomic limpo baixando só o binário `fictor`. Nada depende de pacotes sobrepostos na base (`rpm-ostree`); o que faltar, o Fictor baixa para `$FICTOR_HOME` ([ADR-032](11-decisions.md#adr-032--gerenciador-de-runtimes-e-fictor-update)). |
 
 ## Invariantes
 
@@ -113,7 +114,8 @@ Verificar a versão vigente de cada padrão no início da implementação e regi
 | Agent Skills | https://agentskills.io |
 | AGENTS.md | https://agents.md |
 | ACP (Fase 4) | https://agentclientprotocol.com |
-| Permissões do Deno | https://docs.deno.com/runtime/fundamentals/security/ |
+| Permissões do Node | https://nodejs.org/api/permissions.html |
+| Vite+ | https://viteplus.dev |
 | uv | https://docs.astral.sh/uv/ |
 | Referência de sandbox | https://github.com/anthropic-experimental/sandbox-runtime (bubblewrap + proxy) |
 | Referência de sandbox | https://github.com/openai/codex (`codex-rs`: Landlock/seccomp) |

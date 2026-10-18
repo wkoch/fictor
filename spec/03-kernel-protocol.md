@@ -370,6 +370,8 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `workspace.flagged` | core | `{workspace, flag: "U", session_id, source_event_id}` — sessão `sys` |
 | `workspace.cleared` | user | `{workspace}` — sessão `sys` |
 | `ext.flags_changed` | core | `{ext_id, flags: {U, P}, session_id?, reason}` — marca d'água de extensão global (Fase 1), sessão `sys` |
+| `runtime.installed`, `runtime.activated`, `runtime.rolled_back`, `runtime.integrity_failed` | core ou user | `{name, version, from?}` — sessão `sys` |
+| `update.batch` | user | `{batch_id, items: [{kind: "runtime" \| "extension", id, from, to}]}` — sessão `sys` |
 | `ext.state_reset` | user | `{ext_id}` — kv, `${ext_data}` e marca d'água apagados (Fase 1), sessão `sys` |
 
 ### Gravados pelo harness

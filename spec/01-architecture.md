@@ -90,12 +90,14 @@ fictor/
 │       ├── installer/        pipeline, lock, store, hash de bundle
 │       ├── admin.rs          socket administrativo
 │       └── web/              axum: auth, WebSocket, assets embutidos, host de surfaces
-├── shell/                    TypeScript + Lit + Vite; build embutido no core
+├── package.json              workspace npm do código TypeScript; Vite+ como dependência de desenvolvimento
+├── dev/Containerfile         ambiente de desenvolvimento (toolbx)
+├── shell/                    TypeScript + Lit; build com `vp build`, embutido no core
 │   └── ds/                   design system `fx-*` e CATALOG.md
-├── sdk/                      @fictor/sdk (TypeScript/Deno)
-├── harness/                  bundle da extensão role=harness
-├── extensions/               bundles first-party (fs-tools, shell-net, web, ...)
-└── tests/acceptance/         testes de ponta a ponta (Deno) + provider falso
+├── sdk/                      @fictor/sdk (TypeScript/Node)
+├── harness/                  extensão role=harness; `vp pack` gera dist/main.mjs
+├── extensions/               extensões padrão (fs-tools, shell-net, ...); `vp pack` gera dist/server.mjs
+└── tests/acceptance/         testes de ponta a ponta (Vitest) + provider falso
 ```
 
 Um crate único com módulos. Dividir em crates só quando houver motivo concreto (tempo de compilação, reuso).
@@ -112,6 +114,7 @@ $FICTOR_HOME/
 ├── secrets.toml              só com [secrets] backend = "file" (0600)
 ├── blobs/<2 hex>/<62 hex>    conteúdo endereçado por sha256
 ├── evals/<case_id>/          casos criados pelo usuário (Fase 2)
+├── runtime/                  runtimes gerenciados pelo core: node-<versão>/, uv-<versão>/, python/ (somente leitura)
 ├── extensions/
 │   ├── lock.json
 │   ├── store/<id>/<version>-<hash12>/    somente leitura após promoção
@@ -132,10 +135,11 @@ Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da próp
 | Parte | Escolha | Observação |
 |---|---|---|
 | Core | Rust stable, tokio, axum, rusqlite (`bundled`), rmcp, hyper + rustls, keyring, directories, serde, tracing, ulid, sha2, rust-embed, clap | sem C++ nem runtime JS embutido |
-| Harness e extensões first-party | Deno 2 (TypeScript) | permissões do Deno derivadas do manifest |
-| Extensões Python | Python gerenciado por uv | dependências instaladas na quarentena |
-| MCP de terceiros em Node | Node instalado no host | `node_modules` vendorizado na quarentena |
-| Shell | TypeScript, Lit, Vite, markdown-it, DOMPurify | assets embutidos no binário |
+| Runtime das extensões JavaScript | Node LTS, baixado pelo gerenciador de runtimes ([02-core.md](02-core.md#runtimes)) | permissões do Node derivadas do manifest; mesmo runtime para extensões padrão e MCP de terceiros |
+| Harness e extensões padrão | TypeScript, empacotado com `vp pack` num único `.mjs` | embutidas no binário como origem `builtin` |
+| Extensões Python | Python instalado pelo uv do gerenciador de runtimes | dependências instaladas na quarentena |
+| Shell | TypeScript, Lit, markdown-it, DOMPurify; build com `vp build` (Vite) | assets embutidos no binário |
+| Ferramentas de desenvolvimento | Vite+ (`vp check`, `vp test`, `vp build`, `vp pack`, `vp run`) como dependência npm; Rust e demais ferramentas no container toolbx | só no desenvolvimento, nunca no app em execução ([ADR-034](11-decisions.md#adr-034--desenvolvimento-em-toolbx-vite-como-ferramenta-de-desenvolvimento)) |
 | Banco | SQLite com FTS5 | um arquivo; extensões usam o próprio diretório de dados |
 
 ## Plataformas
@@ -153,9 +157,9 @@ Sandbox: bubblewrap + namespaces; Landlock e seccomp na Fase 3. `fictor doctor` 
 
 ### Fedora COSMIC Atomic
 
-- `/usr` é imutável. Pacotes do sistema (como `gcc` e `git`) entram por `rpm-ostree install` e aparecem em `/usr`, que o sandbox monta só leitura.
-- Toolchains do usuário (rustup, cargo, deno, uv) ficam em `$HOME` e entram no sandbox por `[sandbox.toolchains]` ([02-core.md](02-core.md#configuração)).
+- `/usr` é imutável, e nada é sobreposto nela (R8). Da imagem base, o Fictor usa só o bubblewrap, que vem como dependência do flatpak, e o navegador. Runtimes de extensões ficam em `$FICTOR_HOME/runtime/`.
+- Desenvolvimento do Fictor: dentro de um container toolbx ([10-roadmap.md](10-roadmap.md#instância-de-desenvolvimento-no-toolbx)). O host continua limpo.
 - `/home`, `/opt`, `/srv`, `/mnt`, `/root` e `/usr/local` são symlinks para `/var/...`. O core trabalha com caminhos canônicos e recria esses symlinks dentro do sandbox ([05-security.md](05-security.md#linux-bubblewrap)).
 - SELinux fica em modo enforcing. O core não exige mudanças de política; `fictor doctor` reporta negações (AVC) que afetem o sandbox.
-- Toolbox e distrobox não são usados pelo Fictor.
+- A instalação de uso não usa toolbox nem distrobox. Só o desenvolvimento usa toolbx.
 - Navegador alvo do shell: Firefox, o padrão do Fedora.

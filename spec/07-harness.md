@@ -15,7 +15,7 @@ version: 0.1.0
 description: Loop padrão do agente.
 role: harness
 scope: session
-runtime: { kind: deno, entry: src/main.ts }
+runtime: { kind: node, entry: dist/main.mjs }
 mcp: false
 kernel: [events.read, events.write, sessions, blobs, kv, tools, hooks, catalog, ui, config, approval]   # + ext.propose na Fase 1
 permissions:
@@ -191,11 +191,10 @@ id: fs-tools
 version: 0.1.0
 description: Leitura, escrita, busca e shell sem rede no workspace.
 scope: session
-runtime: { kind: deno, entry: server.ts }
+runtime: { kind: node, entry: dist/server.mjs }
 permissions:
   fs: { read: ["${workspace}"], write: ["${workspace}"] }
   spawn: true
-  toolchains: true
 tools:
   read_file:  { effect: read,        sensitivity: private, output_trust: workspace }
   list_dir:   { effect: read,        sensitivity: private, output_trust: workspace }
@@ -218,20 +217,21 @@ tools:
 
 Caminhos são relativos ao workspace ou absolutos dentro dele. Fora disso, erro (o sandbox também impede).
 
+Variáveis de projeto: antes de cada comando, `bash` e `bash_network` aplicam `<workspace>/.fictor/env`, com linhas `NOME=valor`. Valores que começam com `./` ou `.fictor/` viram caminhos absolutos dentro do workspace. Nomes reservados ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)) são ignorados, com aviso no resultado. Uso típico: `CARGO_HOME=.fictor/cargo` e `npm_config_cache=.fictor/npm`, para que `bash_network` baixe dependências e `bash` as use offline. O arquivo não dá nenhum privilégio novo, porque os comandos já rodam no sandbox da extensão.
+
 ### `shell-net` (Fase 0)
 
 ```yaml
 schema: 1
 id: shell-net
 version: 0.1.0
-description: Shell com rede, para instalar dependências, git push e afins.
+description: Shell com rede, para baixar dependências e afins.
 scope: session
-runtime: { kind: deno, entry: server.ts }
+runtime: { kind: node, entry: dist/server.mjs }
 permissions:
   fs: { read: ["${workspace}"], write: ["${workspace}"] }
   net: { allow: ["*"] }
   spawn: true
-  toolchains: true
 tools:
   bash_network: { effect: external, sensitivity: private, output_trust: untrusted, timeout_ms: 600000 }
 ```
@@ -254,7 +254,7 @@ Bundle `runtime.kind: none` com a skill `authoring-extensions`. A skill DEVE cob
 - o perfil dev e como desenhar extensões que cabem nele (promoção automática);
 - a API do `@fictor/sdk` com exemplos de tool, hook, surface e timer;
 - o catálogo `fx-*` ([08-shell.md](08-shell.md#design-system));
-- o fluxo: desenvolver em `<workspace>/.fictor/ext/<id>/`, escrever testes, rodar `deno test` via `bash`, chamar `propose_extension`, ler os motivos de falha e corrigir;
+- o fluxo: desenvolver em `<workspace>/.fictor/ext/<id>/` em TypeScript (só sintaxe que o Node consegue apagar), escrever testes, rodar `node --test` via `bash`, chamar `propose_extension`, ler os motivos de falha e corrigir;
 - checklist: classificação correta de cada tool, `output_trust` honesto, nenhum caminho fora dos templates sem necessidade.
 
 ### `checkpoints` (Fase 2)

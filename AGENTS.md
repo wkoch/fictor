@@ -24,19 +24,24 @@ Fictor é um runtime pessoal de agentes de IA. O core (Rust) é um kernel de con
 7. **Dependências.** Prefira as listadas em [spec/01-architecture.md](spec/01-architecture.md#stack). Dependência nova precisa de motivo claro.
 8. **Fora do escopo, sempre:** Tauri/Electron, JS ou WASM embutido no core, Docker como requisito, bancos especializados no core.
 
+## Ambiente de desenvolvimento
+
+Tudo roda dentro do container toolbx definido em `dev/Containerfile` ([ADR-034](spec/11-decisions.md#adr-034--desenvolvimento-em-toolbx-vite-como-ferramenta-de-desenvolvimento)). Nada é instalado no host: nada de `rpm-ostree`, e nenhuma ferramenta global no `$HOME`. O Vite+ é dependência npm de desenvolvimento do repositório; o Node vem do container, e `vp env` não é usado.
+
 ## Comandos
 
-| Parte | Formatar | Lint | Testes |
+| Parte | Formatar e lint | Testes | Build |
 |---|---|---|---|
-| `core/` | `cargo fmt` | `cargo clippy --all-targets -- -D warnings` | `cargo test` |
-| `sdk/`, `harness/`, `extensions/*` | `deno fmt` | `deno lint` | `deno test` |
-| `shell/` | `deno fmt` | `deno lint` | `deno task test` |
+| `core/` | `cargo fmt`, `cargo clippy --all-targets -- -D warnings` | `cargo test` | `cargo build --release` |
+| `sdk/`, `harness/`, `extensions/*`, `shell/`, `tests/acceptance/` | `vp check` | `vp test` | `vp pack` (extensões) e `vp build` (shell) |
 
-Build do shell: `deno task build` em `shell/` (Vite via `npm:vite`). Desenvolvimento: `deno task dev` (build em watch) + `fictor serve --shell-dir shell/dist`.
+Ordem da build completa: `vp run build` gera o shell e as extensões empacotadas, que o core embute; depois `cargo build`. Desenvolvimento do shell: build em modo watch + `fictor serve --shell-dir shell/dist`.
+
+Instância de desenvolvimento: dentro do toolbx, com `FICTOR_HOME=~/.local/share/fictor-dev` e portas 7360/7361, para não colidir com a instância de uso do host ([spec/10-roadmap.md](spec/10-roadmap.md#instância-de-desenvolvimento-no-toolbx)).
 
 ## Testes
 
-- Unitários junto ao código. Integração do core em `core/tests/`. Aceitação de ponta a ponta em `tests/acceptance/` (Deno), dirigindo o core pelo WebSocket e pelo socket admin.
+- Unitários junto ao código. Integração do core em `core/tests/`. Aceitação de ponta a ponta em `tests/acceptance/` (Vitest), dirigindo o core pelo WebSocket e pelo socket admin.
 - **Sem chaves reais nem rede externa nos testes.** Use um provider falso: servidor HTTP local que imita o streaming das APIs Anthropic e OpenAI com respostas roteirizadas. Configure-o como provider com `base_url = "http://127.0.0.1:<porta>"`.
 - **Plataforma única: Linux x86-64; alvo validado: Fedora COSMIC Atomic** ([ADR-030](spec/11-decisions.md#adr-030--só-linux-x86-64-alvo-atual-fedora-cosmic-atomic)). Não escreva nem mantenha código, testes ou CI para outros sistemas operacionais ou arquiteturas.
 - **Onde os testes contam.** Build e testes só valem como evidência quando rodam na máquina Fedora COSMIC Atomic do usuário ou na CI (Ubuntu 22.04 x86-64 e container Fedora). Ao reportar, diga onde cada suíte rodou.
@@ -56,6 +61,8 @@ Build do shell: `deno task build` em `shell/` (Vite via `npm:vite`). Desenvolvim
 
 - `strict`. Sem `any`, exceto em fronteiras de protocolo validadas com zod.
 - Extensões usam `@fictor/sdk`; não reimplemente MCP ou Kernel Protocol em cada extensão.
+- Só APIs web padrão e módulos `node:`; nada exclusivo de um runtime.
+- Código executado pelo Node em `.ts` usa só sintaxe que pode ser apagada (sem `enum`, `namespace` ou parameter properties).
 
 ### Commits
 

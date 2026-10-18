@@ -5,8 +5,8 @@ O shell é a UI confiável. É servido pelo core, roda no navegador e é a únic
 ## Stack e build
 
 - TypeScript, Lit, Vite, markdown-it, DOMPurify, highlight.js.
-- `vite build` gera `shell/dist/`, embutido no binário com `rust-embed`.
-- Desenvolvimento: `vite build --watch` + `fictor serve --shell-dir shell/dist`. Assim o desenvolvimento usa os mesmos hosts, CSP e autenticação de produção.
+- `vp build` (Vite) gera `shell/dist/`, embutido no binário com `rust-embed`.
+- Desenvolvimento (no toolbx): build em modo watch + `fictor serve --shell-dir shell/dist`. Assim o desenvolvimento usa os mesmos hosts, CSP e autenticação de produção.
 
 ## Hosts, portas e autenticação
 
@@ -64,6 +64,10 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `ext.rollback` | `{ext_id, to?}` | Rollback. |
 | `ext.set_enabled` | `{ext_id, enabled}` | Liga ou desliga. |
 | `ext.reset_state` | `{ext_id}` | Limpa kv, `${ext_data}` global e marca d'água (Fase 1). Exige confirmação no modal. |
+| `update.check` | — | Verifica atualizações de runtimes, extensões e core. Servidor responde `update.candidates`. |
+| `update.apply` | `{items: string[] \| "all_passing", nonce}` | Aplica os itens escolhidos, ou todos os que passaram nas checagens sem ampliar permissões. |
+| `update.rollback` | `{batch_id, nonce}` | Reverte um lote. |
+| `runtime.rollback` | `{name, nonce}` | Volta o runtime à versão anterior. |
 | `workspace.clear_flag` | `{workspace}` | Apaga a flag U do workspace. Exige confirmação no modal, que mostra a sessão de origem. |
 
 ### Servidor → cliente
@@ -79,6 +83,7 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `app.response` | `{surface_id, request_id, result?, error?}` |
 | `app.notify` | `{surface_id, method, params}` |
 | `catalog.changed` | `{catalog}` |
+| `update.candidates` | `{runtimes: [...], extensions: [...], core?: {current, latest}, nonce}` |
 | `proposal.updated` | `{proposal_id, state}` |
 
 ## Layout
@@ -143,7 +148,7 @@ Página `#/extensions`, parte da UI confiável.
   - relatório do auditor (Fase 3) e gate de evals (Fase 2);
   - editor de overrides: restringir permissões e ajustar classificação de tools;
   - Aprovar / Rejeitar.
-- **Atualizações** (Fase 3): propostas com `update_of`, agrupadas.
+- **Atualizações**: página `#/updates`, parte da UI confiável. Mostra runtimes (versão atual e candidata, checksum, resultado do smoke das extensões afetadas), extensões (inclusive propostas com `update_of`) e o aviso de release nova do core, que só se instala pela CLI. Tem o botão "Atualizar tudo", a lista de lotes anteriores com rollback, e um badge na barra quando a checagem automática encontra novidades.
 
 ## Host de MCP Apps
 

@@ -6,7 +6,7 @@ Cada fase termina com todos os critérios de aceitação passando, de preferênc
 
 | Release | Conteúdo obrigatório | Pode ficar para depois |
 |---|---|---|
-| **v0.1** | [Marco de autossuficiência](#marco-de-autossuficiência-v01): Fase 0 completa, incluindo compactação, toolchains no sandbox, guarda de migração e `fictor ext rollback` | — |
+| **v0.1** | [Marco de autossuficiência](#marco-de-autossuficiência-v01): Fase 0 completa, incluindo compactação, gerenciador de runtimes, `fictor update`, extensões padrão embutidas, guarda de migração, `fictor ext rollback` e instância de desenvolvimento no toolbx | — |
 | v0.2 | Fase 1 completa | — |
 | v0.3 | Fase 2 completa | — |
 | **v1.0** | Fases 0–2 e o núcleo da Fase 3: origens `git`, `mcp`, `skill`, `claude-plugin`; normalização; MCP remoto; checagens OSV, de segredos e de capacidades inferidas; extensão `auditor`; watcher de atualizações com auditoria do diff; Landlock e seccomp no Linux | — |
@@ -37,12 +37,12 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 | M0.6 | Política, aprovações, grants. |
 | M0.7 | Servidor web (auth, WS, CSP, host de surfaces vazio), shell com chat, sessões, modal de aprovação. |
 | M0.8 | `@fictor/sdk` mínimo, `harness` v0 (adapters `anthropic` e `openai-chat`, loop, AGENTS.md, skills, `load_skill`, `todo_write`, compactação), `fs-tools`, `shell-net`. |
-| M0.9 | Autossuficiência: `[sandbox.toolchains]`, guarda de migração com backup, `fictor login`, `fictor ext rollback`, unidade systemd de usuário. |
+| M0.9 | Autossuficiência: gerenciador de runtimes (Node LTS), `fictor update`, extensões padrão embutidas (`vp pack` + origem `builtin`), guarda de migração com backup, `fictor login`, `fictor ext rollback`, unidade systemd de usuário, `dev/Containerfile` e instância de desenvolvimento no toolbx. |
 | M0.10 | Testes de aceitação de ponta a ponta e roteiro de autossuficiência no Fedora COSMIC Atomic. |
 
 ### Critérios de aceitação
 
-1. No Fedora COSMIC Atomic: `fictor init --first-party .` e `fictor serve` sobem; o login pela URL impressa funciona; uma conversa com um modelo Anthropic e com um compatível com OpenAI retorna resposta em streaming.
+1. No Fedora COSMIC Atomic: `fictor init` e `fictor serve` sobem; o login pela URL impressa funciona; uma conversa com um modelo Anthropic e com um compatível com OpenAI retorna resposta em streaming.
 2. Pedir "crie `hello.txt` com o texto oi" num workspace cria o arquivo. O event log tem `user.message`, `model.call`, `assistant.message`, `tool.call` e `tool.result` encadeados.
 3. Dentro de `fs-tools__bash`: `curl https://example.com` falha (sem rede); ler `<HOME real>/.ssh/id_rsa` pelo caminho absoluto falha; criar arquivo num caminho absoluto fora do workspace falha; `touch ./x` no workspace funciona.
 4. `shell-net__bash_network` com `curl https://example.com` pede aprovação no modo `default`; aprovado, funciona; a sessão ganha a flag U com motivo `net:example.com`.
@@ -69,10 +69,14 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 25. Bundle com `fs.read: ["~/Documents/x"]`: o smoke passa sem acesso ao caminho real, um teste do bundle que tenta ler o caminho falha, e a tela de revisão lista o caminho não concedido.
 26. Uma extensão de teste com `spawn: true` faz fork duplo e `setsid()`, e o pai sai. Depois do encerramento da instância, nenhum processo dela existe. Matar o core com SIGKILL também encerra os sandboxes (`--die-with-parent`), e o boot seguinte remove sockets e diretórios que sobraram.
 27. Uma conversa longa passa do limite de contexto e continua depois de `harness.compaction`.
-28. Toolchains: com `[sandbox.toolchains]` configurado, `cargo --version`, `rustc --version` e `deno --version` funcionam em `fs-tools__bash`, e `CARGO_HOME` aponta para `<workspace>/.fictor/cargo`. `mounts = ["~/.cargo"]` impede o core de subir. `~/.cargo/credentials.toml` não é legível dentro do sandbox.
+28. Instância de desenvolvimento: dentro do toolbx criado a partir de `dev/Containerfile`, o bubblewrap funciona; em `fs-tools__bash`, `cargo --version`, `gcc --version`, `git --version`, `node --version` e `npx vp --version` funcionam. Com `<workspace>/.fictor/env` contendo `CARGO_HOME=.fictor/cargo`, um `cargo fetch` via `shell-net` permite `cargo test --offline` via `fs-tools`. Essa instância não lê nem altera o `FICTOR_HOME` da instância de uso.
 29. Fedora Atomic: em `fs-tools__bash`, tanto `/home/<usuário>/<caminho no workspace>` quanto o caminho canônico `/var/home/...` funcionam, e `/var` só mostra os caminhos montados. Uma extensão com `fs.write: ["~/.bashrc"]` ou `["~/.local/bin"]` tem o spawn recusado.
 30. Migrações: subir um binário com migração nova cria `fictor.db.bak-<n>` antes de migrar. Subir de novo o binário anterior falha com mensagem explicativa e não altera o banco.
-31. Roteiro de autossuficiência (manual, registrado em `docs/`): no Fedora COSMIC Atomic, com o Fictor rodando como serviço de usuário e workspace = clone do repositório, o agente implementa uma mudança pequena no core com teste. Ele roda `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e `cargo test --offline` dentro do Fictor e faz commit local. O usuário instala o binário novo e reinicia o serviço, e a sessão anterior continua acessível.
+31. Roteiro de autossuficiência (manual, registrado em `docs/`): no Fedora COSMIC Atomic, com a instância de desenvolvimento rodando no toolbx e workspace = clone do repositório, o agente implementa uma mudança pequena no core com teste. Ele roda `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e `cargo test --offline` dentro do Fictor e faz commit local. O usuário instala o binário novo na instância de uso e reinicia o serviço, e a sessão anterior continua acessível.
+
+32. Instalação limpa: num usuário novo do Fedora COSMIC Atomic, sem Node, Rust ou qualquer ferramenta no `$HOME`, baixar o binário, rodar `fictor init` e `fictor serve` resulta numa conversa funcionando. O Node LTS fica em `$FICTOR_HOME/runtime/` com checksum conferido, e nada é instalado fora de `~/.local/bin/fictor` e `$FICTOR_HOME`.
+33. Runtimes: `fictor runtime update node` com uma versão candidata roda o smoke das extensões ativas antes de ativar. Um checksum adulterado faz a atualização falhar. `fictor runtime rollback node` volta à versão anterior, e instâncias novas passam a usá-la. Alterar o executável do Node em `$FICTOR_HOME/runtime/` faz o boot desativar o runtime e alertar.
+34. `fictor update --yes` aplica só os itens sem falhas e sem ampliação de permissão e grava `update.batch`. `fictor update rollback <batch_id>` desfaz o lote inteiro.
 
 Fora da Fase 0: propostas da IA, surfaces, hooks, web, evals, terceiros.
 
@@ -82,19 +86,24 @@ A partir da v0.1, o Fictor é desenvolvido de dentro do próprio Fictor, no Fedo
 
 ### Instalação de uso
 
-- Binário em `~/.local/bin/fictor`, `FICTOR_HOME` padrão.
+- Num Fedora COSMIC Atomic limpo (R8): baixar o binário para `~/.local/bin/fictor`, rodar `fictor init` (baixa o Node LTS e instala as extensões padrão embutidas) e `fictor serve`.
 - Serviço de usuário opcional, `~/.config/systemd/user/fictor.service`, com `ExecStart=%h/.local/bin/fictor serve`. `fictor login` pede ao core em execução uma URL de login nova, já que a do boot fica no journal.
-- Workspace: clone do repositório, com `workspace_trust: trusted`. O `.gitignore` do repositório DEVE incluir `.fictor/` (caches de toolchains no workspace).
-- `[sandbox.toolchains]` configurado para rustup, cargo e deno. `gcc` e `git` vêm do sistema (`rpm-ostree install gcc git`, se ainda não estiverem).
+- Atualizações com `fictor update`: runtimes e extensões sem mexer no core. O próprio core, só com `fictor update --core`.
+
+### Instância de desenvolvimento no toolbx
+
+- `dev/Containerfile`, baseado na imagem `fedora-toolbox` da versão alvo, instala via `dnf`: `rust`, `cargo`, `clippy`, `rustfmt`, `gcc`, `git`, `nodejs`, `npm` e `bubblewrap`. Criar com `podman build` e `toolbox create --image <imagem> fictor-dev`, e entrar com `toolbox enter fictor-dev`.
+- Dentro do toolbx roda uma instância de desenvolvimento do Fictor, com `FICTOR_HOME=~/.local/share/fictor-dev` e `listen`/`surface_port` 7360/7361. Os sandboxes dela montam o `/usr` do container, então o agente enxerga as ferramentas de desenvolvimento.
+- Workspace: clone do repositório, com `workspace_trust: trusted`. O `.gitignore` DEVE incluir `.fictor/` e `node_modules/`. O repositório traz `.fictor/env` com `CARGO_HOME=.fictor/cargo` e `npm_config_cache=.fictor/npm`.
 
 ### Ciclo de desenvolvimento dentro do Fictor
 
-1. O agente lê spec e código, edita, roda `cargo fmt`, `cargo clippy`, `cargo test --offline` e `deno test` com `fs-tools__bash` (sem rede).
-2. Dependências novas: `cargo fetch` ou `deno install` com `shell-net__bash_network`, com aprovação.
+1. O agente lê spec e código, edita, e roda com `fs-tools__bash` (sem rede): `cargo fmt`, `cargo clippy`, `cargo test --offline`, `npx vp check` e `npx vp test`.
+2. Dependências novas: `cargo fetch` ou `npm ci` com `shell-net__bash_network`, com aprovação.
 3. O agente faz commit local. Nenhuma credencial de git ou SSH entra no sandbox.
 4. O usuário revisa e faz `git push` fora do Fictor.
-5. Atualizar o core é ação do usuário, fora do Fictor: testar a build com `FICTOR_HOME` temporário, `install -m 0755 core/target/release/fictor ~/.local/bin/fictor` e `systemctl --user restart fictor`. O core faz backup do banco antes de migrar.
-6. Atualizar extensões first-party (`harness`, `fs-tools`, `shell-net`): `fictor ext install <caminho>` pelo usuário. Se uma versão nova quebrar o agente, `fictor ext rollback <id>` volta à anterior sem depender do agente.
+5. Atualizar o core da instância de uso é ação do usuário, fora do Fictor: depois de testar na instância de desenvolvimento, `install -m 0755 core/target/release/fictor ~/.local/bin/fictor` e `systemctl --user restart fictor`. O core faz backup do banco antes de migrar. O binário compilado no toolbx roda no host porque os dois usam a mesma versão do Fedora.
+6. Atualizar extensões padrão (`harness`, `fs-tools`, `shell-net`): `fictor ext install <caminho>` pelo usuário, ou o binário novo, que traz as versões `builtin` atualizadas. Se uma versão quebrar o agente, `fictor ext rollback <id>` volta à anterior sem depender do agente.
 
 Testes do core que criam sandboxes reais podem falhar dentro do Fictor por aninhamento de namespaces ([05-security.md](05-security.md#linux-bubblewrap)). Nesse caso, rodam no terminal ou na CI, e isso não bloqueia o marco.
 

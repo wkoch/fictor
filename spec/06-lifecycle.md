@@ -6,7 +6,8 @@ Um único pipeline para todo código que entra no store: escrito pela IA, instal
 
 | `source.kind` | Como chega | Fase |
 |---|---|---|
-| `local` | `fictor ext install <caminho>` ou `fictor init --first-party` | 0 |
+| `builtin` | Extensões padrão embutidas no binário (`harness`, `fs-tools`, `shell-net`), instaladas por `fictor init` e atualizadas por `fictor update` quando o binário traz versão nova | 0 |
+| `local` | `fictor ext install <caminho>` | 0 |
 | `ai` | Kernel `ext.propose` (tool `propose_extension` do harness) | 1 |
 | `git` | `fictor ext add git <url> [--ref] [--subdir]` | 3 |
 | `mcp` | `fictor ext add mcp <nome no MCP Registry \| npm:pkg \| pypi:pkg \| url>` | 3 |
@@ -33,7 +34,7 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 ### 1. Recebimento
 
 - Percorrer a origem de forma iterativa e copiar para `quarantine/<proposal_id>/`.
-- **Ignorados**: não são percorridos, não contam nos limites e aparecem na lista de ignorados da proposta. São eles `.git/` em qualquer nível, `__pycache__/` em qualquer nível e, na raiz do bundle, `node_modules/`, `vendor/`, `.deno/`, `.pydeps/` e `.venv/`. Dependências sempre vêm da etapa 3.
+- **Ignorados**: não são percorridos, não contam nos limites e aparecem na lista de ignorados da proposta. São eles `.git/` em qualquer nível, `__pycache__/` em qualquer nível e, na raiz do bundle, `node_modules/`, `vendor/`, `.pydeps/` e `.venv/`. Dependências sempre vêm da etapa 3.
 - **Recusados** (proposta `failed`): symlinks; arquivos especiais; caminhos absolutos ou com `..`; nomes que não sejam UTF-8 válido ou que contenham caracteres de controle ou `\`.
 - Diretórios vazios não entram no bundle.
 - O percurso conta entradas e bytes enquanto avança e para no primeiro limite excedido ([Limites](#limites)). A ordenação para o hash só acontece depois, com o percurso já dentro dos limites; assim, memória e tempo ficam limitados pelos tetos.
@@ -54,11 +55,10 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 
 ### 3. Dependências
 
-Roda num sandbox com escrita na quarentena e rede só para os registros em `[installer] registries` (default: `jsr.io`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `deno.land`).
+Roda num sandbox com escrita na quarentena e rede só para os registros em `[installer] registries` (default: `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`). Bundles que já trazem o código empacotado num único arquivo, sem `package.json` com dependências, pulam esta etapa.
 
 | Runtime | Comando | Exigência |
 |---|---|---|
-| `deno` | `deno install` (vendor) | `deno.lock` gerado ou existente |
 | `node` | `npm ci --ignore-scripts` | `package-lock.json` obrigatório |
 | `python` | `uv pip install --target .pydeps -r requirements.lock` | lockfile com hashes (`uv export --format requirements-txt`) |
 
@@ -99,7 +99,7 @@ chave_store = <version> + "-" + primeiros 12 hex do bundle_hash
 | Resumo de permissões | 0 | informativo |
 | Diff de permissões contra a versão ativa (expansões destacadas) | 1 | informativo |
 | Testes (`tests.command`) no ambiente de verificação, timeout 300 s | 1 | bloqueia |
-| Varredura de padrões de risco: `eval`, `new Function`, `child_process`, `Deno.Command`, `subprocess`, `os.system`, `fetch`/`WebSocket` com URL literal, blobs base64 > 1 KiB, linhas > 1000 caracteres, caracteres bidi e de largura zero, comentários HTML em `SKILL.md` | 1 | informativo |
+| Varredura de padrões de risco: `eval`, `new Function`, `child_process`, `process.binding`, `subprocess`, `os.system`, `fetch`/`WebSocket` com URL literal, blobs base64 > 1 KiB, linhas > 1000 caracteres, caracteres bidi e de largura zero, comentários HTML em `SKILL.md` | 1 | informativo |
 | Dependências novas (fora das já presentes em bundles ativos e de `[installer] trusted_packages`) | 1 | informativo; impede promoção automática |
 | Vulnerabilidades conhecidas das dependências (OSV) | 3 | informativo; `critical` bloqueia |
 | Segredos no código (formatos conhecidos de chave) | 3 | informativo |
@@ -119,7 +119,6 @@ Código ainda não aprovado (smoke, testes, execução comportamental e evals de
 | `${ext_data}`, `${tmp}` | Temporários vazios. |
 | `${store}` | O store temporário. |
 | Caminhos absolutos e `~/` de `fs.read`/`fs.write` | Não concedidos: o caminho não existe no namespace. Não há substituição por dados sintéticos. |
-| Toolchains (`permissions.toolchains`) | Montadas normalmente, só leitura; `${workspace}` nas variáveis aponta para o workspace temporário. |
 | `sandbox.home_ro_files` | Não montados. |
 | Rede | Nenhuma: o proxy nega tudo e registra as tentativas. |
 | Model proxy | Nega tudo com 403 `{"error": "fictor_preapproval"}`. |
@@ -187,13 +186,15 @@ Promoção automática (`auto:dev-profile`) só se **todas** as condições vale
   - `permissions.net.allow`, `models` e `secrets` vazios;
   - `fs.write` ⊆ {`${ext_data}`, subcaminhos de `${ext_data}`}; `fs.read` ⊆ {`${workspace}`, `${ext_data}`} e subcaminhos;
   - `kernel` ⊆ {`kv`, `ui`, `timers`, `blobs`}, mais `events.read` se `scope: session`;
-  - `isolation: os` e `permissions.toolchains` ausente ou `false`;
+  - `isolation: os`;
 - nenhuma dependência nova;
 - todas as checagens bloqueantes passaram.
 
 Qualquer outro caso exige aprovação humana na tela de revisão ([08-shell.md](08-shell.md#gerenciador-de-extensões)) ou `fictor proposal approve`. Na revisão o humano PODE restringir permissões e ajustar a classificação de tools; os ajustes ficam em `overrides` no lock e o bundle não muda.
 
 Origens `git`, `mcp`, `skill` e `claude-plugin` nunca são promovidas automaticamente.
+
+Origem `builtin`: promovida automaticamente quando o hash do bundle confere com o registrado no próprio binário, porque tem a mesma confiança do binário que você instalou. As checagens bloqueantes, inclusive o smoke, continuam valendo.
 
 ### 9. Promoção
 
@@ -224,8 +225,24 @@ Origens `git`, `mcp`, `skill` e `claude-plugin` nunca são promovidas automatica
           "privileges": [],
           "tools": [ { "name": "run_tests", "description": "…", "inputSchema": {} } ],
           "tools_hash": "sha256:…",
-          "packages": [ { "ecosystem": "jsr", "name": "@std/path", "version": "1.0.8" } ],
+          "packages": [ { "ecosystem": "npm", "name": "zod", "version": "4.1.12" } ],
           "audit": null
+        }
+      }
+    }
+  },
+  "runtimes": {
+    "node": {
+      "active": "24.11.0",
+      "versions": {
+        "24.11.0": {
+          "path": "runtime/node-24.11.0",
+          "archive_sha256": "sha256:…",
+          "bin": "bin/node",
+          "bin_sha256": "sha256:…",
+          "tree_hash": "sha256:…",
+          "source": { "kind": "nodejs", "channel": "lts", "url": "https://nodejs.org/dist/v24.11.0/node-v24.11.0-linux-x64.tar.xz" },
+          "approved": { "by": "user", "at": "2026-10-18T12:00:00Z" }
         }
       }
     }
@@ -233,6 +250,7 @@ Origens `git`, `mcp`, `skill` e `claude-plugin` nunca são promovidas automatica
 }
 ```
 
+- `runtimes` segue o mesmo modelo: `active` aponta a versão em uso, e as 3 últimas ficam em `versions`. `tree_hash` usa o algoritmo do hash de bundle aplicado ao diretório extraído. As versões do exemplo são ilustrativas.
 - `source` para origens remotas inclui `url`, `ref` pedido e `sha` resolvido (ou `package` e `version`).
 - `privileges` só é editável por humano. Valor conhecido: `structured_output_trust` ([05-security.md](05-security.md#leitor-em-quarentena-fase-3)).
 

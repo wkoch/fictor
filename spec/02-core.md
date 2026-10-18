@@ -22,7 +22,7 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 
 | Variável | Valor |
 |---|---|
-| `PATH` | diretórios de `[sandbox.toolchains].path` (só com `permissions.toolchains: true`) + binários do runtime + `/usr/bin:/bin` |
+| `PATH` | diretório do runtime ativo + `/usr/bin:/bin` |
 | `HOME` | diretório temporário da instância (`${tmp}/home`) |
 | `TMPDIR` | `${tmp}` |
 | `LANG` | `C.UTF-8` |
@@ -35,7 +35,6 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 | `FICTOR_MODELS_URL` | `http://models.fictor.internal/p` se `permissions.models` não for vazio |
 | variáveis de `permissions.env` | valores estáticos do manifest |
 | variáveis de `permissions.secrets` | ver [05-security.md](05-security.md#segredos) |
-| variáveis de `[sandbox.toolchains].env` | só com `permissions.toolchains: true`, com templates expandidos |
 
 5. Montar a linha de comando do runtime ([04-extensions.md](04-extensions.md#runtimes)) e envolvê-la no bubblewrap.
 6. Conectar stdin/stdout ao cliente MCP (se `mcp: true`). Stderr vai para `logs/ext/<ext_id>.log`, com rotação a 10 MiB.
@@ -68,6 +67,57 @@ Ao promover uma versão nova:
 2. Chamadas novas vão para instâncias da versão nova, criadas sob demanda.
 3. Instâncias em `draining` encerram quando não houver chamada em andamento, ou após 30 s.
 4. O core envia `tools.changed` a todos os harnesses e `catalog.changed` ao shell.
+
+## Runtimes
+
+Os runtimes das extensões (Node LTS; uv e o Python que ele instala) são gerenciados pelo core e ficam em `$FICTOR_HOME/runtime/`. As versões são dados no lock; nenhuma versão é fixada no código do core ([ADR-032](11-decisions.md#adr-032--gerenciador-de-runtimes-e-fictor-update)).
+
+### Fontes
+
+Declaradas em `[runtimes.<nome>]` no config ([Configuração](#configuração)). Há dois tipos:
+
+| `source` | Como acha a versão | Verificação |
+|---|---|---|
+| `nodejs` | Lê `https://nodejs.org/dist/index.json` e escolhe a maior versão do canal (`channel = "lts"`). Baixa `node-v<versão>-linux-x64.tar.xz`. | sha256 do arquivo contra o `SHASUMS256.txt` da mesma versão. (Fase 3) Também a assinatura do `SHASUMS256.txt` com as chaves de release do Node. |
+| `github-release` | Última release que não é pré-release de `repo`. Baixa `asset`. | sha256 contra o arquivo `checksum` da mesma release. (Fase 3) Também a atestação Sigstore do GitHub, quando o projeto publicar. |
+
+O core baixa só dos hosts da fonte: `nodejs.org`; ou `api.github.com`, `github.com` e o host de download indicado no redirect, desde que termine em `.githubusercontent.com`. Esse download é feito pelo próprio core, fora de sandbox.
+
+### Instalação e ativação
+
+1. Baixar para `runtime/.staging/<nome>-<versão>/` e conferir o checksum. Se falhar, descartar.
+2. Extrair num sandbox sem rede com `fictor __extract`, gravando só em `runtime/.staging/`. São recusados symlinks que apontem para fora, caminhos absolutos e `..`. Formatos: `.tar.xz`, `.tar.gz` e `.zip`.
+3. Rodar `<bin> --version` no ambiente de verificação e o smoke de cada extensão ativa que usa o runtime, já com a versão candidata ([06-lifecycle.md](06-lifecycle.md#ambiente-de-verificação)).
+4. Aprovação humana, pela CLI ou pela UI confiável. A confirmação do `fictor init` vale para a primeira instalação.
+5. Mover para `runtime/<nome>-<versão>/` (somente leitura), gravar no lock (seção `runtimes`, [06-lifecycle.md](06-lifecycle.md#lock)) e trocar como no hot swap: instâncias novas usam a versão nova, e as antigas terminam o que estão fazendo.
+6. Manter as 3 últimas versões. `fictor runtime rollback <nome>` volta para a anterior.
+
+Quando instalar:
+
+- `node`: no `fictor init`, porque as extensões padrão precisam dele.
+- `uv`: quando chega a primeira proposta com `runtime.kind: python`. O uv instala o Python na etapa de dependências, em `runtime/python/`, com rede só para os hosts de download do próprio uv.
+
+Integridade: no boot, o core confere o sha256 do executável principal de cada runtime ativo contra o lock; `fictor doctor` confere a árvore inteira. Divergência desativa o runtime e gera alerta no shell.
+
+### `fictor update`
+
+1. Verificar:
+   - cada runtime de `[runtimes.<nome>]`;
+   - as extensões com origem atualizável: `builtin` cuja versão no binário mudou, `local` cujo caminho tem conteúdo novo, e `git`/`mcp` a partir da Fase 3;
+   - a release mais nova do core em `[update] core_source`, só como aviso.
+2. Preparar os candidatos: runtimes primeiro, depois extensões. As checagens das extensões rodam com os runtimes candidatos.
+3. Mostrar uma revisão única, na CLI ou na página "Atualizações" do shell, com versão atual e nova, checagens e diffs de permissão.
+4. "Aprovar tudo" (`--yes` na CLI) aplica só os itens que passaram em todas as checagens e não ampliam permissões. Os demais ficam para revisão individual.
+5. Cada aplicação vira um lote, registrado no evento `update.batch` da sessão `sys`. `fictor update rollback <batch_id>` reverte todos os itens do lote.
+6. Checagem automática conforme `[update] check`. Ela só avisa; nunca aplica.
+
+`fictor update --core` existe só na CLI:
+
+1. Baixa a release do core de `core_source` e confere o `SHA256SUMS` da release.
+2. Grava o binário novo ao lado do executável atual, renomeia o atual para `fictor.prev` e põe o novo no lugar.
+3. Você reinicia o serviço.
+
+Nenhum caminho da UI web ou de um sandbox chega a esse comando.
 
 ## Store
 
@@ -300,11 +350,20 @@ surface_port = 7351              # surfaces servidas em http://localhost:7351
 [paths]
 default_workspace = "~/Projetos"
 
-[runtimes]                       # vazio = procurar no PATH em `fictor doctor`
-deno = ""
-node = ""
-uv = ""
-python = ""
+[runtimes.node]                  # ver #runtimes; a versão instalada fica no lock
+source = "nodejs"
+channel = "lts"
+
+[runtimes.uv]
+source = "github-release"
+repo = "astral-sh/uv"
+asset = "uv-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "uv-x86_64-unknown-linux-gnu.tar.gz.sha256"
+bin = "uv-x86_64-unknown-linux-gnu/uv"
+
+[update]
+check = "weekly"                 # weekly | off; só avisa
+core_source = "github:wkoch/fictor"
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
@@ -352,14 +411,9 @@ idle_timeout_min = 30
 [sandbox]
 home_ro_files = ["~/.gitconfig"] # arquivos do HOME real montados só leitura em instâncias de sessão
 
-[sandbox.toolchains]             # só para extensões com permissions.toolchains = true
-mounts = ["~/.rustup", "~/.cargo/bin", "~/.deno"]   # somente leitura; caminho sensível é recusado
-path = ["~/.cargo/bin", "~/.deno/bin"]              # prefixados ao PATH
-env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "${workspace}/.fictor/cargo" }   # sem nomes reservados
-
 [installer]
-registries = ["jsr.io", "registry.npmjs.org", "deno.land", "pypi.org", "files.pythonhosted.org"]
-trusted_packages = ["jsr:@std/*", "npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
+registries = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
+trusted_packages = ["npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
 
 [evals]                          # Fase 2
 judge_model = "main"             # chave de [ext.harness.models]
@@ -385,8 +439,8 @@ Binário único `fictor`. Comandos que alteram estado com o servidor rodando fal
 
 | Comando | Fase | Função |
 |---|---|---|
-| `fictor init [--first-party <repo>]` | 0 | Cria `FICTOR_HOME`, config, banco, sessão `sys`; instala bundles first-party do repositório com confirmação. |
-| `fictor doctor` | 0 | Verifica bubblewrap e user namespaces, SELinux, runtimes, toolchains vistas de dentro do sandbox, keyring e portas. |
+| `fictor init` | 0 | Cria `FICTOR_HOME`, config, banco e sessão `sys`. Instala o Node LTS e as extensões padrão embutidas (origem `builtin`), com uma confirmação. |
+| `fictor doctor` | 0 | Verifica bubblewrap (versão mínima) e user namespaces, SELinux, integridade dos runtimes, keyring e portas. |
 | `fictor serve [--open] [--shell-dir <dir>]` | 0 | Sobe o core e imprime a URL de login com token único. `--shell-dir` serve assets do disco (desenvolvimento). |
 | `fictor secrets set\|list\|rm <nome>` | 0 | Gerencia segredos. `list` mostra só nomes. |
 | `fictor login` | 0 | Pede ao core em execução uma URL de login nova, com token de uso único. Útil quando o core roda como serviço systemd de usuário. |
@@ -394,9 +448,13 @@ Binário único `fictor`. Comandos que alteram estado com o servidor rodando fal
 | `fictor ext install <caminho> [--yes]` | 0 | Proposta de origem `local`; mostra permissões e pede confirmação no TTY. |
 | `fictor ext enable\|disable <id>` | 0 | Liga ou desliga no lock. |
 | `fictor ext rollback <id> [--to <key>]` | 0 | Volta para a versão anterior (ou a indicada). |
+| `fictor runtime list\|check\|update\|rollback [<nome>]` | 0 | Gerencia runtimes ([Runtimes](#runtimes)). |
+| `fictor update [--yes] [--core]` | 0 | Verifica e aplica atualizações de runtimes e extensões; `--core` troca o binário do core. |
+| `fictor update rollback <batch_id>` | 0 | Reverte um lote de atualizações. |
 | `fictor ext remove <id> [--purge-data]` | 1 | Remove do lock; store e dados ficam até `gc`/`--purge-data`. |
 | `fictor proposal list\|show\|approve\|reject <id>` | 1 | Revisão de propostas pela CLI. |
 | `fictor ext add git\|mcp\|skill\|claude-plugin <ref>` | 3 | Importação de terceiros. |
 | `fictor eval run <ext>[@<key>] [--baseline <key>]` | 2 | Roda evals. |
 | `fictor gc` | 2 | Coleta blobs e versões antigas do store (mantém as 5 últimas por extensão). |
 | `fictor __sandbox-init` | 0 | Interno: init do sandbox Linux. |
+| `fictor __extract` | 0 | Interno: extração de arquivos de runtime dentro de sandbox. |

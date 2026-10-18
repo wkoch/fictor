@@ -7,8 +7,8 @@ Uma extensão é um bundle (diretório) com um manifest `fictor.yaml` na raiz. E
 ```text
 <bundle>/
 ├── fictor.yaml          manifest (obrigatório)
-├── server.ts            entry do runtime (nome livre, definido em runtime.entry)
-├── deno.json, deno.lock vendor/, node_modules/   dependências vendorizadas na quarentena
+├── dist/server.mjs      entry do runtime (nome livre, definido em runtime.entry); um único arquivo empacotado, ou
+├── package.json, package-lock.json   dependências resolvidas na quarentena (node_modules/)
 ├── skills/<nome>/SKILL.md
 ├── prompts/*.md         prompts de comandos
 ├── ui/*.html            resources ui:// servidos como surfaces
@@ -32,8 +32,8 @@ description: Roda a suíte de testes após edições e mostra o status num paine
 role: extension                 # extension | harness
 scope: session                  # global | session
 runtime:
-  kind: deno                    # deno | node | python | binary | remote | none
-  entry: server.ts
+  kind: node                    # node | python | binary | remote | none
+  entry: dist/server.mjs
   args: []
 mcp: true                       # o processo fala MCP no stdio
 
@@ -86,7 +86,7 @@ permissions:
 
 isolation: os                   # os | container (Fase 3) | vm (Fase 4)
 tests:
-  command: ["deno", "test", "--allow-read"]
+  command: ["node", "--test", "tests/"]
 evals: evals
 ```
 
@@ -122,7 +122,7 @@ Regras bloqueantes na validação (etapa 2 do pipeline); o schema cobre as estru
 |---|---|---|
 | `runtime.kind: none` | `mcp: false` (ou ausente) | `role: harness`, `kernel`, `hooks`, `surfaces`, `tools`, `permissions`. Permite só `skills`, `commands`, `tests`, `evals`. |
 | `runtime.kind: remote` (Fase 3) | `mcp: true` (ou ausente), `scope: global` | `role: harness`, `kernel`, `hooks`, `permissions` (o core deriva a rede do host de `runtime.url`), `isolation` diferente de `os` |
-| `role: harness` | runtime com processo (`deno`, `node`, `python`, `binary`), `scope: session`, `mcp: false` | `hooks`, `surfaces`, `tools` |
+| `role: harness` | runtime com processo (`node`, `python`, `binary`), `scope: session`, `mcp: false` | `hooks`, `surfaces`, `tools` |
 | Runtime com processo e `mcp: false` | `kernel` com pelo menos um escopo | `hooks`, `surfaces`, `tools` |
 | `scope: global` com runtime com processo | Fase 1 ou posterior. Na Fase 0, o instalador recusa com motivo `phase:global`, porque a marca d'água ainda não existe | — |
 
@@ -132,27 +132,23 @@ Regras bloqueantes na validação (etapa 2 do pipeline); o schema cobre as estru
 
 | `kind` | Execução | Dependências (resolvidas na quarentena) |
 |---|---|---|
-| `deno` | `deno run --cached-only --no-prompt <flags> <entry> <args>` | `deno install` com `"vendor": true` e `"nodeModulesDir": "auto"` no `deno.json`. `DENO_DIR=${tmp}/deno`. |
-| `node` | `node <entry> <args>` | `npm ci --ignore-scripts` com lockfile. Sem lockfile, a proposta falha. |
-| `python` | `python <entry> <args>` com `PYTHONPATH=<bundle>/.pydeps` | `uv pip install --target .pydeps -r requirements.lock` (ou export do `uv.lock`). |
+| `node` | `node --permission <flags> <entry> <args>`. Entry `.mjs`, `.cjs`, `.js` ou `.ts` (o Node remove os tipos; só sintaxe que pode ser apagada) | Nenhuma, se o entry já é um arquivo empacotado (como as extensões padrão, feitas com `vp pack`). Senão, `npm ci --ignore-scripts` com `package-lock.json` obrigatório. |
+| `python` | `python <entry> <args>` com `PYTHONPATH=<bundle>/.pydeps`; o Python é instalado pelo uv do gerenciador de runtimes | `uv pip install --target .pydeps -r requirements.lock` (ou export do `uv.lock`). |
 | `binary` | `<bundle>/<entry> <args>` | Binário incluído no bundle; hash fixado como qualquer arquivo. |
 | `remote` | Sem processo local. O gateway conecta via HTTP streamable do MCP à `runtime.url`, através do egress proxy (Fase 3). | — |
 | `none` | Sem processo. Bundle só de skills e comandos. | — |
 
-Flags do Deno derivadas das permissões (o sandbox do SO continua sendo a fronteira principal):
+Flags do modelo de permissões do Node derivadas do manifest. É defesa em profundidade; a fronteira principal continua sendo o sandbox do SO e o egress proxy.
 
 | Permissão | Flag |
 |---|---|
-| `fs.read` | `--allow-read=<bundle>,<caminhos expandidos>` (+ montagens de toolchains, se `toolchains: true`) |
-| `fs.write` | `--allow-write=<caminhos expandidos>,${tmp}` |
-| `net.allow` ou `models` não vazios, ou escopos de kernel | `--allow-net=<hosts>` (inclui `models.fictor.internal` se `models` não vazio e `127.0.0.1:3129` se houver kernel) |
-| `spawn: true` | `--allow-run` |
-| env | `--allow-env` (o ambiente já é construído pelo core) |
-| sempre | sem `--allow-ffi`, sem `--allow-sys` |
+| sempre | `--permission`; nunca `--allow-addons` nem `--allow-wasi` |
+| `fs.read` | um `--allow-fs-read=<caminho>` por caminho: bundle, runtime e caminhos expandidos |
+| `fs.write` | um `--allow-fs-write=<caminho>` por caminho: caminhos expandidos e `${tmp}` |
+| `spawn: true` | `--allow-child-process` e `--allow-worker` |
+| `net.allow` ou `models` não vazios, ou escopos de kernel | `--allow-net`, nas versões em que o modelo de permissões restringe a rede. O destino continua sendo filtrado pelo proxy. |
 
-Verificar na versão do Deno usada se o acesso via `HTTP_PROXY` também exige `--allow-net` para o endereço do proxy; se exigir, o supervisor inclui `127.0.0.1:<porta do proxy>`.
-
-O binário de cada runtime vem de `[runtimes]` no config ou do PATH, e seu diretório de instalação é montado só leitura no sandbox. Em runtime nenhuma extensão baixa código (invariante I7).
+O executável de cada runtime vem do gerenciador de runtimes ([02-core.md](02-core.md#runtimes)). O diretório da versão ativa é montado só leitura no sandbox. Em runtime nenhuma extensão baixa código (invariante I7).
 
 ## Escopo e templates de caminho
 
@@ -183,7 +179,6 @@ Regras de validação por escopo (bloqueantes no pipeline):
 | `spawn` | bool | Pode criar subprocessos (dentro do mesmo sandbox). |
 | `secrets` | `{name, env}[]` | Segredo injetado como variável de ambiente. Ver [05-security.md](05-security.md#segredos). |
 | `env` | mapa | Variáveis estáticas. Não podem usar nomes reservados. |
-| `toolchains` | bool | Recebe as montagens, o `PATH` e as variáveis de `[sandbox.toolchains]` do config ([02-core.md](02-core.md#configuração)). Exige `scope: session`. Nunca entra no perfil dev. |
 
 ### Variáveis de ambiente reservadas
 
@@ -282,7 +277,7 @@ Formato Agent Skills sem alterações: `skills/<nome>/SKILL.md` com frontmatter 
 
 ## SDK `@fictor/sdk`
 
-Pacote TypeScript para Deno que esconde MCP e Kernel Protocol. Usa o SDK oficial de MCP em TypeScript para o servidor.
+Pacote TypeScript para Node que esconde MCP e Kernel Protocol. Usa o SDK oficial de MCP em TypeScript para o servidor. Usa só APIs web padrão e módulos `node:`, sem APIs exclusivas de um runtime.
 
 ```ts
 import { defineExtension, z } from "@fictor/sdk";
@@ -320,7 +315,7 @@ Responsabilidades do SDK:
 - `ctx.exec`: subprocesso com timeout e truncamento de saída.
 - Validar que hooks implementados batem com `hooks` do manifest na inicialização.
 
-O SDK é dependência vendorizada de cada bundle, não uma API do core.
+O SDK não é uma API do core. Ele entra em cada bundle de duas formas: embutido pelo `vp pack` no arquivo empacotado (extensões padrão), ou como dependência resolvida na quarentena. Neste caso, o instalador usa a cópia de `@fictor/sdk` embutida no binário, sem baixar do npm, e ela conta como pacote confiável.
 
 ## Importação de formatos externos (Fase 3)
 

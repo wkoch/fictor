@@ -10,6 +10,7 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-002 — Extensões fora do processo; sem JS ou WASM embutido
 
+- **Status:** o runtime padrão passou a ser o Node LTS pelo [ADR-033](#adr-033--node-lts-no-lugar-do-deno). O restante vale.
 - **Contexto.** Um interpretador embutido (QuickJS) obriga o core a expor cada capacidade que as extensões precisam (fetch, sqlite, websockets, SDKs). O core cresceria a cada funcionalidade. Gerar WASM exige toolchains pesadas e os modelos escrevem WIT mal.
 - **Decisão.** Cada extensão é um processo separado, em qualquer linguagem, falando protocolos. TypeScript em Deno é o default para extensões first-party e geradas pela IA.
 - **Consequências.** Extensões usam npm, JSR e PyPI livremente. Crash isolado por processo. Custo de IPC na ordem de 1 ms por chamada, irrelevante perto do modelo. Depende de Deno instalado (~100 MB).
@@ -209,6 +210,7 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-030 — Só Linux x86-64; alvo atual Fedora COSMIC Atomic
 
+- **Status:** a menção a pacotes sobrepostos com `rpm-ostree` foi revogada pelo [ADR-034](#adr-034--desenvolvimento-em-toolbx-vite-como-ferramenta-de-desenvolvimento) e pelo requisito R8. O restante vale.
 - **Contexto.** O Fictor é pessoal e roda na máquina do usuário, um desktop Fedora COSMIC Atomic x86-64. Uma única plataforma mantém um único backend de sandbox e um único conjunto de testes.
 - **Decisão.**
   - Plataforma suportada: Linux x86-64. Alvo validado e único gate: Fedora COSMIC Atomic, na versão estável corrente, na máquina do usuário. Outras distros Linux x86-64 podem funcionar, mas não são testadas nem bloqueiam release.
@@ -219,6 +221,7 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
 
 ## ADR-031 — v0.1 autossuficiente e fluxo de desenvolvimento
 
+- **Status:** as toolchains no sandbox foram substituídas pelo ambiente toolbx do [ADR-034](#adr-034--desenvolvimento-em-toolbx-vite-como-ferramenta-de-desenvolvimento). O restante vale.
 - **Contexto.** O usuário quer chegar o mais cedo possível a uma versão que permita continuar desenvolvendo o Fictor de dentro do próprio Fictor.
 - **Decisão.**
   - **v0.1 = marco de autossuficiência.** Fase 0 completa, mais compactação no harness (antecipada da Fase 1), toolchains de desenvolvimento no sandbox, guarda de migração com backup e separação entre a instância de uso e as builds de teste ([10-roadmap.md](10-roadmap.md#marco-de-autossuficiência-v01)).
@@ -226,3 +229,40 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
   - **O core não se substitui.** O Fictor compila builds novas do próprio core dentro do workspace. Instalar o binário e reiniciar o serviço é ação do usuário, fora do Fictor; nenhum sandbox tem escrita em `~/.local/bin`. Builds de teste usam `FICTOR_HOME` temporário.
   - **Push fica com o usuário.** O agente faz commits locais. `git push` acontece fora do Fictor, depois da revisão. Nenhuma credencial de git ou SSH entra no sandbox.
 - **Consequências.** O caminho até usar o Fictor no dia a dia fica curto e explícito. A partir da v0.1, o Fictor desenvolve o Fictor, com o usuário controlando instalação, push e migrações.
+
+## ADR-032 — Gerenciador de runtimes e `fictor update`
+
+- **Contexto.** A instalação de uso precisa funcionar num Fedora COSMIC Atomic limpo, baixando só o binário (R8). Versões novas dos runtimes não podem exigir build nova do core.
+- **Decisão.**
+  - O core sabe instalar, verificar, ativar e reverter runtimes. As versões são dados no lock (seção `runtimes`), não código ([02-core.md](02-core.md#runtimes)).
+  - As fontes ficam no config, em `[runtimes.<nome>]`, com dois tipos: `nodejs` (índice oficial do nodejs.org, canal `lts`, `SHASUMS256.txt`) e `github-release` (asset mais arquivo de checksum da mesma release).
+  - O core baixa só dos hosts da fonte. A extração roda num sandbox sem rede (`fictor __extract`). Antes de ativar, o smoke das extensões ativas roda com a versão candidata. Toda ativação exige aprovação humana, as 3 últimas versões ficam guardadas e há rollback.
+  - `fictor init` instala o Node LTS. O uv só é instalado quando a primeira extensão `python` aparece.
+  - `fictor update` verifica runtimes, extensões e releases novas do core:
+    - "Aprovar tudo" cobre só itens sem falhas e sem ampliação de permissão;
+    - cada aplicação vira um lote, registrado no evento `update.batch`, com rollback do lote inteiro;
+    - `fictor update --core`, só pela CLI, troca o binário em `~/.local/bin` e guarda o anterior.
+  - As extensões padrão viajam dentro do binário como origem `builtin` ([06-lifecycle.md](06-lifecycle.md#origens)).
+- **Consequências.** Instalar é baixar um binário. Atualizar Node ou uv não toca o core. Em troca, confia-se no que o upstream publica no momento da atualização; checksum, smoke, aprovação e rollback mitigam esse risco.
+
+## ADR-033 — Node LTS no lugar do Deno
+
+- **Contexto.** A Cloudflare comprou a Deno Land em outubro de 2026. Segundo o que foi divulgado, o desenvolvimento oficial do runtime termina em cerca de um ano. Nenhuma extensão tinha sido escrita ainda.
+- **Decisão.**
+  - O runtime `deno` sai. `node`, na versão LTS do gerenciador de runtimes, é o runtime JavaScript.
+  - O modelo de permissões do Node (`--permission` com `--allow-fs-read`, `--allow-fs-write`, `--allow-child-process`, `--allow-worker`, `--allow-net`) é a defesa em profundidade. Addons nativos e WASI nunca são liberados.
+  - O código first-party usa só APIs web padrão e módulos `node:`, para continuar portável.
+  - As extensões padrão são distribuídas como um único `.mjs` empacotado.
+- **Consequências.** Pacotes npm e servidores MCP de terceiros rodam nativamente. Perde-se a allowlist de rede por host do Deno; o egress proxy continua aplicando a allowlist. Pacotes com addons nativos só rodam no tier `container`.
+
+## ADR-034 — Desenvolvimento em toolbx; Vite+ como ferramenta de desenvolvimento
+
+- **Contexto.** A base imutável não pode receber pacotes sobrepostos (R8). Desenvolver o Fictor exige Rust, compilador C, git, Node e ferramentas de TypeScript. O `[sandbox.toolchains]` existia só para levar essas ferramentas ao sandbox do host.
+- **Decisão.**
+  - O ambiente de desenvolvimento é um container toolbx definido em `dev/Containerfile`. Ele parte da imagem `fedora-toolbox` da versão alvo e instala, via `dnf`, `rust`, `cargo`, `clippy`, `rustfmt`, `gcc`, `git`, `nodejs`, `npm` e `bubblewrap`. O Fictor não automatiza nada disso.
+  - O Vite+ é dependência npm de desenvolvimento do repositório, com `vp check`, `vp test`, `vp build`, `vp pack` e `vp run`. O `vp env` não é usado: o Node vem do container.
+  - As extensões padrão são empacotadas com `vp pack` num único `.mjs` e embutidas no binário durante a build.
+  - Para a autossuficiência, uma instância de desenvolvimento roda dentro do toolbx, com `FICTOR_HOME=~/.local/share/fictor-dev` e portas 7360/7361. Os sandboxes dela montam o `/usr` do container.
+  - `[sandbox.toolchains]` e `permissions.toolchains` saem. Variáveis de projeto para os comandos (como `CARGO_HOME`) vêm de `<workspace>/.fictor/env`, aplicado por `fs-tools` e `shell-net`.
+  - Ferramentas para outros projetos na instalação de uso ficam para a Fase 3, com o tier `container` usando uma imagem por workspace.
+- **Consequências.** O host fica limpo, e as ferramentas de desenvolvimento ficam num único lugar. O bubblewrap dentro do toolbx precisa funcionar; isso vira critério de aceitação. Plano de saída do Vite+: chamar Vite, Vitest, Oxlint, Oxfmt e tsdown diretamente.
