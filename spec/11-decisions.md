@@ -378,3 +378,13 @@ base novas, nem antecipa origens externas da Fase 3. Sem migração.
 - **Consequências.** Uma linha significa configuração registrada, nunca “processo saudável”. Um home que precisa de migração ou reconciliação exige primeiro um comando autorizado a fazê-las. O método administrativo não altera o homônimo WebSocket nem define seus dados de recuperação para o gerenciador da Fase 0/M0.7.
 
 Contrato normativo em [02-core.md](02-core.md#listagem-de-extensões); critérios 47–50 da Fase 0.
+
+## ADR-042 — Origem protegida dos arquivos de controle (resolve ARQ-026)
+
+- **Data:** 2026-10-18.
+- **Contexto.** config.get classifica configuração e instruções globais como trusted/public porque são entradas do usuário. Symlink ou hardlink para um arquivo gravável por extensão permite mudar essa entrada fora da mediação de I11; ser apenas um arquivo regular não estabelece essa fronteira.
+- **Decisão.** config.toml e AGENTS.md globais são nomes diretos no FICTOR_HOME canônico e privado. O core não segue links nem atravessa montagens entre o descritor ancorado desse home e esses arquivos. Exige arquivo regular, UID do usuário, um único link e permissões sem execução ou escrita por grupo/outros. A leitura e a validação usam o mesmo descritor, com nova validação a cada releitura. O sandbox também recusa grants que exponham a árvore privada do home por aliases de montagem, inclusive submounts; nomes ausentes continuam protegidos pelo diretório pai.
+- **Legado.** Fonte insegura falha com diagnóstico; não copiar, desvincular, chmod, chown ou substituir automaticamente. A correção explícita do usuário usa conteúdo revisado em um inode novo dentro do home. Não se promove automaticamente conteúdo de workspace/ext_data a instrução global confiável.
+- **Consequências.** Mantém I11 sem listas dinâmicas de destinos de symlinks, mudanças de flags/proveniência ou permissões adicionais. Alias de caminho para o próprio home continua permitido após canonicalização e fixação de identidade. Não há migração, novo formato persistido ou método de protocolo.
+
+Contrato normativo em [02-core.md](02-core.md#arquivos-de-controle-do-core), erros em [03-kernel-protocol.md](03-kernel-protocol.md#configuração) e proteção de aliases em [05-security.md](05-security.md#origem-protegida-dos-arquivos-de-controle). Critérios 51–56 da Fase 0.

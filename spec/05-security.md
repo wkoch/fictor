@@ -66,6 +66,12 @@ Regras comuns:
 - Não existe rede direta. Só o proxy.
 - O ambiente é construído do zero ([02-core.md](02-core.md#spawn)).
 
+### Origem protegida dos arquivos de controle
+
+A proibição de expor a árvore privada de `FICTOR_HOME` vale também para aliases por bind mount e sobreposições de montagem, não só para prefixos textuais ou symlinks canonicalizados. A validação de cada perfil deve considerar identidade e ancestralidade de suas fontes/montagens, incluindo submounts que seriam incorporados por um grant de diretório. Se o grant expuser por alias a raiz privada ou um arquivo de controle, recusar o grant inteiro e o spawn; não reescrever o grant, ocultar um submount silenciosamente nem conceder outro caminho. Quando não for possível estabelecer essa separação, recusar o perfil. Isso conserva as exceções já explícitas de bundle, ext_data e sockets próprios; elas não abrangem os arquivos de controle nem permitem expor sua raiz privada. A identidade da raiz protege também `config.toml`/`AGENTS.md` ainda ausentes: a criação futura não pode tornar acessível um novo controle a um sandbox existente.
+
+Nenhuma nova lista de destinos de symlinks é criada. A política recusa os links dos arquivos de controle conforme [02-core.md](02-core.md#arquivos-de-controle-do-core); não adiciona seus alvos ao perfil. `FICTOR_HOME` e workspaces continuam sujeitos às restrições de sobreposição existentes, considerando a identidade fixada do home, não apenas a grafia do caminho. A topologia de [mountinfo](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html) permite distinguir raízes e ancestrais de bind mounts; a estratégia interna permanece responsabilidade do implementador.
+
 ### Linux (bubblewrap)
 
 O supervisor executa `bwrap` com ambiente vazio. Estrutura dos argumentos (ajustar por teste no Fedora COSMIC Atomic):
@@ -163,7 +169,7 @@ Invariante I11. O harness, e portanto o modelo, só recebe dados por canais medi
 | `events.*` | Só a linhagem da própria sessão, cujas flags já estão no head. |
 | `kv`, `${ext_data}` | Por sessão (`ext_id@session_id`, `data/<id>/sessions/<session_id>`). Não formam canal entre sessões. |
 | `blobs.get` | Ler exige conhecer o hash, que só chega por um dos canais acima. |
-| `config.get` | Escrita pelo usuário: trusted, public. |
+| `config.get` | Somente dados de arquivos de controle aprovados pelas verificações de [origem protegida](02-core.md#arquivos-de-controle-do-core), ou snapshots já validados na inicialização: trusted, public. Fonte insegura falha; não se reclassifica nem é seguida para fora do home. |
 | Arquivos | Só `${store}`, `${ext_root}`, `${ext_data}` e `${tmp}` ([04-extensions.md](04-extensions.md#escopo-e-templates-de-caminho)). Bundles no store foram aprovados: trusted, public. |
 
 Extensões de sessão com `${workspace}` (como `fs-tools`) leem o workspace diretamente, mas só entregam dados ao harness como `tool.result`, com a classificação efetiva aprovada e as regras de proveniência do core.

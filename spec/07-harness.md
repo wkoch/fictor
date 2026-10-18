@@ -78,7 +78,7 @@ type HMessage =
 1. **System prompt**, nesta ordem:
    1. `prompts/system.md` do bundle;
    2. bloco de ambiente: data e hora local, SO, workspace, modo da sessão, modelo;
-   3. instruções globais (`config.get({section: "instructions"})`, conteúdo de `$FICTOR_HOME/AGENTS.md`);
+   3. instruções globais (`config.get({section: "instructions"})`, conteúdo de `$FICTOR_HOME/AGENTS.md`), pela [origem protegida](02-core.md#arquivos-de-controle-do-core) do ADR-042. Somente ausência real é opcional; erro dessa leitura não autoriza buscar um alvo externo por tools nem tratá-lo como instrução global confiável;
    4. `AGENTS.md` da raiz do workspace, se existir. O harness o lê com `tools.call` de `fs-tools__read_file` (`call_id` com prefixo `harness:agents-md:`) no primeiro turno de cada processo, sem passar pelo modelo. O resultado é um `tool.result` comum: a política se aplica e as flags acendem (P sempre; U se o workspace for `untrusted` ou estiver com a flag U). Na montagem, o harness usa o resultado mais recente desse tipo no caminho. Sem `fs-tools` ativo, o passo é pulado;
    5. índice de skills: uma linha `- <name>: <description>` por skill de `catalog.list`, com a instrução de usar `load_skill`;
    6. textos `system_append` do hook `session.start` (calculados uma vez por processo);

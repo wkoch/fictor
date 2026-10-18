@@ -300,6 +300,19 @@ result:
   | { instructions: string | null }                         // conteúdo de $FICTOR_HOME/AGENTS.md
 ```
 
+As fontes de `ext` e `instructions` seguem [Arquivos de controle do core](02-core.md#arquivos-de-controle-do-core), revalidadas a cada chamada. `providers` continua usando o snapshot validado no boot; não relê o arquivo para essa resposta. Apenas ausência da entrada final `AGENTS.md` sob o home válido retorna `instructions: null`; arquivo vazio retorna `instructions: ""`. Link pendente não significa ausência. `config.toml` ausente falha. Strings de caminhos/URLs nos valores opacos de `ext` são dados e não autorizam leituras adicionais.
+
+Falhas dessas fontes usam JSON-RPC `-32603` (`INTERNAL_ERROR`), com `error.data.reason` definido abaixo. Não há resultado parcial, fallback para conteúdo antigo/default, conversão de erro em `null` ou retry automático. Um limite excedido mantém `-32010` (`TOO_LARGE`), conforme os tetos já definidos.
+
+| `error.data.reason` | Condição |
+|---|---|
+| `control_file:unsafe` | Origem/tipo/UID/modos/links ou montagem recusados pelas verificações de segurança. |
+| `control_file:changed` | Mudança de metadados observada entre as validações da leitura. |
+| `control_file:unreadable` | Falha de abertura/leitura sem violação de segurança identificada, inclusive `config.toml` ausente. |
+| `control_file:invalid` | Conteúdo lido não é UTF-8 válido ou, para `config.toml`, TOML válido. |
+
+Diagnósticos de CLI/boot e erros de protocolo identificam apenas o nome lógico `config.toml`/`AGENTS.md` e o código da falha; não incluem conteúdo bruto, segredos ou caminhos externos/alvos de links. A seção `config` e os formatos de sucesso permanecem iguais.
+
 ### Aprovação customizada
 
 ```ts

@@ -133,6 +133,8 @@ $FICTOR_HOME/
 
 Nenhum caminho de `FICTOR_HOME` é montado em sandbox, exceto: o bundle da própria extensão (`store/...`, leitura), o `${ext_data}` da instância (escrita) e os sockets da própria instância. O harness também lê `store/` inteiro. Registros de instância e a árvore auxiliar de preparação não são montados; o `/tmp` do sandbox continua privado. Recuperação e descarte seguem [02-core.md](02-core.md#confirmação-e-recuperação-no-boot).
 
+`config.toml` e o `AGENTS.md` global são arquivos regulares diretamente no home privado, sem links nem montagens intermediárias. Carga, releituras e aliases do próprio home seguem [Arquivos de controle do core](02-core.md#arquivos-de-controle-do-core) (ADR-042); não recebem grants para extensões.
+
 ## Stack
 
 | Parte | Escolha | Observação |

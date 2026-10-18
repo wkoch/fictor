@@ -166,3 +166,33 @@ Diagnóstico no Toolbx `fictor-dev`, Fedora Linux 44/SQLite 3.51.2, sobre Bazzit
   `git diff --check`. Nenhuma migração histórica foi alterada.
 - Critérios 47–50 devem virar testes do produto. Nenhuma suíte do core ou teste
   de aceitação ponta a ponta foi executado nesta revisão.
+
+## Verificação arquitetural do ADR-042 — 2026-10-18
+
+Base: `99989273af5949b0544a8122ca281488795bfe80`, em worktree isolado da main.
+Diagnóstico no Toolbx `fictor-dev`, Fedora Linux 44, kernel
+`7.2.9-ogc3.1.fc44.x86_64`, sobre Bazzite `44.20261012.0` (Kinoite);
+não é gate COSMIC nem CI. Todos os arquivos do experimento eram descartáveis em `/tmp`.
+
+- `openat2` com resolução BENEATH/NO_SYMLINKS/NO_XDEV e O_PATH/NOFOLLOW
+  permitiu inspecionar arquivos regulares e recusou escape/intermediários inválidos.
+  Symlink final, inclusive pendente, retornou FD do próprio link: a validação de
+  tipo o recusou. Portanto não se pode depender somente de ELOOP.
+- FIFO foi inspecionado sem bloqueio e recusado por tipo; hardlink foi recusado
+  pelo número de links. Modos com escrita por terceiros, execução/bits especiais
+  e ausência de leitura pelo dono falharam. A checagem de UID foi exercitada
+  comparando fstat real a um UID esperado diferente, sem chown.
+- Retargeting do alias do home não desviou o descritor ancorado. Rename sobre um
+  controle preservou o inode do FD antigo, mas mudou nlink de 1 para 0 e os
+  metadados observados, justificando o erro `changed` antes da devolução.
+- Em namespaces novos de usuário e montagem, com identidade de namespace
+  conferida antes das operações, bind mount de arquivo no mesmo dispositivo
+  recebeu EXDEV. Bind do próprio diretório como raiz preservou dev/ino e
+  permitiu abrir seu arquivo regular relativo. Nenhuma montagem ocorreu no host.
+- Revisão independente não encontrou bloqueadores na interação com ADR-038,
+  abertura/validação do mesmo objeto, erros, aliases e critérios 51–56.
+- Conferidos 168 links/âncoras locais, 56 critérios consecutivos e
+  `git diff --check`. Nenhum arquivo do produto ou migração foi alterado.
+- Experimentos verificam primitivas Linux, não os critérios do produto. Não
+  foram executadas suítes do core nem aceitação ponta a ponta; implementação,
+  testes de corridas/adversários entre sessões e gate de release permanecem pendentes.

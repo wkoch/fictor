@@ -2,6 +2,14 @@
 
 Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
 
+## ARQ-026 — Destinos de links dos arquivos de controle do core
+
+- **Status: resolvida em 2026-10-18 — [ADR-042](../spec/11-decisions.md#adr-042--origem-protegida-dos-arquivos-de-controle-resolve-arq-026).**
+- **Referência:** I11, origem de `config.get`, perfil de sandbox e arquivos globais `config.toml`/`AGENTS.md`.
+- **Dúvida resolvida:** links para workspace/ext_data permitiam modificar conteúdo entregue a outra sessão como trusted/public; exigir somente alvo regular não comprovava origem protegida.
+- **Resolução:** nomes diretos no home privado ancorado, sem symlinks/hardlinks ou montagens intermediárias; validar objeto, UID, modos e estabilidade a cada leitura. Recusar grants que exponham aliases da árvore privada, inclusive antes da criação dos controles. Falhas não viram cache, defaults ou ausência; legado exige revisão humana e inode novo, sem reparo automático.
+- **Entrega ao implementador:** aplicar o mesmo contrato no boot, init e config.get; proteger aliases na construção do perfil e implementar os erros e critérios 51–56. Nenhum código do implementador foi incorporado nesta resolução; testes do produto e gate permanecem pendentes.
+
 ## ARQ-025 — Disponibilidade e estado de `fictor ext list`
 
 - **Status: resolvida em 2026-10-18 — [ADR-041](../spec/11-decisions.md).**
