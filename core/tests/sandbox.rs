@@ -175,3 +175,127 @@ fn sandbox_init_is_hidden_and_refuses_host_execution() {
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("HOME não definido"));
 }
+
+mod receipt_mount_cleanup {
+    use fictor::{
+        installer::{
+            lease::InstallerLease,
+            recovery::{self, DiagnosticCode},
+        },
+        store::{NewProposal, ProposalState as State, Store},
+    };
+    use serde_json::json;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::Arc,
+    };
+    async fn fixture() -> (tempfile::TempDir, Arc<Store>) {
+        let home = tempfile::Builder::new()
+            .prefix("fx-mount-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fictor::home::prepare(home.path()).unwrap();
+        let store = Arc::new(Store::open(home.path()).await.unwrap());
+        (home, store)
+    }
+    async fn begin(store: &Store) -> String {
+        store
+            .begin_attempt(NewProposal {
+                source: json!({"kind":"local"}),
+                tainted: false,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+    fn receipt(home: &Path, id: &str) -> PathBuf {
+        home.join("extensions/quarantine")
+            .join(format!(".receipt-{id}"))
+    }
+    async fn recover(
+        home: &Path,
+        store: Arc<Store>,
+    ) -> Result<recovery::RecoveryReport, recovery::RecoveryError> {
+        let lease = Arc::new(InstallerLease::acquire(home).unwrap());
+        recovery::recover(home, store, lease).await
+    }
+    #[test]
+    fn cleanup_stops_at_bind_mounts_even_on_the_same_filesystem() {
+        let status = Command::new("/usr/bin/unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "receipt_mount_cleanup::bind_mount_subprocess",
+                "--nocapture",
+            ])
+            .env("FICTOR_TEST_RECOVERY_MOUNT", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn bind_mount_subprocess() {
+        if std::env::var_os("FICTOR_TEST_RECOVERY_MOUNT").is_none() {
+            return;
+        }
+        let (home, store) = fixture().await;
+        let id = begin(&store).await;
+        let temporary = receipt(home.path(), &id);
+        let mountpoint = temporary.join("mounted");
+        fs::create_dir_all(&mountpoint).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::write(external.path().join("keep"), "mounted external bytes").unwrap();
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let source = CString::new(external.path().as_os_str().as_bytes()).unwrap();
+        let destination = CString::new(mountpoint.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this opt-in subprocess owns a private mount/user namespace and
+        // both NUL-terminated paths point to its disposable fixture directories.
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let report = recover(home.path(), store.clone()).await.unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code == DiagnosticCode::CleanupFailed)
+        );
+        assert_eq!(store.proposal(id).await.unwrap().state, State::Failed);
+        assert_eq!(
+            fs::read_to_string(external.path().join("keep")).unwrap(),
+            "mounted external bytes"
+        );
+        // SAFETY: destination identifies exactly the private bind mount above.
+        assert_eq!(
+            unsafe { libc::umount2(destination.as_ptr(), libc::MNT_DETACH) },
+            0
+        );
+        assert!(
+            recover(home.path(), store)
+                .await
+                .unwrap()
+                .diagnostics
+                .is_empty()
+        );
+        assert!(!temporary.exists());
+    }
+}

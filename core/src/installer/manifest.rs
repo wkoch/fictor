@@ -10,8 +10,10 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    mem::MaybeUninit,
     sync::OnceLock,
 };
+use unsafe_libyaml as unsafe_yaml;
 
 const SCHEMA: &str = include_str!("../../../spec/schemas/extension.schema.json");
 // The local-receipt per-file ceiling is already fixed by ADR-024. Valid manifest
@@ -290,6 +292,7 @@ impl Manifest {
         if text.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestError::Limit);
         }
+        reject_explicit_yaml_tags(text)?;
         let budget = ParseBudget {
             nodes: Cell::new(text.len().saturating_mul(2).max(1)),
             bytes: Cell::new(MAX_MANIFEST_BYTES),
@@ -607,6 +610,76 @@ pub fn valid_environment_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
         && !PREFIXES.iter().any(|prefix| name.starts_with(prefix))
         && !RESERVED.contains(&name)
+}
+
+/// serde_yaml_ng erases some explicit global/standard tags during deserialize_any.
+/// Inspect libyaml tokens first so every explicit tag is rejected, while tag-like
+/// text in quoted, plain and block scalars keeps its literal meaning.
+fn reject_explicit_yaml_tags(text: &str) -> Result<(), ManifestError> {
+    let mut scanner = YamlScanner::new(text)?;
+    loop {
+        match scanner.next()? {
+            unsafe_yaml::YAML_TAG_TOKEN | unsafe_yaml::YAML_TAG_DIRECTIVE_TOKEN => {
+                return Err(ManifestError::Parse);
+            }
+            unsafe_yaml::YAML_STREAM_END_TOKEN => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+struct YamlScanner<'a> {
+    // set_input_string stores a self-pointer; the initialized parser must remain
+    // at one heap address until yaml_parser_delete. Moving this Box is safe.
+    parser: Box<MaybeUninit<unsafe_yaml::yaml_parser_t>>,
+    _input: &'a str,
+}
+impl<'a> YamlScanner<'a> {
+    fn new(input: &'a str) -> Result<Self, ManifestError> {
+        let mut parser = Box::new(MaybeUninit::uninit());
+        // SAFETY: Box provides aligned writable storage at a stable address.
+        if unsafe { unsafe_yaml::yaml_parser_initialize(parser.as_mut_ptr()) }.fail {
+            return Err(ManifestError::Parse);
+        }
+        let mut scanner = Self {
+            parser,
+            _input: input,
+        };
+        // SAFETY: initialization succeeded, the parser stays pinned in its Box,
+        // and _input keeps the immutable UTF-8 byte slice alive through deletion.
+        unsafe {
+            unsafe_yaml::yaml_parser_set_input_string(
+                scanner.parser.as_mut_ptr(),
+                input.as_ptr(),
+                input.len() as u64,
+            );
+        }
+        Ok(scanner)
+    }
+
+    fn next(&mut self) -> Result<unsafe_yaml::yaml_token_type_t, ManifestError> {
+        let mut token = MaybeUninit::uninit();
+        // SAFETY: the parser is initialized, has live input and exclusive access;
+        // the token pointer provides aligned writable storage for this scan.
+        if unsafe { unsafe_yaml::yaml_parser_scan(self.parser.as_mut_ptr(), token.as_mut_ptr()) }
+            .fail
+        {
+            return Err(ManifestError::Parse);
+        }
+        // SAFETY: a successful scan initialized the complete token. Extract its
+        // Copy discriminant and free all token-owned allocations exactly once.
+        let mut token = unsafe { token.assume_init() };
+        let kind = token.type_;
+        unsafe { unsafe_yaml::yaml_token_delete(&mut token) };
+        Ok(kind)
+    }
+}
+impl Drop for YamlScanner<'_> {
+    fn drop(&mut self) {
+        // SAFETY: only successful initialization constructs Self; parser storage
+        // and borrowed input are still live, and this is its sole deletion.
+        unsafe { unsafe_yaml::yaml_parser_delete(self.parser.as_mut_ptr()) };
+    }
 }
 
 struct ParseBudget {

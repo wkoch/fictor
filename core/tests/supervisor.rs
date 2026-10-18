@@ -451,11 +451,12 @@ async fn smoke_uses_fake_credentials_disposable_kernel_state_and_no_real_data() 
         r#"case "$API_TOKEN" in fictor_honey_*) ;; *) exit 91 ;; esac
 [ -z "${FICTOR_MODELS_URL-}" ] || exit 92
 [ ! -e "$HOME/../../config.toml" ] || exit 93
+[ ! -e "$REAL_QUARANTINE" ] || exit 94
 printf '%s\n' "$API_TOKEN" >&2
 exit 0"#,
     );
     let manifest = manifest(
-        json!({"net":{"allow":["example.test"]},"models":["provider"],"spawn":true,"secrets":[{"name":"fake_api","env":"API_TOKEN"}]}),
+        json!({"net":{"allow":["example.test"]},"models":["provider"],"spawn":true,"secrets":[{"name":"fake_api","env":"API_TOKEN"}],"env":{"REAL_QUARANTINE":fixture.home.join("extensions/quarantine").to_str().unwrap()}}),
         true,
         false,
     );

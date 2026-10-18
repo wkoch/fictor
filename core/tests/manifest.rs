@@ -428,6 +428,52 @@ fn yaml_duplicates_tags_complex_keys_and_multiple_documents_fail_without_echo() 
 }
 
 #[test]
+fn explicit_local_global_standard_and_directive_yaml_tags_are_rejected() {
+    let valid =
+        "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: none}\n";
+    for text in [
+        format!("!!forbidden\n{valid}"),
+        format!("!!map\n{valid}"),
+        format!("!Injected\n{valid}"),
+        format!("!<tag:example.com,2026:extension>\n{valid}"),
+        valid.replace("schema: 1", "!!str schema: 1"),
+        valid.replace("schema: 1", "schema: !!int 1"),
+        valid.replace("description: test", "description: !!str test"),
+        valid.replace("runtime: {kind: none}", "runtime: !!map {kind: none}"),
+        valid.replace("runtime: {kind: none}", "runtime: ! {kind: none}"),
+        format!("{valid}commands: !!seq []\n"),
+        format!("%TAG !e! tag:example.com,2026:\n---\n!e!extension\n{valid}"),
+        format!("%TAG !! tag:example.com,2026:\n---\n!!extension\n{valid}"),
+        format!("%TAG !e! tag:yaml.org,2002:\n---\n!e!map\n{valid}"),
+    ] {
+        assert!(
+            matches!(Manifest::parse(&text), Err(ManifestError::Parse)),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn taglike_text_in_scalar_values_and_comments_remains_literal() {
+    let valid =
+        "schema: 1\nid: test-extension\nversion: 1.0.0\ndescription: test\nruntime: {kind: none}\n";
+    for description in [
+        "\"!!forbidden\"",
+        "'!Injected !!map %TAG !e! literal'",
+        "literal !Injected !!map https://example.test/!value",
+        "|\n  !!forbidden\n  !Injected %TAG !e! literal",
+        ">\n  !!forbidden\n  !Injected %TAG !e! literal",
+        "\"\\u0021\\u0021forbidden\"",
+    ] {
+        let text = valid.replace("description: test", &format!("description: {description}"));
+        assert!(
+            Manifest::parse(&format!("# !!forbidden %TAG !e! comment\n{text}")).is_ok(),
+            "{description}"
+        );
+    }
+}
+
+#[test]
 fn parser_bounds_recursion_and_alias_expansion_before_schema_validation() {
     let nested = format!("value: {}0{}", "[".repeat(64), "]".repeat(64));
     assert!(Manifest::parse(&nested).is_err());

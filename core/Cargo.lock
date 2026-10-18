@@ -675,6 +675,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "unicode-normalization",
+ "unsafe-libyaml",
  "zbus-secret-service-keyring-store",
 ]
 

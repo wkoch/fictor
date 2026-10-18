@@ -2,10 +2,11 @@ pub mod blobs;
 mod budget;
 mod events;
 mod kv;
+mod migrations;
 mod proposals;
 pub use proposals::{
-    HumanDecision, NewProposal, Proposal, ProposalCheck, ProposalNonce, ProposalState,
-    ProposalUpdate, ResolvedPackage,
+    HumanDecision, NewProposal, Proposal, ProposalCheck, ProposalIdentity, ProposalNonce,
+    ProposalState, ProposalUpdate, ResolvedPackage,
 };
 mod sessions;
 pub use budget::{BudgetExceeded, local_day};
@@ -25,8 +26,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const SCHEMA_VERSION: i64 = 2;
-const MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
+use migrations::open_writer;
 type Job = Box<dyn FnOnce(&mut Writer) + Send>;
 
 struct Writer {
@@ -214,46 +214,6 @@ impl Store {
         drop(self.writer);
         self.task.await.map_err(|_| StoreError::Closed)
     }
-}
-
-fn open_writer(path: &Path) -> Result<Connection, StoreError> {
-    // Create with private permissions before SQLite opens it (independent of umask).
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let mut connection = Connection::open(path)?;
-    connection.busy_timeout(Duration::from_millis(5000))?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "NORMAL")?;
-    // Acquire the writer lock before reading user_version to serialize concurrent init.
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version > SCHEMA_VERSION {
-        return Err(StoreError::NewerSchema(version));
-    }
-    if version == 0 {
-        transaction.execute_batch(MIGRATION)?;
-    }
-    if version < 2 {
-        transaction.execute_batch(include_str!("../../migrations/0002_flow_budget.sql"))?;
-    }
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO sessions (id, kind, created_at, updated_at) VALUES ('sys', 'system', ?1, ?1)",
-        [now_ms()?],
-    )?;
-    transaction.commit()?;
-    Ok(connection)
 }
 
 pub fn now_ms() -> Result<i64, StoreError> {

@@ -416,7 +416,7 @@ async fn version_one_upgrade_adds_budget_tables_without_changing_historical_even
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     for table in ["budget_usage", "workspace_flags", "ext_flags"] {
         assert_eq!(

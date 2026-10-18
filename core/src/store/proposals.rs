@@ -47,18 +47,22 @@ pub struct ResolvedPackage {
 }
 
 pub struct NewProposal {
+    pub source: Value,
+    pub tainted: bool,
+}
+/// Trusted installer input, supplied only after complete manifest validation.
+/// Binding it is part of the received -> checking transaction, never receipt.
+pub struct ProposalIdentity {
     pub ext_id: String,
     pub version: String,
-    pub source: Value,
     pub manifest: Value,
-    pub tainted: bool,
     pub update_of: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct Proposal {
     pub id: String,
-    pub ext_id: String,
-    pub version: String,
+    pub ext_id: Option<String>,
+    pub version: Option<String>,
     pub hash: Option<String>,
     pub source: Value,
     pub state: ProposalState,
@@ -87,6 +91,8 @@ pub enum HumanDecision {
 }
 #[derive(Default)]
 pub struct ProposalUpdate {
+    pub identity: Option<ProposalIdentity>,
+    pub failure_reason: Option<String>,
     pub checks: Option<Vec<ProposalCheck>>,
     pub hash: Option<String>,
     pub packages: Option<Vec<ResolvedPackage>>,
@@ -94,25 +100,30 @@ pub struct ProposalUpdate {
 }
 
 impl Store {
-    pub async fn receive_proposal(&self, input: NewProposal) -> Result<Proposal, StoreError> {
-        if input.tainted
-            || input.source.get("kind").and_then(Value::as_str) != Some("local")
+    pub async fn begin_attempt(&self, input: NewProposal) -> Result<Proposal, StoreError> {
+        if input.source.get("kind").and_then(Value::as_str) != Some("local")
             || !input.source.is_object()
-            || !valid_ext_id(&input.ext_id)
-            || input.version.is_empty()
-            || input.version.chars().any(char::is_control)
-            || input.manifest.get("id").and_then(Value::as_str) != Some(input.ext_id.as_str())
-            || input.manifest.get("version").and_then(Value::as_str) != Some(input.version.as_str())
         {
             return Err(StoreError::Invalid("invalid local proposal"));
         }
         let nonce = nonce()?;
-        self.with_writer(move|writer|{
-            let id=writer.next_id()?;let event_id=writer.next_id()?;let timestamp=now_ms()?;
-            let tx=writer.db.transaction()?;
-            tx.execute("INSERT INTO proposals(id,ext_id,version,source,state,update_of,tainted,manifest,nonce,created_at,updated_at) VALUES (?1,?2,?3,?4,'received',?5,0,?6,?7,?8,?8)",params![id,input.ext_id,input.version,serde_json::to_string(&input.source)?,input.update_of,serde_json::to_string(&input.manifest)?,nonce,timestamp])?;
-            audit(&tx,event_id,timestamp,Audit {kind:"ext.proposed",actor:"core",proposal_id:&id,ext_id:&input.ext_id,from:None,state:ProposalState::Received})?;
-            let proposal=get(&tx,&id)?;tx.commit()?;Ok(proposal)
+        self.with_writer(move |writer| {
+            let id = writer.next_id()?;
+            let event_id = writer.next_id()?;
+            let timestamp = now_ms()?;
+            let tx = writer.db.transaction()?;
+            tx.execute(
+                "INSERT INTO proposals(id,source,state,tainted,nonce,created_at,updated_at) VALUES (?1,?2,'received',?3,?4,?5,?5)",
+                params![id, serde_json::to_string(&input.source)?, input.tainted, nonce, timestamp],
+            )?;
+            audit(&tx, event_id, timestamp, Audit {
+                kind: "ext.proposed", actor: "core", proposal_id: &id,
+                ext_id: None, version: None, from: None,
+                state: ProposalState::Received, reason: None,
+            })?;
+            let proposal = get(&tx, &id)?;
+            tx.commit()?;
+            Ok(proposal)
         }).await
     }
     pub async fn proposal(&self, id: String) -> Result<Proposal, StoreError> {
@@ -135,7 +146,7 @@ impl Store {
         id: String,
         expected: ProposalState,
         next: ProposalState,
-        update: ProposalUpdate,
+        mut update: ProposalUpdate,
     ) -> Result<Proposal, StoreError> {
         let valid = matches!(
             (expected, next),
@@ -156,17 +167,27 @@ impl Store {
         if update.hash.as_ref().is_some_and(|hash| !valid_hash(hash)) {
             return Err(StoreError::Invalid("invalid proposal hash"));
         }
+        if let Some(identity) = &mut update.identity {
+            if expected != ProposalState::Received || next != ProposalState::Checking {
+                return Err(StoreError::Invalid("invalid proposal identity"));
+            }
+            validate_identity(identity)?;
+        }
+        if update.failure_reason.as_ref().is_some_and(|reason| {
+            next != ProposalState::Failed || failure_check_name(reason).is_none()
+        }) {
+            return Err(StoreError::Invalid("invalid proposal failure reason"));
+        }
         let decision = matches!(next, ProposalState::Approved | ProposalState::Rejected);
         if decision != update.decision.is_some() {
             return Err(StoreError::Invalid("invalid proposal decision"));
         }
-        // Receipt failures must retain their check/reason even before checking.
-        // Successful results, hashes and packages still require the checking stage.
-        let received_failure = expected == ProposalState::Received && next == ProposalState::Failed;
+        // Receipt may retain completed checks while binding or refusing identity.
+        // Successful bundle hashes and resolved packages still require checking.
         if expected != ProposalState::Checking
             && (update.hash.is_some()
                 || update.packages.is_some()
-                || (update.checks.is_some() && !received_failure))
+                || (update.checks.is_some() && expected != ProposalState::Received))
         {
             return Err(StoreError::Invalid("invalid proposal results"));
         }
@@ -182,37 +203,178 @@ impl Store {
             return Err(StoreError::Invalid("invalid proposal results"));
         }
         let replacement = if decision { Some(nonce()?) } else { None };
-        self.with_writer(move|writer|{
-            let event_id=writer.next_id()?;let timestamp=now_ms()?;
-            let tx=writer.db.transaction()?;
-            let current=get(&tx,&id)?;
-            if current.state!=expected {return Err(StoreError::Invalid("proposal state changed"));}
-            if let Some(HumanDecision::User(confirmed))=&update.decision {
-                let existing:String=tx.query_row("SELECT nonce FROM proposals WHERE id=?1",[&id],|row|row.get(0))?;
-                if !constant_time(&existing,&confirmed.0){return Err(StoreError::Invalid("invalid proposal decision"));}
+        self.with_writer(move |writer| {
+            let event_id = writer.next_id()?;
+            let timestamp = now_ms()?;
+            let tx = writer.db.transaction()?;
+            let current = get(&tx, &id)?;
+            if current.state != expected {
+                return Err(StoreError::Invalid("proposal state changed"));
             }
-            let checks=update.checks.or(current.checks);
-            let hash=update.hash.or(current.hash);
-            let packages=update.packages.or(current.packages);
-            if next==ProposalState::Checked && (hash.is_none()||checks.as_ref().is_none_or(|checks|checks.is_empty()||checks.iter().any(|check|check.blocking&&!check.passed))) {
+            if let Some(HumanDecision::User(confirmed)) = &update.decision {
+                let existing: String = tx.query_row(
+                    "SELECT nonce FROM proposals WHERE id=?1", [&id], |row| row.get(0),
+                )?;
+                if !constant_time(&existing, &confirmed.0) {
+                    return Err(StoreError::Invalid("invalid proposal decision"));
+                }
+            }
+            let (ext_id, version, manifest, update_of) = match update.identity {
+                Some(identity) => {
+                    if current.ext_id.is_some() || current.version.is_some() {
+                        return Err(StoreError::Invalid("proposal identity already bound"));
+                    }
+                    (Some(identity.ext_id), Some(identity.version), Some(identity.manifest), identity.update_of)
+                }
+                None => (current.ext_id, current.version, current.manifest, current.update_of),
+            };
+            if next != ProposalState::Failed && (ext_id.is_none() || version.is_none()) {
+                return Err(StoreError::Invalid("proposal identity required"));
+            }
+            if next == ProposalState::Failed
+                && let (Some(existing), Some(replacement)) = (&current.checks, &update.checks)
+                && !replacement.starts_with(existing)
+            {
+                return Err(StoreError::Invalid("proposal failure must preserve checks"));
+            }
+            let checks = update.checks.or(current.checks);
+            let hash = update.hash.or(current.hash);
+            let packages = update.packages.or(current.packages);
+            if next == ProposalState::Checked && (hash.is_none() || checks.as_ref().is_none_or(|checks| {
+                checks.is_empty() || checks.iter().any(|check| check.blocking && !check.passed)
+            })) {
                 return Err(StoreError::Invalid("proposal checks incomplete"));
             }
-            let changed=tx.execute("UPDATE proposals SET state=?1,checks=?2,hash=?3,packages=?4,decided_by=CASE WHEN ?5 THEN 'user' ELSE decided_by END,nonce=COALESCE(?6,nonce),updated_at=?7 WHERE id=?8 AND state=?9",params![next.name(),checks.map(|value|serde_json::to_string(&value)).transpose()?,hash,packages.map(|value|serde_json::to_string(&value)).transpose()?,decision,replacement,timestamp,id,expected.name()])?;
-            if changed!=1{return Err(StoreError::Invalid("proposal state changed"));}
-            let kind=match next {ProposalState::Checking=>"ext.checking",ProposalState::Checked=>"ext.checked",ProposalState::Approved=>"ext.approved",ProposalState::Rejected=>"ext.rejected",ProposalState::Failed=>"ext.failed",_=>return Err(StoreError::Invalid("invalid proposal transition"))};
-            audit(&tx,event_id,timestamp,Audit{kind,actor:if decision{"user"}else{"core"},proposal_id:&id,ext_id:&current.ext_id,from:Some(expected),state:next})?;
-            let proposal=get(&tx,&id)?;tx.commit()?;Ok(proposal)
+            let reason = if next == ProposalState::Failed {
+                let reason = update.failure_reason.as_deref().unwrap_or("check:failed");
+                if checks.as_ref().is_none_or(|checks| !checks.iter().any(|check| {
+                    check.blocking && !check.passed
+                })) || (ext_id.is_none() && !receipt_failure_matches(checks.as_deref(), reason)) {
+                    return Err(StoreError::Invalid("proposal failure check required"));
+                }
+                Some(reason)
+            } else {
+                None
+            };
+            let changed = tx.execute(
+                "UPDATE proposals SET state=?1,checks=?2,hash=?3,packages=?4,decided_by=CASE WHEN ?5 THEN 'user' ELSE decided_by END,nonce=COALESCE(?6,nonce),updated_at=?7,ext_id=?10,version=?11,manifest=?12,update_of=?13 WHERE id=?8 AND state=?9",
+                params![next.name(), checks.as_ref().map(serde_json::to_string).transpose()?, hash,
+                    packages.as_ref().map(serde_json::to_string).transpose()?, decision, replacement,
+                    timestamp, id, expected.name(), ext_id, version,
+                    manifest.as_ref().map(serde_json::to_string).transpose()?, update_of],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Invalid("proposal state changed"));
+            }
+            let kind = match next {
+                ProposalState::Checking => "ext.checking", ProposalState::Checked => "ext.checked",
+                ProposalState::Approved => "ext.approved", ProposalState::Rejected => "ext.rejected",
+                ProposalState::Failed => "ext.failed",
+                _ => return Err(StoreError::Invalid("invalid proposal transition")),
+            };
+            audit(&tx, event_id, timestamp, Audit {
+                kind, actor: if decision { "user" } else { "core" }, proposal_id: &id,
+                ext_id: ext_id.as_deref(), version: version.as_deref(),
+                from: Some(expected), state: next, reason,
+            })?;
+            let proposal = get(&tx, &id)?;
+            tx.commit()?;
+            Ok(proposal)
+        }).await
+    }
+
+    /// Run before installer admission while its exclusive recovery lease is held.
+    /// All interrupted records reconcile atomically; returning old failures lets
+    /// quarantine cleanup retry without creating another failure event.
+    pub async fn recover_interrupted_proposals(&self) -> Result<Vec<Proposal>, StoreError> {
+        self.with_writer(|writer| {
+            let pending = ids_with_states(&writer.db, "'received','checking'")?;
+            // Allocate IDs before borrowing the writer connection for its transaction.
+            let events = pending.iter().map(|_| writer.next_id()).collect::<Result<Vec<_>, _>>()?;
+            let timestamp = now_ms()?;
+            let tx = writer.db.transaction()?;
+            for (id, event_id) in pending.iter().zip(events) {
+                let current = get(&tx, id)?;
+                if !matches!(current.state, ProposalState::Received | ProposalState::Checking) {
+                    return Err(StoreError::Invalid("proposal state changed"));
+                }
+                let mut checks = current.checks.unwrap_or_default();
+                checks.push(ProposalCheck {
+                    name: "recovery".into(), passed: false, blocking: true,
+                    detail: Some("recovery:interrupted".into()),
+                });
+                let changed = tx.execute(
+                    "UPDATE proposals SET state='failed',checks=?1,updated_at=?2 WHERE id=?3 AND state=?4",
+                    params![serde_json::to_string(&checks)?, timestamp, id, current.state.name()],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Invalid("proposal state changed"));
+                }
+                audit(&tx, event_id, timestamp, Audit {
+                    kind: "ext.failed", actor: "core", proposal_id: id,
+                    ext_id: current.ext_id.as_deref(), version: current.version.as_deref(),
+                    from: Some(current.state), state: ProposalState::Failed,
+                    reason: Some("recovery:interrupted"),
+                })?;
+            }
+            let failed = ids_with_states(&tx, "'failed'")?.into_iter()
+                .map(|id| get(&tx, &id)).collect::<Result<Vec<_>, _>>()?;
+            tx.commit()?;
+            Ok(failed)
         }).await
     }
 }
-fn valid_ext_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 40
-        && id.as_bytes()[0].is_ascii_lowercase()
-        && id.split('-').all(|p| {
-            !p.is_empty()
-                && p.bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+fn ids_with_states(db: &Connection, states: &str) -> Result<Vec<String>, StoreError> {
+    // Only the fixed state lists above reach this helper; no caller-supplied SQL.
+    let mut statement = db.prepare(&format!(
+        "SELECT id FROM proposals WHERE state IN ({states}) ORDER BY created_at,id"
+    ))?;
+    Ok(statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+fn validate_identity(identity: &mut ProposalIdentity) -> Result<(), StoreError> {
+    // Structural and generic semantic validation is repeated at the writer API.
+    // Configured NAT64 prefixes and provider-secret names are checked earlier by
+    // the installer, which owns that context; default validation cannot add grants.
+    let manifest = crate::installer::manifest::Manifest::parse(&identity.manifest.to_string())
+        .map_err(|_| StoreError::Invalid("invalid proposal identity"))?;
+    if manifest.id != identity.ext_id || manifest.version != identity.version {
+        return Err(StoreError::Invalid("invalid proposal identity"));
+    }
+    identity.manifest = serde_json::to_value(manifest)?;
+    Ok(())
+}
+fn failure_check_name(reason: &str) -> Option<&'static str> {
+    match reason {
+        "limit:entries"
+        | "limit:bytes"
+        | "limit:file_size"
+        | "limit:depth"
+        | "limit:path_length"
+        | "limit:time"
+        | "receipt:symlink"
+        | "receipt:special_file"
+        | "receipt:invalid_path"
+        | "receipt:source_changed"
+        | "receipt:io" => Some("receipt"),
+        "manifest:missing" | "manifest:invalid_yaml" | "manifest:invalid" | "phase:global" => {
+            Some("manifest")
+        }
+        "recovery:interrupted" => Some("recovery"),
+        "check:failed" => Some("check"),
+        _ => None,
+    }
+}
+fn receipt_failure_matches(checks: Option<&[ProposalCheck]>, reason: &str) -> bool {
+    reason != "check:failed"
+        && checks.is_some_and(|checks| {
+            checks.iter().any(|check| {
+                Some(check.name.as_str()) == failure_check_name(reason)
+                    && !check.passed
+                    && check.blocking
+                    && check.detail.as_deref() == Some(reason)
+            })
         })
 }
 fn valid_hash(hash: &str) -> bool {
@@ -239,9 +401,11 @@ struct Audit<'a> {
     kind: &'a str,
     actor: &'a str,
     proposal_id: &'a str,
-    ext_id: &'a str,
+    ext_id: Option<&'a str>,
+    version: Option<&'a str>,
     from: Option<ProposalState>,
     state: ProposalState,
+    reason: Option<&'a str>,
 }
 fn audit(
     tx: &rusqlite::Transaction<'_>,
@@ -254,17 +418,23 @@ fn audit(
         actor,
         proposal_id,
         ext_id,
+        version,
         from,
         state,
+        reason,
     } = change;
     let session = super::sessions::get(tx, "sys")?;
+    let mut payload = json!({"proposal_id":proposal_id,"ext_id":ext_id,"version":version,"from":from,"state":state});
+    if let Some(reason) = reason {
+        payload["reason"] = reason.into();
+    }
     let event = Event {
         id,
         parent_id: session.head_id,
         session_id: "sys".into(),
         kind: kind.into(),
         actor: actor.into(),
-        payload: json!({"proposal_id":proposal_id,"ext_id":ext_id,"from":from,"state":state}),
+        payload,
         blob_refs: vec![],
         trust: Trust::Trusted,
         sensitivity: Sensitivity::Public,
