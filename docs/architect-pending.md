@@ -1,6 +1,78 @@
 # Pendências para o arquiteto
 
-Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
+ARQ-020–023 abertas em 2026-10-18 durante a continuação do M0.5.
+Resolução do spec não significa implementação concluída.
+
+## ARQ-020 — Recuperação da promoção entre filesystem, lock e evento
+
+- **Status: aberta.**
+- **Referência:** `spec/06-lifecycle.md`, estados da proposta e etapa 9;
+  `spec/02-core.md`, troca de versão; ADR-035.
+- **Dúvida:** a promoção publica a cópia imutável, troca o lock, faz hot swap e
+  só então grava `ext.promoted`. Não está definido como recuperar um crash ou erro
+  de persistência em cada intervalo. A recuperação do ADR-035 trata somente
+  `received`/`checking` e preserva `approved`. Um lock já alterado pode coexistir
+  com uma proposta ainda `approved` e sem evento de promoção.
+- **Necessário:** ADR com o ponto de compromisso da ativação, evidência persistida
+  necessária, recuperação/idempotência das janelas e tratamento de staging,
+  cópia publicada e falha no evento. Definir também a validação de `update_of`
+  quando a chave ativa mudou após a revisão.
+- **Impacto:** ativação e alteração de lock por promoção aguardam o ADR. É possível
+  materializar e validar a cópia imutável de uma proposta aprovada por humano,
+  preservando lock, estado, eventos, quarentena e processos. Essa parte não declara
+  promoção concluída nem executa código.
+
+## ARQ-021 — Formato e aplicação dos overrides humanos
+
+- **Status: aberta.**
+- **Referência:** `spec/06-lifecycle.md`, decisão e lock;
+  `spec/04-extensions.md`, classificação de tools;
+  `spec/05-security.md`, perfil de sandbox e decisão.
+- **Dúvida:** `overrides.permissions` e `overrides.tools` são objetos vazios no
+  exemplo do lock. Não está definido se um valor substitui a seção inteira ou
+  faz merge de campos, como se aplicam defaults nem como provar que uma mudança
+  em permissões só restringe o manifest. Ignorar um override pode ampliar acesso
+  ou tornar visível uma tool que o humano ocultou.
+- **Necessário:** ADR com schema, semântica de aplicação e validação de restrição,
+  incluindo classificação nominal e `default`, removidos/ausentes e valores nulos.
+  O mesmo resultado efetivo deve alimentar supervisor, registro e política.
+- **Impacto:** consumo de overrides não vazios fica bloqueado. A listagem pode
+  operar com overrides vazios; recusa os demais explicitamente, sem fallback
+  para a classificação original nem um catálogo parcial.
+
+## ARQ-022 — Identidade e posse para limpeza de instâncias no boot
+
+- **Status: aberta.**
+- **Referência:** `spec/02-core.md`, encerramento; ADR-029;
+  `spec/10-roadmap.md`, critério 26; `core/src/supervisor.rs`, `create_pid` e
+  `create_temporary`.
+- **Dúvida:** o boot deve remover sockets e diretórios deixados por um core morto,
+  depois de confirmar que nenhum processo os usa. O registro atual contém só PID
+  numérico; não identifica boot/starttime nem associa de forma durável o temporário
+  à instância. PID pode ser reutilizado, e `--die-with-parent` não oferece ao novo
+  core uma confirmação persistida da saída do bwrap.
+- **Necessário:** ADR com metadados mínimos de identidade/posse, exclusão entre
+  donos e regra de confirmação antes da limpeza, incluindo PID reutilizado,
+  registro parcial, core anterior ainda vivo e recursos sem registro legado.
+- **Impacto:** a limpeza geral no boot aguarda o ADR. Encerramento confirmado
+  durante a execução e recuperação de recibos do ADR-035 continuam operacionais;
+  nenhum PID legado é sinalizado e nenhum temporário desconhecido é apagado.
+
+## ARQ-023 — Escopo do crash loop e reabilitação humana
+
+- **Status: aberta.**
+- **Referência:** `spec/02-core.md`, identidade, processos lazy e falhas;
+  `spec/06-lifecycle.md`, desativação; `spec/02-core.md`, CLI `ext enable`.
+- **Dúvida:** o spec define backoff 1/2/4/8/16 s e desativação após mais de cinco
+  crashes em 60 s até ação humana. Não define se a contagem pertence à instância,
+  à chave lógica ou também à versão, se `disabled` sobrevive ao reinício do core,
+  qual ação humana limpa esse bloqueio nem se o restart é imediato ou lazy.
+- **Necessário:** ADR com escopo, persistência e reset, relação com `enabled` no
+  lock e comportamento das chamadas durante espera/recuperação. Não deve haver
+  repetição automática de uma chamada que estava em andamento no crash.
+- **Impacto:** restart/backoff e bloqueio durável de crash loop aguardam o ADR.
+  Monitoramento, auditoria de crash, cauda de stderr e contenção/encerramento da
+  árvore continuam funcionando; não é simulada uma reabilitação humana.
 
 ## ARQ-019 — Recebimento inválido antes da identidade do manifest
 
