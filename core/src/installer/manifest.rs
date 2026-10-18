@@ -289,25 +289,7 @@ impl Manifest {
     }
 
     pub fn parse_with_nat64(text: &str, nat64: &Nat64Prefixes) -> Result<Self, ManifestError> {
-        if text.len() > MAX_MANIFEST_BYTES {
-            return Err(ManifestError::Limit);
-        }
-        reject_explicit_yaml_tags(text)?;
-        let budget = ParseBudget {
-            nodes: Cell::new(text.len().saturating_mul(2).max(1)),
-            bytes: Cell::new(MAX_MANIFEST_BYTES),
-        };
-        let mut documents = serde_yaml_ng::Deserializer::from_str(text);
-        let document = documents.next().ok_or(ManifestError::Parse)?;
-        let value = JsonSeed {
-            budget: &budget,
-            depth: 0,
-        }
-        .deserialize(document)
-        .map_err(|_| ManifestError::Parse)?;
-        if documents.next().is_some() {
-            return Err(ManifestError::Parse);
-        }
+        let value = parse_yaml_value(text, MAX_MANIFEST_BYTES)?;
         validate_schema(&value)?;
         let mut manifest: Self =
             serde_json::from_value(value).map_err(|_| ManifestError::Schema)?;
@@ -485,6 +467,31 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// Shared bounded data parser for manifests and skill frontmatter. This never
+/// resolves tags or accepts duplicate keys; aliases share the expansion budget.
+pub(crate) fn parse_yaml_value(text: &str, max_bytes: usize) -> Result<Value, ManifestError> {
+    if text.len() > max_bytes {
+        return Err(ManifestError::Limit);
+    }
+    reject_explicit_yaml_tags(text)?;
+    let budget = ParseBudget {
+        nodes: Cell::new(text.len().saturating_mul(2).max(1)),
+        bytes: Cell::new(max_bytes),
+    };
+    let mut documents = serde_yaml_ng::Deserializer::from_str(text);
+    let document = documents.next().ok_or(ManifestError::Parse)?;
+    let value = JsonSeed {
+        budget: &budget,
+        depth: 0,
+    }
+    .deserialize(document)
+    .map_err(|_| ManifestError::Parse)?;
+    if documents.next().is_some() {
+        return Err(ManifestError::Parse);
+    }
+    Ok(value)
 }
 
 fn validate_schema(value: &Value) -> Result<(), ManifestError> {

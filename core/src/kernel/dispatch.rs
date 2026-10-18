@@ -326,6 +326,23 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
                     })?;
             Ok(json!({"tools":tools}))
         }
+        "catalog.list" => {
+            let p: SessionId = params(value)?;
+            session_id(&p.session_id)?;
+            if state.identity.session_id.as_deref() != Some(&p.session_id) {
+                return Err(RpcError::SCOPE);
+            }
+            state.store.session(p.session_id).await?;
+            let home = state.home.clone();
+            let catalog = tokio::task::spawn_blocking(move || super::catalog::list(&home))
+                .await
+                .map_err(|_| RpcError::INTERNAL)?
+                .map_err(|error| match error {
+                    super::catalog::CatalogError::TooLarge => RpcError::TOO_LARGE,
+                    _ => RpcError::INTERNAL,
+                })?;
+            serialize(catalog)
+        }
         "config.get" => {
             let p: Section = params(value)?;
             match p.section.as_str() {

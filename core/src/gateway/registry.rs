@@ -1,7 +1,7 @@
 //! Model-visible tools come from the active lock and immutable manifests, never
 //! from a live process or MCP annotations. This module does not execute tools.
 use crate::installer::{
-    lock::Lock,
+    lock::{Lock, LockedVersion},
     manifest::{Effect, MAX_MANIFEST_BYTES, Manifest, RuntimeKind, Scope, Sensitivity, ToolClass},
 };
 use serde::Serialize;
@@ -59,18 +59,7 @@ fn model_tools_bounded(home: &Path, limit: usize) -> Result<Vec<ToolDef>, Regist
             .versions
             .get(&extension.active)
             .ok_or(RegistryError::Invalid)?;
-        // Merge/restriction semantics have not been specified. Never silently
-        // fall back to broader manifest grants/classification (ARQ-021).
-        if !version.overrides.permissions.is_empty() || !version.overrides.tools.is_empty() {
-            return Err(RegistryError::UnsupportedOverrides);
-        }
-        let manifest = read_manifest(&home.join("extensions").join(&version.path))?;
-        if manifest.id != *id
-            || manifest.version != version.version
-            || (manifest.scope == Scope::Global && manifest.runtime.kind != RuntimeKind::None)
-        {
-            return Err(RegistryError::Invalid);
-        }
+        let manifest = active_manifest(home, id, version)?;
         let catalog = version.catalog().map_err(|_| RegistryError::Invalid)?;
         if !manifest.mcp_enabled() && !catalog.tools().is_empty() {
             return Err(RegistryError::Invalid);
@@ -129,6 +118,28 @@ impl Write for ResponseBudget {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Shared active-state validation for tools and catalog. The caller has loaded
+/// the enclosing Lock; consume one manifest at a time to bound retained memory.
+pub(crate) fn active_manifest(
+    home: &Path,
+    id: &str,
+    version: &LockedVersion,
+) -> Result<Manifest, RegistryError> {
+    // Merge/restriction semantics have not been specified. Never silently fall
+    // back to broader manifest grants/classification (ARQ-021).
+    if !version.overrides.permissions.is_empty() || !version.overrides.tools.is_empty() {
+        return Err(RegistryError::UnsupportedOverrides);
+    }
+    let manifest = read_manifest(&home.join("extensions").join(&version.path))?;
+    if manifest.id != id
+        || manifest.version != version.version
+        || (manifest.scope == Scope::Global && manifest.runtime.kind != RuntimeKind::None)
+    {
+        return Err(RegistryError::Invalid);
+    }
+    Ok(manifest)
 }
 
 fn read_manifest(bundle: &Path) -> Result<Manifest, RegistryError> {

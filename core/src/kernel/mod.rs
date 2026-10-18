@@ -1,5 +1,6 @@
 //! Authenticated per-instance Kernel Protocol. Identity is trusted supervisor
 //! input, sealed at bind; request fields can never change it.
+mod catalog;
 mod dispatch;
 mod log;
 mod transport;
