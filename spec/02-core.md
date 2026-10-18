@@ -584,7 +584,7 @@ Seções `[ext.<id>]` são opacas para o core e só legíveis pela extensão `<i
 
 ## CLI
 
-Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext rollback|enable|disable|reset-crashes`. Toda mutação offline exige a [posse exclusiva do home](#posse-do-diretório-de-dados) e os mesmos guardas de migração. Rollback/enable/disable alteram o lock sob a seção crítica do instalador, após reconciliar promoções pendentes. `reset-crashes` escreve somente o SQLite pelo writer único, conforme [Reabilitação humana](#reabilitação-humana); não altera o lock. Core ativo ou reconciliação inconclusiva impede fallback offline.
+Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext list|rollback|enable|disable|reset-crashes`. A listagem é uma consulta coordenada de configuração, com roteamento online/offline definido abaixo; não abre o inicializador/migrador geral do Store. Toda mutação offline exige a [posse exclusiva do home](#posse-do-diretório-de-dados) e os mesmos guardas de migração. Rollback/enable/disable alteram o lock sob a seção crítica do instalador, após reconciliar promoções pendentes. `reset-crashes` escreve somente o SQLite pelo writer único, conforme [Reabilitação humana](#reabilitação-humana); não altera o lock. Core ativo ou reconciliação inconclusiva impede fallback offline.
 
 | Comando | Fase | Função |
 |---|---|---|
@@ -593,7 +593,7 @@ Binário único `fictor`. Comandos que alteram estado com o servidor rodando fal
 | `fictor serve [--open] [--shell-dir <dir>]` | 0 | Sobe o core e imprime a URL de login com token único. `--shell-dir` serve assets do disco (desenvolvimento). |
 | `fictor secrets set\|list\|rm <nome>` | 0 | Gerencia segredos. `list` mostra só nomes. |
 | `fictor login` | 0 | Pede ao core em execução uma URL de login nova, com token de uso único. Útil quando o core roda como serviço systemd de usuário. |
-| `fictor ext list` | 0 | Extensões, versões ativas, estado. |
+| `fictor ext list` | 0 | Configuração registrada: ID, chave selecionada, versão e habilitação; online/offline. Não consulta saúde de processos. |
 | `fictor ext install <caminho> [--yes]` | 0 | Proposta de origem `local`; mostra permissões e pede confirmação no TTY. |
 | `fictor ext enable\|disable <id>` | 0 | Liga ou desliga no lock; preserva bloqueios de crashes e integridade. |
 | `fictor ext rollback <id> [--to <key>]` | 0 | Volta para a versão anterior (ou a indicada). |
@@ -608,3 +608,61 @@ Binário único `fictor`. Comandos que alteram estado com o servidor rodando fal
 | `fictor gc` | 2 | Coleta blobs e versões antigas do store (mantém as 5 últimas por extensão). |
 | `fictor __sandbox-init` | 0 | Interno: init do sandbox Linux. |
 | `fictor __extract` | 0 | Interno: extração de arquivos de runtime dentro de sandbox. |
+
+### Listagem de extensões
+
+`fictor ext list` é permitido na Fase 0 com o servidor ativo ou parado. Seu resultado é o snapshot de configuração abaixo, ordenado lexicograficamente por `id`, uma linha por extensão registrada, inclusive as desabilitadas:
+
+```json
+{
+  "schema": 1,
+  "extensions": [
+    {"id": "fs-tools", "active": "0.1.0-123456789abc", "version": "0.1.0", "enabled": true}
+  ]
+}
+```
+
+`active` é a chave selecionada no lock e `version` vem do registro correspondente em `versions`. `enabled` é exclusivamente a habilitação administrativa. Não significa que exista processo, que o runtime esteja disponível, que uma instância possa subir ou que esteja livre de backoff/crash loop. A saída humana usa colunas ID, CHAVE, VERSÃO, HABILITADA; não rotula `enabled` como running/stopped/healthy. Saúde não foi consultada e não tem campo neste resultado. A chave “ativa” continua sendo seleção de configuração, não declaração de execução.
+
+Validar o documento de lock inteiro pelas regras vigentes, incluindo schema, identidade, referência `active` e formato de overrides; qualquer erro impede a lista inteira. Não devolver catálogo parcial, inventar valores ausentes nem executar extensão/smoke para listar. Uma lista vazia exige home/banco/lock inicializados e válidos com `extensions` vazio; ausência de arquivos não significa lista vazia. A listagem não substitui a prova semântica de permissões nem as verificações de integridade de runtime/bundle necessárias na aprovação, no boot e no spawn. Em um home novo, `init` cria um lock schema 1 explícito, com `extensions` e `runtimes` vazios antes de instalar os bundles/runtimes iniciais. Isso não autoriza recriar automaticamente um lock perdido em home existente; a listagem nunca inicializa esse arquivo.
+
+#### Escolha entre online e offline
+
+1. Abrir o home canônico existente e validar tipo/posse privada como no ADR-038, sem criá-lo. Tentar adquirir a posse exclusiva não bloqueante do mesmo inode.
+2. Se obtiver a posse, conservar o descritor durante a leitura offline. Abrir `fictor.db` existente em modo somente leitura, sem inicializador, writer ou migrador; confirmar `user_version` exatamente igual à versão mais recente conhecida por este binário. Versão menor ou maior falha sem modificar o banco. Não criar banco, schema, backup, config, socket, evento ou registro de instância.
+3. Sob essa posse, abrir uma transação de leitura que considere os commits presentes no WAL e consultar `promotion_intents`. Se houver `prepared`, devolver `recovery_required`, sem ler o próximo lock como configuração confirmada e sem reconciliar. Banco inconsistente, tabela exigida ausente ou leitura inválida falham; não se presume journal vazio.
+4. Sem intenção pendente, capturar e validar o lock inteiro e produzir o resultado. Não iniciar/encerrar processos nem limpar recursos. A posse não afirma que todos os sandboxes do dono anterior terminaram; a listagem não depende dessa afirmação, pois não toca recursos de instância.
+5. Se a posse estiver ocupada, usar somente o canal administrativo do home. Core inicializando/ocupado, socket ausente, falha de conexão, timeout ou erro administrativo não autorizam fallback para ler arquivos fora da posse. Se o dono sair durante a tentativa, o usuário pode repetir o comando; a tentativa atual falha sem trocar silenciosamente de modo.
+
+A conexão SQLite é realmente read-only para dados da aplicação e nunca usa `immutable=1`/`nolock` para contornar o WAL. Não se lê apenas o arquivo principal nem apenas seu cabeçalho: commits de journal ainda no WAL contam. Não há migração, reconciliação de promoção, checkpoint manual ou limpeza implícita. O gerenciamento normal dos auxiliares SQLite `-wal`/`-shm` pode ocorrer: “somente leitura” não promete ausência de toda escrita de metadados do SQLite. Se o SQLite não conseguir obter uma leitura consistente, falhar, sem promover a conexão a writer. A semântica do WAL é documentada em [SQLite — Read-Only Databases](https://www.sqlite.org/wal.html#read_only_databases).
+
+#### Canal administrativo mínimo
+
+CLI e core se comunicam pelo Unix stream socket `run/admin.sock` (0600), em `run/` privado 0700. O socket não é montado nos sandboxes. O servidor verifica `SO_PEERCRED`: UID do cliente igual ao UID efetivo do core; a CLI confere o UID do servidor e o tipo/posse do socket, sem aceitar symlink. Falha de identidade encerra a conexão, sem executar método. Nenhum token do Kernel Protocol ou mensagem de surface autoriza esse canal.
+
+O transporte usa JSON-RPC 2.0 em UTF-8, uma mensagem por linha terminada em LF, com limite de 16 MiB por mensagem, excluindo LF. Um cliente envia uma requisição, o servidor envia uma resposta e fecha. Sem batches, notificações, streaming, callbacks ou encaminhamento para extensões. O envelope da requisição tem exatamente `jsonrpc`, `id`, `method`, `params`; `jsonrpc` é `"2.0"`, `id` é string não vazia de até 128 bytes e `params` é objeto. Campos desconhecidos e chaves JSON duplicadas são recusados. A resposta repete o mesmo `id`; erros sem ID recuperável usam `id: null`. Mensagem recebida acima do limite encerra a conexão sem processamento; resultado acima do limite retorna erro pequeno `too_large`, sem truncamento.
+
+Esta decisão define somente o método administrativo `ext.list`; outros métodos exigem seu próprio contrato. Exemplo:
+
+```json
+{"jsonrpc":"2.0","id":"cli-1","method":"ext.list","params":{}}
+{"jsonrpc":"2.0","id":"cli-1","result":{"schema":1,"extensions":[]}}
+```
+
+`params` deve ser exatamente `{}`. A resposta `result` usa exatamente o formato da listagem acima, sem informações de segredos, ambiente, caminhos, grants, conteúdo de propostas ou snapshots do journal. A versão do resultado é `schema: 1`; a CLI recusa outra versão ou resposta malformada, sem fallback para arquivos.
+
+O handler adquire a mesma seção crítica do instalador que serializa alterações do lock, inicia a leitura de SQLite dentro dela, verifica que não há intenção `prepared` e captura o lock validado. Copia o resultado completo para memória e libera a seção crítica antes de escrever no socket; cliente lento não segura o instalador. Não reconcilia, migra nem muda a aplicação em resposta à consulta. A operação que já possui a seção crítica pode terminar normalmente; se não for possível obter o snapshot em até 5 s, retornar `busy`. A CLI encerra uma tentativa de conexão/leitura sem progresso por 5 s como falha, sem repetir a requisição automaticamente. Nenhuma linha é enviada antes de obter o resultado completo e válido.
+
+Erros de protocolo seguem JSON-RPC: `-32700` para UTF-8/JSON inválido; `-32600` para envelope, batch ou ID inválido; `-32601` para método desconhecido; `-32602` para parâmetros inválidos. Uma notificação (objeto sem `id`) é ignorada e a conexão é fechada, sem executar seu método. Erros de domínio usam `code: -32000`, `message: "ext.list failed"` e `data: {"reason": "<código>"}`. Códigos de domínio:
+
+| Código | Significado |
+|---|---|
+| `not_initialized` | Home, banco ou lock obrigatório ausente; não criar nem supor lista vazia. |
+| `data_version_unsupported` | `user_version` não corresponde ao conhecido; sem migrar. |
+| `recovery_required` | Existe intenção de promoção `prepared`. |
+| `invalid_snapshot` | Lock/journal/schema/dados malformados ou inconsistentes; sem lista parcial. |
+| `busy` | Seção crítica indisponível no prazo. |
+| `io_error` | Não foi possível obter leitura consistente. |
+| `too_large` | Resultado ultrapassa o limite do transporte. |
+
+A CLI offline usa os mesmos motivos para diagnóstico e termina com status diferente de zero em falhas. Erros locais de transporte/autenticação também falham sem fallback. Mensagens não incluem dados brutos do lock/journal, valores de env/segredos ou caminhos privados. A CLI termina com status zero somente depois de validar e apresentar o resultado inteiro; zero extensões é um sucesso explícito.

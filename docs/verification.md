@@ -142,3 +142,27 @@ principal. Execução no Toolbx `fictor-dev`, Fedora Linux 44, sobre Bazzite
   e a mensagem WebSocket do reset humano; ambas foram incorporadas.
 - Critérios 38–46 descrevem os testes ainda necessários no produto. Nenhuma suíte
   Rust do core ou aceitação ponta a ponta foi executada nesta revisão arquitetural.
+
+## Verificação arquitetural do ADR-041 — 2026-10-18
+
+Base: `c87fba86ac68689859372723e0e0fc92eebaa799`, em worktree isolado da main.
+Diagnóstico no Toolbx `fictor-dev`, Fedora Linux 44/SQLite 3.51.2, sobre Bazzite
+`44.20261012.0` (Kinoite); não é gate COSMIC nem CI.
+
+- Experimento Linux com dois descritores do mesmo diretório, por caminhos
+  alternativos: o flock exclusivo recusou o segundo dono e permitiu aquisição
+  depois da liberação do primeiro. Diretórios/banco eram descartáveis.
+- Processo filho gravou `prepared` e `user_version=5` em WAL e terminou sem fechar
+  a conexão. A leitura SQLite `mode=ro` encontrou ambos: o cabeçalho do arquivo
+  principal ainda dizia versão 0, demonstrando por que não se deve ignorar o WAL.
+- DELETE pela conexão read-only foi recusado e os bytes do arquivo principal
+  ficaram intactos. Não se exige que os auxiliares SQLite nunca sejam tocados.
+- Revisão independente definiu coordenação online/offline, formato do snapshot,
+  limites e erros do canal. Nenhuma migração ou arquivo de código foi alterado;
+  o experimento verifica primitivas, não a implementação futura de `ext list`.
+- Revisão independente não encontrou bloqueadores na interação com os ADRs
+  036/038/039 nem no contrato administrativo.
+- Conferidos 156 links/âncoras locais, os 50 critérios, três exemplos JSON e
+  `git diff --check`. Nenhuma migração histórica foi alterada.
+- Critérios 47–50 devem virar testes do produto. Nenhuma suíte do core ou teste
+  de aceitação ponta a ponta foi executado nesta revisão.

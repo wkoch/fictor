@@ -349,7 +349,9 @@ acrescentar até 16 s de espera e preservar por mais 60 s uma contagem anterior;
 contrato normativo está em `02-core.md`, `03-kernel-protocol.md`,
 `06-lifecycle.md` e `schemas/0005_crash_recovery.sql`.
 
-## ADR-040 —Destinos exatos para registros de dependências (resolve ARQ-024)
+## ADR-040 — Destinos exatos para registros de dependências (resolve ARQ-024)
+
+**Data:** 2026-10-18.
 
 **Decisão:** `installer.registries` é uma allowlist de autoridades exatas, não uma
 lista de URLs nem um atalho para os curingas de `net.allow`. Aceita nome DNS com
@@ -366,3 +368,13 @@ de porta explícita para HTTP simples e destinos não públicos.
 **Escopo:** Fase 0, etapa de dependências. Não muda os padrões aceitos nas
 permissões de extensões, não cria gerenciador de registros, credenciais ou URLs
 base novas, nem antecipa origens externas da Fase 3. Sem migração.
+
+## ADR-041 — Listagem de configuração online e offline (resolve ARQ-025)
+
+- **Data:** 2026-10-18.
+- **Contexto.** A CLI promete listar extensões, mas a regra de comandos offline a exclui e a palavra “estado” confunde configuração com saúde de processos. Depois do ADR-036, ler o lock sem coordenar com o journal pode apresentar como concluída uma promoção ainda pendente.
+- **Decisão.** `fictor ext list` funciona com e sem servidor. Mostra somente a configuração selecionada no lock validado, com `id`, `active`, `version` e `enabled`. Não consulta nem afirma saúde, processos iniciados/parados, disponibilidade de tools ou ausência de crash loop. Online, usa `ext.list` no canal administrativo definido abaixo; offline, lê sob a posse exclusiva do home, sem mutações de estado da aplicação. Journal pendente impede a listagem; o comando não o reconcilia. Não há migração, tabela nem schema persistido novo.
+- **Motivo.** A posse exclusiva atual dura toda a vida do core. Um mutex do instalador não protege leitores em outro processo; adicionar uma segunda exclusão compartilhada ampliaria o protocolo de lock. Reusar `admin.sock` para o único consumidor necessário mantém uma seção crítica e um resultado.
+- **Consequências.** Uma linha significa configuração registrada, nunca “processo saudável”. Um home que precisa de migração ou reconciliação exige primeiro um comando autorizado a fazê-las. O método administrativo não altera o homônimo WebSocket nem define seus dados de recuperação para o gerenciador da Fase 0/M0.7.
+
+Contrato normativo em [02-core.md](02-core.md#listagem-de-extensões); critérios 47–50 da Fase 0.

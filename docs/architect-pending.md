@@ -2,6 +2,14 @@
 
 Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não significa implementação concluída.
 
+## ARQ-025 — Disponibilidade e estado de `fictor ext list`
+
+- **Status: resolvida em 2026-10-18 — [ADR-041](../spec/11-decisions.md).**
+- **Referência:** [CLI](../spec/02-core.md#listagem-de-extensões) e lock do ciclo de vida.
+- **Dúvida resolvida:** a listagem funciona online e offline; “estado” nesta CLI é somente habilitação administrativa, nunca saúde de processos.
+- **Resolução:** snapshot validado de ID/chave/versão/`enabled`, coordenado com o journal. Offline exige posse exclusiva e SQLite read-only considerando WAL; intenção pendente ou versão incompatível falha sem migrar/reconciliar. Online usa `ext.list` pelo contrato administrativo mínimo, sem fallback para arquivos. Critérios 47–50.
+- **Entrega ao implementador:** implementar CLI e handler administrativo, mantendo a consulta sem mutações de estado da aplicação; testes e gate de release continuam pendentes.
+
 ## ARQ-020 — Recuperação da promoção entre filesystem, lock e evento
 
 - **Status: resolvida em 2026-10-18 — [ADR-036](../spec/11-decisions.md).**

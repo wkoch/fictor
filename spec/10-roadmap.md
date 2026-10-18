@@ -92,6 +92,11 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 
 46. Registros de dependências (ADR-040): defaults e destinos exatos normalizam sem perder a presença explícita de porta. Wildcards, URLs, CIDR, porta inválida, localhost/IP sem porta e rota interna de modelo invalidam a lista inteira. Host sem porta não acessa HTTP ou IP privado, inclusive após salvar/recarregar. Com servidores locais e DNS falso, artefato/redirect fora da lista recebe zero requisições; configurar explicitamente o segundo destino permite a etapa, mas não um terceiro. Manifest, lockfile, aliases e configuração de pacote não ampliam destinos, não desligam proxy/TLS nem expõem credenciais. Nenhuma rede externa ou chave real nos testes.
 
+47. A mesma configuração válida produz os mesmos campos e ordem na CLI com core ativo e parado, incluindo extensão desabilitada e lock válido vazio. `enabled:true` não gera rótulo de processo rodando; a listagem não faz spawn, smoke, notificações ou eventos.
+48. Offline, home/banco/lock ausentes, `user_version` menor/maior, JSON duplicado/inválido ou journal inconsistente falham sem inicializar/migrar/alterar estado da aplicação. Uma intenção `prepared` presente somente no WAL também produz `recovery_required`; não é ignorada lendo só o arquivo principal. Nenhum evento, snapshot ou lock é modificado pela consulta.
+49. Concorrer a listagem com rename/commit de promoção nunca expõe candidata antes do compromisso nem combina snapshots. Posse ocupada e admin inacessível falham sem leitura alternativa dos arquivos. A consulta não aborta nem conclui journal.
+50. Canal administrativo: peer de outro UID, notificações/batches, método desconhecido, parâmetros extras, envelope/chaves duplicadas, UTF-8 inválido, mensagem acima de 16 MiB e resposta com schema desconhecido não executam operações. Limites e erros não geram lista parcial. Testes de leitura verificam estado lógico; não assumem que abrir SQLite read-only nunca toca seus arquivos auxiliares.
+
 Fora da Fase 0: propostas da IA, surfaces, hooks, web, evals, terceiros.
 
 ## Marco de autossuficiência (v0.1)

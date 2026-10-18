@@ -71,6 +71,8 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `runtime.rollback` | `{name, nonce}` | Volta o runtime à versão anterior. |
 | `workspace.clear_flag` | `{workspace}` | Apaga a flag U do workspace. Exige confirmação no modal, que mostra a sessão de origem. |
 
+O `ext.list` deste WebSocket pertence ao gerenciador de extensões. É distinto do método homônimo do [canal administrativo da CLI](02-core.md#canal-administrativo-mínimo); seu formato não é substituído pelo snapshot de configuração do ADR-041. A UI continua mostrando esperas/bloqueios por chave e sessão conforme ADR-039, sem confundir esses dados com `enabled`.
+
 ### Servidor → cliente
 
 | `type` | Campos |

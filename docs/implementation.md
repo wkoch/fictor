@@ -132,7 +132,7 @@ reinício do serviço são ações do usuário, fora do sandbox.
 2. Completar M0.5, incluindo aplicação/testes dos ADRs 025–029 e dos requisitos Atomic;
    resolvers, promoção, lock, ativação, recuperação e backoff.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
-4. Seguir M0.6–M0.10 e os **46 critérios da Fase 0**, incluindo autossuficiência,
+4. Seguir M0.6–M0.10 e os **50 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
 
 ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural não implica
@@ -147,3 +147,7 @@ humanos, posse/recuperação de instâncias, crash loops e fronteira dos registr
 0004/0005, schema de overrides e critérios 38–46 estão no spec. Este registro
 abrange apenas arquitetura na branch principal; não incorpora nem certifica o
 código em andamento na branch do implementador.
+
+ARQ-025 resolvida pelo ADR-041: `ext list` consulta configuração online/offline
+sem afirmar saúde; leitura coordenada com o journal e canal administrativo mínimo
+definidos. Critérios 47–50 aguardam implementação e testes do produto.

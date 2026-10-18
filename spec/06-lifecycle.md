@@ -355,7 +355,7 @@ Staging novo usa nomes derivados da intenção: `quarantine/.promotion-<operatio
 
 ## Lock
 
-`extensions/lock.json` é a fonte de verdade das extensões ativas depois de reconciliar o journal de promoção. Enquanto houver intenção `prepared`, o lock sozinho não autoriza ativação. Só o instalador escreve nele.
+`extensions/lock.json` é a fonte de verdade das extensões ativas depois de reconciliar o journal de promoção. Enquanto houver intenção `prepared`, o lock sozinho não autoriza ativação. Só o instalador escreve nele. A [listagem de configuração](02-core.md#listagem-de-extensões) coordena a leitura com o journal, recusa promoção pendente e não a reconcilia como efeito de uma consulta.
 
 ```json
 {

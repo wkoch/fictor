@@ -53,7 +53,7 @@ Regras:
 | Core ↔ extensão (Kernel Protocol) | Unix socket por instância no host, exposto dentro do sandbox por `__sandbox-init` como TCP em `127.0.0.1:3129`. JSON-RPC delimitado por linha. | serviços do kernel. Ver [03-kernel-protocol.md](03-kernel-protocol.md#transporte). |
 | Extensão → internet | HTTP(S) via egress proxy do core | allowlist por domínio, log, contaminação. |
 | Extensão → modelo | HTTP via proxy para o host interno `models.fictor.internal` | o core injeta a chave e repassa via TLS. |
-| CLI ↔ core | Unix socket `run/admin.sock` (0600) | comandos administrativos. |
+| CLI ↔ core | Unix socket `run/admin.sock` (0600), JSON-RPC por linha | [Contrato administrativo mínimo](02-core.md#canal-administrativo-mínimo); canal separado do Kernel Protocol e do WebSocket. |
 
 ## Fluxo de um turno
 
