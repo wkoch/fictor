@@ -4,6 +4,7 @@ pub mod lease;
 pub mod local;
 pub mod lock;
 pub mod manifest;
+pub mod promotion;
 pub mod recovery;
 
 pub use bundle::{
