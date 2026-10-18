@@ -316,6 +316,132 @@ async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
 }
 
+#[tokio::test]
+async fn session_admission_rejects_missing_and_archived_sessions_without_starting_a_process() {
+    let fixture = Fixture::new().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf 'unexpected\n' > "$FICTOR_WORKSPACE/unexpected.process""#,
+    );
+    // A normal MCP process may have no kernel channel. Admission must not rely
+    // on KernelServer::bind to check the persisted session.
+    let manifest = manifest(
+        json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+        true,
+        true,
+    );
+    let missing = ulid::Ulid::generate().to_string();
+    assert!(matches!(
+        fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                "1.0.0-000000000000",
+                Some(&missing),
+                Some(&fixture.workspace),
+            )
+            .await,
+        Err(SupervisorError::Invalid)
+    ));
+    let session = fixture.session().await;
+    let archived = session.clone();
+    fixture
+        .store
+        .write(move |database| {
+            database.execute("UPDATE sessions SET archived=1 WHERE id=?1", [archived])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                "1.0.0-000000000000",
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await,
+        Err(SupervisorError::Invalid)
+    ));
+    assert!(!fixture.workspace.join("unexpected.process").exists());
+    assert!(!fixture.home.join("extensions/data/test-extension").exists());
+    assert!(
+        fs::read_dir(fixture.home.join("run"))
+            .unwrap()
+            .all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "pid"))
+    );
+}
+
+#[tokio::test]
+async fn session_workspace_must_match_the_store_and_accepts_a_canonical_alias() {
+    let fixture = Fixture::new().await;
+    let session = fixture.session().await;
+    let bundle = fixture.bundle(
+        false,
+        r#"printf '%s\n' "$FICTOR_WORKSPACE" > "$FICTOR_WORKSPACE/admitted.workspace""#,
+    );
+    let permissions = json!({"fs":{"write":["${workspace}"]},"spawn":true});
+    for mcp in [false, true] {
+        let manifest = manifest(permissions.clone(), true, mcp);
+        assert!(matches!(
+            fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    "1.0.0-000000000000",
+                    Some(&session),
+                    Some(&fixture.real_home),
+                )
+                .await,
+            Err(SupervisorError::Path | SupervisorError::Invalid)
+        ));
+        let other = fixture._root.path().join("other-workspace");
+        fs::create_dir_all(&other).unwrap();
+        assert!(matches!(
+            fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    "1.0.0-000000000000",
+                    Some(&session),
+                    Some(&other),
+                )
+                .await,
+            Err(SupervisorError::Invalid)
+        ));
+        assert!(!other.join("admitted.workspace").exists());
+    }
+    let alias = fixture._root.path().join("workspace-alias");
+    std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+    let manifest = manifest(permissions, true, false);
+    let mut instance = fixture
+        .supervisor
+        .spawn(
+            &manifest,
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session),
+            Some(&alias),
+        )
+        .await
+        .unwrap();
+    assert_eq!(instance.wait().await.unwrap().code, Some(0));
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("admitted.workspace")).unwrap(),
+        format!("{}\n", fixture.workspace.display())
+    );
+}
+
 fn namespace_members(namespace: &str) -> Vec<u32> {
     fs::read_dir("/proc")
         .unwrap()

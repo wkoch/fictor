@@ -448,6 +448,24 @@ impl Supervisor {
                 .map_err(|_| SupervisorError::Audit)?;
             session = Some(created.id);
         }
+        if let Some(session) = &session {
+            let stored =
+                self.store
+                    .session(session.clone())
+                    .await
+                    .map_err(|error| match error {
+                        crate::store::StoreError::NotFound => SupervisorError::Invalid,
+                        _ => SupervisorError::Audit,
+                    })?;
+            // The session, rather than a caller-supplied path, owns the
+            // workspace identity. Check even MCP-only processes without kernel.
+            if stored.archived
+                || stored.kind == "system"
+                || stored.workspace.as_deref().map(Path::new) != workspace.as_deref()
+            {
+                return Err(SupervisorError::Invalid);
+            }
+        }
         let data_base = self.home.join("extensions/data");
         let data = if smoke {
             data_base.join(&manifest.id).join("smoke").join(&id)
