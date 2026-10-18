@@ -122,9 +122,24 @@ O supervisor gera um perfil SBPL por instância e executa `/usr/bin/sandbox-exec
 (allow network-outbound (remote unix-socket (path-literal "<socket do kernel>")))
 ```
 
-`${tmp}` no macOS é `$TMPDIR/fictor/<instance_id>`, removido ao encerrar a instância.
+`${tmp}` no macOS é `$TMPDIR/fictor/<instance_id>`, removido só depois que a árvore da instância estiver vazia ([02-core.md](02-core.md#encerramento)).
 
 `sandbox-exec` é uma API depreciada pela Apple, mas é usada por Codex e Claude Code. Monitorar e manter o tier `vm` como alternativa.
+
+#### Contenção de processos no macOS
+
+O macOS não tem namespace de PID. Com `spawn: true`, um descendente pode chamar `setsid()`, trocar de grupo ou ficar órfão e ser adotado pelo `launchd`. O Seatbelt continua aplicado a ele, mas o processo sobreviveria ao encerramento por grupo.
+
+- **Identidade pelo perfil.** Um processo pertence à instância se todas as condições valerem:
+  1. tem o mesmo UID do core;
+  2. está sob sandbox: `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)` retorna 1;
+  3. o perfil dele permite escrever no caminho exclusivo `${tmp}/.instance`: `sandbox_check(pid, "file-write-data", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, <caminho>)` retorna 0.
+
+  Essa identidade não muda com `setsid`, troca de grupo, orfandade ou limpeza do ambiente, porque o perfil é herdado e não pode ser trocado.
+- **Varredura.** Listar os processos do UID (`proc_listpids`) e aplicar o teste. No encerramento, repetir até não sobrar membro, por até 10 s, enviando SIGKILL a cada membro. Antes de cada sinal, testar de novo o mesmo PID, para não atingir um PID reutilizado.
+- **`spawn: false`.** O perfil nega `process-fork` e só permite `process-exec` do binário do runtime, então a árvore tem um único processo.
+- **Rede e kernel.** Os tokens são revogados antes dos sinais. Um processo que escape fica sem proxy e sem kernel.
+- **Validação.** `sandbox_check` é exportada pela `libsystem_sandbox`, mas não é documentada pela Apple. O implementador DEVE validá-la em cada versão suportada do macOS com o teste adversarial do roadmap. Se ela ficar indisponível, o fallback é rastrear por ancestralidade (`kqueue` com `NOTE_FORK`/`NOTE_EXIT` e `proc_listchildpids`). Nesse caso, o `doctor` avisa e a fuga vira risco residual.
 
 ### Tiers de isolamento
 
@@ -304,5 +319,6 @@ Senão, o resultado é `untrusted`. Valores fechados não carregam instruções;
 | Segredo via env visível para a extensão | Allowlist de rede obrigatória; injeção no proxy | 3 |
 | `spawn: false` não aplicado para node/python no Linux | Documentado na aprovação; seccomp | 3 |
 | Seatbelt depreciado | Tier `vm` | 4 |
+| macOS: sem `sandbox_check` utilizável, um descendente que se separe entre duas varreduras escapa do encerramento (continua sob Seatbelt, sem rede e sem kernel) | Identidade pelo perfil; fallback por ancestralidade; varredura no boot | 0 |
 | Instruções maliciosas dentro de skills | Revisão no pipeline; skills só de bundles promovidos | 3 |
 | Fadiga de aprovação | Grants por sessão; motivo explícito; modo `auto` com Rule of Two | — |

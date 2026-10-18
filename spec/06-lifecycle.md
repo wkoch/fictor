@@ -45,7 +45,7 @@ Toda transição grava evento `ext.*` na sessão `sys` e notifica o shell (`prop
 - Se não houver `fictor.yaml` (origens externas), gerar o manifest pela tabela de [04-extensions.md](04-extensions.md#importação-de-formatos-externos-fase-3), com classificação restritiva.
 - Validar o manifest contra [schemas/extension.schema.json](schemas/extension.schema.json) e as regras semânticas, todas bloqueantes:
   - templates válidos para o escopo e regras de escopo de kernel e de acesso a dados ([04-extensions.md](04-extensions.md#escopo-e-templates-de-caminho));
-  - `role: harness` com `scope: session` e sem `hooks`; `hooks_api` presente quando há hooks;
+  - combinações de `runtime`, `mcp`, `role`, `scope`, `kernel`, `hooks`, `surfaces` e `tools` ([04-extensions.md](04-extensions.md#combinações-válidas)); `hooks_api` presente quando há hooks;
   - nenhum nome reservado em `permissions.env` ou `permissions.secrets[].env`, e nenhum nome repetido entre os dois ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas));
   - `net.allow` válido semanticamente, com IPv6 normalizado ([04-extensions.md](04-extensions.md#sintaxe-de-netallow));
   - `secrets` não vazio exige `net.allow` não vazio e sem `*` ([05-security.md](05-security.md#segredos));
@@ -94,19 +94,40 @@ chave_store = <version> + "-" + primeiros 12 hex do bundle_hash
 | Checagem | Fase | Resultado |
 |---|---|---|
 | Schema e regras semânticas do manifest | 0 | bloqueia |
-| Smoke test: subir no sandbox **sem rede** e com segredos substituídos por honeytokens; `initialize`, `tools/list`, `resources/list` em até 15 s | 0 | bloqueia |
+| Smoke test no [ambiente de verificação](#ambiente-de-verificação): `initialize`, `tools/list`, `resources/list` em até 15 s | 0 | bloqueia |
 | Hooks declarados têm tool `hook_*` correspondente; surfaces declaradas têm resource correspondente | 0 | bloqueia |
 | Resumo de permissões | 0 | informativo |
 | Diff de permissões contra a versão ativa (expansões destacadas) | 1 | informativo |
-| Testes (`tests.command`) no sandbox com as permissões do manifest, sem rede, timeout 300 s | 1 | bloqueia |
+| Testes (`tests.command`) no ambiente de verificação, timeout 300 s | 1 | bloqueia |
 | Varredura de padrões de risco: `eval`, `new Function`, `child_process`, `Deno.Command`, `subprocess`, `os.system`, `fetch`/`WebSocket` com URL literal, blobs base64 > 1 KiB, linhas > 1000 caracteres, caracteres bidi e de largura zero, comentários HTML em `SKILL.md` | 1 | informativo |
 | Dependências novas (fora das já presentes em bundles ativos e de `[installer] trusted_packages`) | 1 | informativo; impede promoção automática |
 | Vulnerabilidades conhecidas das dependências (OSV) | 3 | informativo; `critical` bloqueia |
 | Segredos no código (formatos conhecidos de chave) | 3 | informativo |
 | Capacidades inferidas × declaradas: hosts e caminhos literais no código fora de `net.allow`/`fs` | 3 | informativo |
-| Execução comportamental com honeytokens e registro de tentativas de rede negadas | 3 | informativo |
+| Execução comportamental no ambiente de verificação, com registro de tentativas de rede negadas e de honeytokens que apareçam em requisições | 3 | informativo |
 
 O smoke test produz a lista de tools que será fixada no lock.
+
+#### Ambiente de verificação
+
+Código ainda não aprovado (smoke, testes, execução comportamental e evals de candidatas) nunca toca dados reais. Ele roda com o sandbox normal do manifest, com estas substituições:
+
+| Recurso | No ambiente de verificação |
+|---|---|
+| `FICTOR_HOME` | Temporário próprio: config mínima, banco novo e store só com o bundle verificado. Apagado ao fim. |
+| `${workspace}` | Diretório temporário vazio, ou cópia de `tests/fixtures/workspace/` do bundle, se existir. |
+| `${ext_data}`, `${tmp}` | Temporários vazios. |
+| `${store}` | O store temporário. |
+| Caminhos absolutos e `~/` de `fs.read`/`fs.write` | Não concedidos. No Linux o caminho não existe no namespace; no macOS o Seatbelt nega o acesso. Não há substituição por dados sintéticos. |
+| `sandbox.home_ro_files` | Não montados. |
+| Rede | Nenhuma: o proxy nega tudo e registra as tentativas. |
+| Model proxy | Nega tudo com 403 `{"error": "fictor_preapproval"}`. |
+| Segredos | Honeytokens aleatórios. Um honeytoken numa requisição negada vira achado. |
+| Kernel Protocol | Servido sobre o banco temporário. |
+
+Regra para autores: `initialize`, `tools/list` e `resources/list` não podem depender de caminhos absolutos, rede, modelo ou segredos. O acesso a esses recursos acontece nas chamadas de tool. A tela de revisão lista os caminhos que não foram concedidos durante a verificação.
+
+Evals de candidatas ([09-evals.md](09-evals.md)) seguem a mesma regra para caminhos absolutos e segredos. O acesso a modelos é a exceção, porque é o objeto da medição.
 
 ### 6. Auditoria por IA (Fase 3)
 

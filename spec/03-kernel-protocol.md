@@ -19,8 +19,8 @@ O manifest declara os escopos em `kernel: [...]`. O core recusa com `SCOPE_DENIE
 
 | Escopo | Métodos | Observação |
 |---|---|---|
-| `events.read` | `events.get`, `events.path`, `events.query` | Instância de sessão: só a linhagem da própria sessão. Instância global: todas as sessões, e as flags dos eventos lidos entram na marca d'água da extensão (Fase 1). |
-| `events.write` | `events.append` | Kinds `x.<ext_id>.*`. O harness também pode `assistant.*` e `harness.*`. |
+| `events.read` | `events.get`, `events.path`, `events.query` | Instância de sessão: só a linhagem da própria sessão. Instância global (Fase 1): todas as sessões, e as flags dos eventos lidos entram na marca d'água da extensão. |
+| `events.write` | `events.append` | Kinds `x.<ext_id>.*`. O harness também pode `assistant.*` e `harness.*`. Instância de sessão: só na própria sessão. Instância global (Fase 1): `sys` ou qualquer sessão, com a proveniência da tabela [Proveniência dos eventos](#proveniência-dos-eventos). |
 | `sessions` | `sessions.get`, `sessions.fork`, `sessions.delegate` (Fase 2), `sessions.complete` (Fase 2) | Só instâncias de sessão. |
 | `sessions.input` | `sessions.input` | Injeta entrada e dispara um turno do agente. |
 | `blobs` | `blobs.put`, `blobs.get` | Conhecer o hash é a capacidade de leitura. |
@@ -367,7 +367,7 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `approval.decided` | user | `{approval_id, decision, scope}` |
 | `hook.failed` | core | `{point, ext_id, error}` |
 | `net.denied` | core | `{ext_id, host, count}` |
-| `ext.started`, `ext.stopped`, `ext.crashed`, `ext.tools_changed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
+| `ext.started`, `ext.stopped`, `ext.crashed`, `ext.tools_changed`, `ext.cleanup_failed` | core | `{ext_id, key, instance_id, ...}` — sessão `sys` |
 | `ext.proposed`, `ext.promoted`, `ext.rejected`, `ext.rolled_back` | core ou user | `{proposal_id?, ext_id, key}` — sessão `sys` |
 | `workspace.flagged` | core | `{workspace, flag: "U", session_id, source_event_id}` — sessão `sys` |
 | `workspace.cleared` | user | `{workspace}` — sessão `sys` |
@@ -396,7 +396,9 @@ Notificação extensão → core: `log { level: "debug" | "info" | "warn" | "err
 | `user.message`, `session.*`, `approval.decided` | trusted | public |
 | `tool.result` | ver [05-security.md](05-security.md#proveniência) | classificação da tool |
 | `ui.event` de surface, `ext.input` | `output_trust` default da extensão (`tools.default`), senão untrusted; combinado com a marca d'água se a extensão for global | `tools.default`, senão private; combinado com a marca d'água |
-| `events.append` por extensão | trusted | public |
+| `events.append` por instância de sessão, na própria sessão | trusted | public |
+| `events.append` por instância global, em sessão diferente de `sys` (Fase 1) | `output_trust` default da extensão (`tools.default`), senão untrusted, combinado com a marca d'água; acende as flags da sessão | `tools.default`, senão private, combinado com a marca d'água |
+| `events.append` por instância global, em `sys` | trusted | public |
 | demais eventos do core | trusted | public |
 
-Eventos gravados por extensões via `events.append` não acendem flags. Isso é seguro porque toda entrada de dados nesses processos já passou por um canal mediado que acendeu as flags da sessão ([05-security.md](05-security.md#fluxo-entre-sessões)), e as flags são cumulativas.
+Eventos gravados por instâncias de sessão na própria sessão não acendem flags. Isso é seguro porque toda entrada de dados nesses processos já passou por um canal mediado que acendeu as flags da sessão ([05-security.md](05-security.md#fluxo-entre-sessões)), e as flags são cumulativas. Instâncias globais recebem dados de várias sessões, por isso o que elas gravam numa sessão acende flags e carrega a marca d'água. Na Fase 0 não há instâncias globais com processo ([04-extensions.md](04-extensions.md#combinações-válidas)).

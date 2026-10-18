@@ -96,13 +96,13 @@ evals: evals
 |---|---|---|
 | `schema` | sim | Sempre `1`. |
 | `id` | sim | `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`, até 40 caracteres. Sem `_`. |
-| `version` | sim | Semver. Pode se repetir entre builds; o store distingue por hash. |
+| `version` | sim | SemVer 2.0.0, inclusive pré-release e `+build`, até 64 caracteres. Pode se repetir entre builds; o store distingue por hash. Ordem: precedência SemVer, que ignora `+build`; empates são desfeitos pela data de aprovação. |
 | `name`, `description` | `description` sim | Texto para UI e catálogo. |
-| `role` | não | `extension` (default) ou `harness`. Harness exige `scope: session` e não pode ter `hooks`. |
+| `role` | não | `extension` (default) ou `harness`. Ver [Combinações válidas](#combinações-válidas). |
 | `hooks_api` | se `hooks` | Versão da API de hooks esperada (atual: `1`). |
-| `scope` | não | `global` (default) ou `session`. |
+| `scope` | não | `global` (default) ou `session`. Extensões globais com processo só a partir da Fase 1. |
 | `runtime` | sim | Ver [Runtimes](#runtimes). |
-| `mcp` | não | Default `true` se `runtime.kind` ≠ `none`. |
+| `mcp` | não | Default `true` se `runtime.kind` ≠ `none`, `false` se `none`. |
 | `kernel` | não | Escopos do [Kernel Protocol](03-kernel-protocol.md#escopos). |
 | `hooks` | não | Lista de `{point, priority?, timeout_ms?}`. Exige tool `hook_<point>` no servidor. |
 | `tools` | não | Classificação por tool e `default`. Ver [Classificação](#classificação-de-tools). |
@@ -113,6 +113,20 @@ evals: evals
 | `isolation` | não | `os` (default), `container`, `vm`. |
 | `tests` | não | `{command: string[]}` executado no sandbox durante as checagens. |
 | `evals` | não | Diretório de evals (Fase 2). |
+
+### Combinações válidas
+
+Regras bloqueantes na validação (etapa 2 do pipeline); o schema cobre as estruturais.
+
+| Caso | Exige | Proíbe |
+|---|---|---|
+| `runtime.kind: none` | `mcp: false` (ou ausente) | `role: harness`, `kernel`, `hooks`, `surfaces`, `tools`, `permissions`. Permite só `skills`, `commands`, `tests`, `evals`. |
+| `runtime.kind: remote` (Fase 3) | `mcp: true` (ou ausente), `scope: global` | `role: harness`, `kernel`, `hooks`, `permissions` (o core deriva a rede do host de `runtime.url`), `isolation` diferente de `os` |
+| `role: harness` | runtime com processo (`deno`, `node`, `python`, `binary`), `scope: session`, `mcp: false` | `hooks`, `surfaces`, `tools` |
+| Runtime com processo e `mcp: false` | `kernel` com pelo menos um escopo | `hooks`, `surfaces`, `tools` |
+| `scope: global` com runtime com processo | Fase 1 ou posterior. Na Fase 0, o instalador recusa com motivo `phase:global`, porque a marca d'água ainda não existe | — |
+
+`hooks` e `surfaces` exigem um servidor MCP, então só existem com `mcp: true`.
 
 ## Runtimes
 

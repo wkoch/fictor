@@ -164,3 +164,46 @@ Formato: contexto, decisão, consequências. Para mudar uma decisão, adicionar 
   - Nomes inválidos e colisões por maiúsculas/minúsculas ou NFC são recusados.
   - Tabela em [06-lifecycle.md](06-lifecycle.md#limites).
 - **Consequências.** Memória e tempo limitados em todas as origens. O hash e o store ficam iguais em Linux e macOS. Uma pasta local de desenvolvimento com `node_modules/` instala sem custo extra. A verificação de colisão por NFC exige normalização Unicode no core.
+
+## ADR-025 — Extensões globais só a partir da Fase 1 (resolve ARQ-014)
+
+- **Contexto.** Uma instância global recebe dados de várias sessões e pode gravar eventos em qualquer uma. Sem a marca d'água, prevista para a Fase 1, isso levaria conteúdo privado ou não confiável de uma sessão para outra como `trusted/public`.
+- **Decisão.**
+  - Na Fase 0, o instalador recusa bundles `scope: global` com processo (motivo `phase:global`). Bundles `runtime: none` continuam permitidos.
+  - A partir da Fase 1, junto com a marca d'água: `events.append` de instância global numa sessão diferente de `sys` sai com a classificação default da extensão combinada com a marca e acende as flags da sessão. `sessions.input` e `events.read` globais seguem a mesma regra ([03-kernel-protocol.md](03-kernel-protocol.md#proveniência-dos-eventos)).
+- **Consequências.** A Fase 0 só tem instâncias de sessão, cujos dados já foram contabilizados. As extensões first-party globais (`web`, `search`) chegam na Fase 1, quando a mediação existe.
+
+## ADR-026 — SemVer completo no manifest (resolve ARQ-015)
+
+- **Contexto.** A expressão do schema recusava `+build` válido e aceitava pré-releases inválidas, como `1.0.0-01`.
+- **Decisão.** Usar a expressão oficial de semver.org, com até 64 caracteres. A ordem segue a precedência SemVer, que ignora `+build`; empates são desfeitos pela data de aprovação. Rollback continua usando a ordem de aprovação, não a de versão.
+- **Consequências.** A comparação de versões, usada pelo watcher da Fase 3, fica bem definida. A chave do store `<version>-<hash12>` continua inequívoca, porque o hash vem depois do último hífen.
+
+## ADR-027 — Combinações válidas de runtime, MCP e papel (resolve ARQ-016)
+
+- **Contexto.** O schema aceitava manifests impossíveis, como `runtime: none` com `mcp: true` ou harness sem processo.
+- **Decisão.** Tabela normativa em [04-extensions.md](04-extensions.md#combinações-válidas), aplicada no schema e na validação semântica:
+  - `none` é só para skills, comandos, testes e evals;
+  - `remote` exige MCP e é global, sem kernel, hooks nem permissões declaradas;
+  - harness exige processo, `scope: session` e `mcp: false`, sem hooks, surfaces ou tools;
+  - processo sem MCP precisa de pelo menos um escopo de kernel.
+- **Consequências.** O supervisor nunca precisa inventar um processo nem um handshake. Os erros aparecem na validação, não no spawn.
+
+## ADR-028 — Ambiente de verificação para código não aprovado (resolve ARQ-017)
+
+- **Contexto.** O smoke e os testes rodam código ainda não aprovado. Conceder a ele os caminhos absolutos ou `~/` declarados permitiria ler ou alterar dados reais antes da decisão humana. O macOS não permite remontar esses caminhos com conteúdo sintético.
+- **Decisão.**
+  - Toda execução anterior à aprovação usa um ambiente de verificação: `FICTOR_HOME` temporário, templates apontando para diretórios temporários, caminhos absolutos e `~/` não concedidos, sem rede, model proxy negando tudo e segredos substituídos por honeytokens ([06-lifecycle.md](06-lifecycle.md#ambiente-de-verificação)).
+  - Autores não podem depender desses recursos em `initialize`, `tools/list` ou `resources/list`.
+  - A revisão mostra os caminhos não concedidos.
+- **Consequências.** Bundles com caminhos absolutos passam pela verificação sem acesso aos dados reais. Uma extensão que leia esses caminhos já na inicialização falha no smoke e precisa ser corrigida pelo autor.
+
+## ADR-029 — Contenção de árvore de processos no macOS (resolve ARQ-018)
+
+- **Contexto.** No macOS não há namespace de PID. Com `spawn: true`, um descendente pode usar `setsid()`, trocar de grupo ou ficar órfão e sobreviver ao encerramento por grupo, ainda sob Seatbelt.
+- **Decisão.**
+  - A pertença à instância é decidida pelo perfil Seatbelt herdado: mesmo UID, processo sob sandbox e perfil que permite escrever em `${tmp}/.instance`, verificado com `sandbox_check`.
+  - O encerramento revoga os tokens, sinaliza e varre até não sobrar membro, por até 10 s. Sem confirmação, a instância vira `cleanup_failed` e os recursos ficam retidos. O boot do core varre instâncias que sobraram.
+  - Fallback por ancestralidade se `sandbox_check` não estiver disponível.
+  - Detalhes em [05-security.md](05-security.md#contenção-de-processos-no-macos) e [02-core.md](02-core.md#encerramento).
+- **Consequências.** A daemonização deixa de escapar, desde que `sandbox_check` funcione, o que precisa ser validado por teste adversarial a cada versão do macOS. No Linux nada muda: o namespace de PID já contém a árvore.

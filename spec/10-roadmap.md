@@ -64,6 +64,10 @@ Resultado: um agente de código básico (nível Pi/Claude Code mínimo) rodando 
 20. `secrets.backend = "keyring"` com o keyring indisponível: `fictor secrets set` falha sem criar `secrets.toml`, e o model proxy responde 503 `fictor_secret_unavailable`.
 21. NAT64: com `nat64_prefixes` contendo um prefixo /96 e um /64 (globais de teste, fora das faixas não públicas), um nome que resolve para um endereço desses prefixos com IPv4 embutido `192.168.1.1` é negado sem regra exata para `192.168.1.1:<porta>`. Um destino em `64:ff9b:1::/48` é negado sem regra exata. Um prefixo com bits de host impede o core de subir.
 22. `fictor ext install` de um diretório com 5 001 arquivos vazios falha com `limit:entries` sem ultrapassar o tempo limite. Um diretório com `node_modules/` na raiz instala, e `node_modules/` aparece na lista de ignorados. Um diretório com `A.txt` e `a.txt` falha.
+23. Na Fase 0, instalar um bundle `scope: global` com processo falha com `phase:global`. Um bundle `runtime: none` só com skills instala.
+24. São recusados: `runtime: none` com `mcp: true`; `role: harness` com `runtime: none`; processo com `mcp: false` sem `kernel`; versão `1.0.0-01`. A versão `1.0.0+build.5` é aceita.
+25. Bundle com `fs.read: ["~/Documents/x"]`: o smoke passa sem acesso ao caminho real, um teste do bundle que tenta ler o caminho falha, e a tela de revisão lista o caminho não concedido.
+26. macOS: uma extensão de teste com `spawn: true` faz fork duplo e `setsid()`, e o pai sai. Depois do encerramento da instância, nenhum processo dela existe. Matar o core com SIGKILL e subir de novo também elimina os processos que sobraram.
 
 Fora da Fase 0: propostas da IA, surfaces, hooks, web, compactação, evals, terceiros.
 
@@ -94,6 +98,7 @@ Critérios de aceitação:
 8. Uma conversa longa passa do limite de contexto e continua após `harness.compaction`.
 9. Uma extensão global de teste com estado, chamada por uma sessão com U, devolve resultados `untrusted` a outra sessão; depois de "limpar estado", volta a `trusted`.
 10. Um hook `context.assemble` de extensão com `output_trust: untrusted` acende U na sessão que o invoca.
+11. Uma extensão global grava `x.<id>.*` numa sessão: o evento sai com a classificação default da extensão combinada com a marca d'água e acende as flags dessa sessão.
 
 ## Fase 2 — Histórico e qualidade
 

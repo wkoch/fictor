@@ -14,8 +14,10 @@
       "maxLength": 40
     },
     "version": {
+      "description": "SemVer 2.0.0 (expressão oficial de semver.org).",
       "type": "string",
-      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$"
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
     },
     "name": { "type": "string", "maxLength": 80 },
     "description": { "type": "string", "minLength": 1, "maxLength": 500 },
@@ -171,16 +173,61 @@
   },
   "allOf": [
     {
+      "description": "Harness: processo, scope session, sem MCP. spec/04-extensions.md#combinações-válidas",
       "if": { "properties": { "role": { "const": "harness" } }, "required": ["role"] },
       "then": {
-        "properties": { "scope": { "const": "session" } },
-        "required": ["scope"],
-        "not": { "required": ["hooks"] }
+        "properties": {
+          "scope": { "const": "session" },
+          "mcp": { "const": false },
+          "runtime": { "properties": { "kind": { "enum": ["deno", "node", "python", "binary"] } } }
+        },
+        "required": ["scope", "mcp"],
+        "not": { "anyOf": [{ "required": ["hooks"] }, { "required": ["surfaces"] }, { "required": ["tools"] }] }
       }
     },
     {
       "if": { "required": ["hooks"] },
       "then": { "required": ["hooks_api"] }
+    },
+    {
+      "description": "Sem processo: só skills, commands, tests e evals.",
+      "if": { "properties": { "runtime": { "properties": { "kind": { "const": "none" } } } } },
+      "then": {
+        "properties": { "mcp": { "const": false } },
+        "not": {
+          "anyOf": [
+            { "required": ["kernel"] }, { "required": ["hooks"] }, { "required": ["surfaces"] },
+            { "required": ["tools"] }, { "required": ["permissions"] }
+          ]
+        }
+      }
+    },
+    {
+      "description": "MCP remoto (Fase 3): sem processo local; rede derivada de runtime.url.",
+      "if": { "properties": { "runtime": { "properties": { "kind": { "const": "remote" } } } } },
+      "then": {
+        "properties": {
+          "mcp": { "const": true },
+          "scope": { "const": "global" },
+          "isolation": { "const": "os" }
+        },
+        "not": { "anyOf": [{ "required": ["kernel"] }, { "required": ["hooks"] }, { "required": ["permissions"] }] }
+      }
+    },
+    {
+      "description": "Processo sem MCP: precisa de kernel e não pode ter hooks, surfaces nem tools.",
+      "if": {
+        "properties": {
+          "mcp": { "const": false },
+          "runtime": { "properties": { "kind": { "enum": ["deno", "node", "python", "binary"] } } }
+        },
+        "required": ["mcp"]
+      },
+      "then": {
+        "required": ["kernel"],
+        "properties": { "kernel": { "minItems": 1 } },
+        "not": { "anyOf": [{ "required": ["hooks"] }, { "required": ["surfaces"] }, { "required": ["tools"] }] }
+      }
     }
   ],
   "$defs": {

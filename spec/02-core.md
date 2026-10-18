@@ -43,8 +43,18 @@ Responsável por subir, monitorar e encerrar processos de extensão.
 ### Encerramento
 
 1. Enviar a notificação `shutdown` pelo Kernel Protocol (se houver canal) e fechar o stdin.
-2. Aguardar 3 s e enviar SIGTERM ao grupo de processos.
-3. Aguardar 2 s e enviar SIGKILL ao grupo.
+2. Aguardar 3 s, revogar os tokens de proxy e de kernel e enviar SIGTERM à árvore da instância.
+3. Aguardar 2 s e enviar SIGKILL à árvore.
+4. Confirmar que a árvore está vazia. Só então liberar `${tmp}`, os sockets e o slot da instância.
+
+A árvore da instância é:
+
+- **Linux:** o namespace de PID. Quando `__sandbox-init` (PID 1) morre, o kernel mata todos os processos do namespace. A confirmação é a saída do `bwrap`.
+- **macOS:** os processos identificados pelo perfil Seatbelt da instância ([05-security.md](05-security.md#contenção-de-processos-no-macos)). Grupo de processos não basta.
+
+Sem confirmação em 10 s: a instância fica `cleanup_failed`, o core grava `ext.cleanup_failed` na sessão `sys`, retém os recursos, mantém os tokens revogados e alerta no shell. Uma nova instância da mesma extensão pode subir, com identidade nova.
+
+O mesmo procedimento roda quando o processo raiz sai sozinho (crash) e, no boot do core, para cada `${tmp}` de instância que tenha sobrado de uma execução anterior.
 
 ### Falhas
 
