@@ -1559,3 +1559,113 @@ esac"#,
         assert_eq!(instance.wait().await.unwrap().code, Some(0), "{role}");
     }
 }
+
+#[tokio::test]
+async fn same_extension_sessions_keep_kernel_kv_and_data_private_after_the_other_session_writes() {
+    let fixture = Fixture::new().await;
+    let session_a = fixture.session().await;
+    let session_b = fixture.session().await;
+    let data = fixture.home.join("extensions/data/test-extension/sessions");
+    let data_a = data.join(&session_a);
+    let data_b = data.join(&session_b);
+    let bundle = fixture.bundle(
+        false,
+        r#"exec /usr/bin/python3 -I - <<'PY'
+import json, os, pathlib, socket, time
+
+channel = socket.create_connection(('127.0.0.1', 3129), timeout=5).makefile('rwb')
+sequence = 0
+def call(method, params):
+    global sequence
+    sequence += 1
+    channel.write((json.dumps({'jsonrpc':'2.0', 'id':sequence, 'method':method, 'params':params}) + '\n').encode())
+    channel.flush()
+    response = json.loads(channel.readline())
+    assert response['id'] == sequence and 'error' not in response, response
+    return response['result']
+
+hello = call('kernel.hello', {'protocol':1, 'token':os.environ['FICTOR_KERNEL_TOKEN']})
+assert hello['session']['id'] == os.environ['FICTOR_SESSION_ID']
+own = pathlib.Path(os.environ['DATA_PATH'])
+other = pathlib.Path(os.environ['OTHER_PATH']) / 'canary'
+value = os.environ['CANARY']
+assert call('kv.get', {'key':'same'})['value'] is None, 'another session KV is visible'
+assert not (own / 'canary').exists(), 'another session file is visible'
+def deny_other_file():
+    try:
+        other.read_text()
+    except OSError as error:
+        assert error.errno in (2, 13), error
+    else:
+        raise AssertionError('the other session real data path is readable')
+
+if value == 'session-b':
+    deny_other_file()
+call('kv.set', {'key':'same', 'value':value})
+(own / 'canary').write_text(value)
+if value == 'session-a':
+    (own / 'ready').write_text('ready')
+    deadline = time.monotonic() + 30
+    while not (own / 'resume').exists():
+        assert time.monotonic() < deadline, 'the other session never finished'
+        time.sleep(0.01)
+    deny_other_file()
+assert call('kv.get', {'key':'same'})['value'] == value, 'another session overwrote KV'
+assert (own / 'canary').read_text() == value, 'another session overwrote the file'
+PY"#,
+    );
+    let make_manifest = |own: &Path, other: &Path, value: &str| {
+        let mut manifest = manifest(
+            json!({"spawn":true,"fs":{"write":["${ext_data}"]},"env":{
+                "DATA_PATH":own.to_str().unwrap(),"OTHER_PATH":other.to_str().unwrap(),"CANARY":value
+            }}),
+            true,
+            false,
+        );
+        manifest.kernel = vec![KernelScope::Kv];
+        manifest
+    };
+    let mut first = fixture
+        .supervisor
+        .spawn(
+            &make_manifest(&data_a, &data_b, "session-a"),
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session_a),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    wait_file(&data_a.join("ready")).await;
+    let mut second = fixture
+        .supervisor
+        .spawn(
+            &make_manifest(&data_b, &data_a, "session-b"),
+            &bundle,
+            "1.0.0-000000000000",
+            Some(&session_b),
+            Some(&fixture.workspace),
+        )
+        .await
+        .unwrap();
+    let second_exit = tokio::time::timeout(Duration::from_secs(5), second.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    fs::write(data_a.join("resume"), b"resume").unwrap();
+    let first_exit = tokio::time::timeout(Duration::from_secs(5), first.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let log = fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap();
+    assert_eq!(second_exit.code, Some(0), "session B: {log}");
+    assert_eq!(first_exit.code, Some(0), "session A: {log}");
+    assert_eq!(
+        fs::read_to_string(data_a.join("canary")).unwrap(),
+        "session-a"
+    );
+    assert_eq!(
+        fs::read_to_string(data_b.join("canary")).unwrap(),
+        "session-b"
+    );
+}
