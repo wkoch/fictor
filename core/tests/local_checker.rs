@@ -1,10 +1,13 @@
 use fictor::{
     config::Config,
-    installer::local::{LocalChecker, LocalError},
+    installer::{
+        local::{LocalChecker, LocalError},
+        manifest::Manifest,
+    },
     proxy::{EgressProxy, nat64::Nat64Prefixes},
     secrets::{BackendKind, Redactor, SecretStore},
     store::{ProposalState, Store},
-    supervisor::Supervisor,
+    supervisor::{Supervisor, SupervisorError},
 };
 use std::{fs, path::Path, sync::Arc};
 
@@ -107,6 +110,7 @@ async fn runtime_dependencies_are_not_silently_skipped() {
         r#"{"dependencies":{"zod":"4.1.12"}}"#,
     )
     .unwrap();
+    fs::write(source.join("package-lock.json"), "{}").unwrap();
     let (checker, store) = setup(&home, &real).await;
     let error = checker.check_local(&source).await.err().unwrap();
     let LocalError::Failed {
@@ -152,12 +156,12 @@ async fn prepacked_node_skips_resolution_but_dependency_metadata_fails_closed() 
         (
             2,
             Some(r#"{"optionalDependencies":{"package":"1.0.0"}}"#),
-            "dependency resolver unavailable",
+            "dependency lockfile missing",
         ),
         (
             3,
             Some(r#"{"devDependencies":{"package":"1.0.0"}}"#),
-            "dependency resolver unavailable",
+            "dependency lockfile missing",
         ),
         (
             4,
@@ -195,6 +199,7 @@ async fn mcp_default_classification_is_not_a_required_tool_but_named_declaration
     let real = root.path().join("user");
     fs::create_dir(&real).unwrap();
     let (checker, store) = setup(&home, &real).await;
+    let toolbx = Path::new("/run/.toolboxenv").is_file();
     for (index, named, expected) in [
         (0, "", ProposalState::Checked),
         (1, "  echo: {}\n", ProposalState::Checked),
@@ -227,6 +232,18 @@ for await (const line of createInterface({ input: process.stdin })) {
 "#,
         )
         .unwrap();
+        if !toolbx && index == 0 {
+            let manifest =
+                Manifest::parse(&fs::read_to_string(source.join("fictor.yaml")).unwrap()).unwrap();
+            let supervisor =
+                test_supervisor(&home, &real, store.clone(), "runtime-guard.sock").await;
+            assert!(matches!(
+                supervisor
+                    .smoke(&manifest, &source, "0.1.0-000000000000")
+                    .await,
+                Err(SupervisorError::Unsupported)
+            ));
+        }
         let proposal = match checker.check_local(&source).await {
             Ok(report) => {
                 assert_eq!(report.catalog.tools().len(), 1);
@@ -237,12 +254,39 @@ for await (const line of createInterface({ input: process.stdin })) {
                 proposal_id,
                 reason,
             }) => {
-                assert_eq!(reason, "declared MCP tools or resources absent");
+                assert_eq!(
+                    reason,
+                    if toolbx {
+                        "declared MCP tools or resources absent"
+                    } else {
+                        "sandbox smoke failed"
+                    }
+                );
                 store.proposal(proposal_id).await.unwrap()
             }
             Err(error) => panic!("unexpected error: {error}"),
         };
-        assert_eq!(proposal.state, expected);
+        assert_eq!(
+            proposal.state,
+            if toolbx {
+                expected
+            } else {
+                ProposalState::Failed
+            }
+        );
+        if !toolbx {
+            let checks = proposal.checks.unwrap();
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check.name == "dependencies" && check.passed)
+            );
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| check.name == "smoke" && !check.passed)
+            );
+        }
         assert!(!home.join("extensions/lock.json").exists());
     }
 }

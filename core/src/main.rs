@@ -124,6 +124,12 @@ async fn main() -> anyhow::Result<()> {
                 .values()
                 .filter_map(|p| p.secret.clone())
                 .collect();
+            let dependency_resolver =
+                Arc::new(fictor::installer::dependencies::DependencyResolver::new(
+                    config.clone(),
+                    real_home.clone(),
+                    std::env::current_exe().context("resolver executável do core")?,
+                ));
             let supervisor = Arc::new(fictor::supervisor::Supervisor::new(
                 &home,
                 real_home,
@@ -138,7 +144,8 @@ async fn main() -> anyhow::Result<()> {
                 store,
                 supervisor,
                 provider_secrets,
-            );
+            )
+            .with_dependency_resolver(dependency_resolver);
             let result = checker.check_local(&path).await?;
             println!(
                 "{}",

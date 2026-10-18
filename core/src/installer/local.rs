@@ -2,6 +2,7 @@
 //! this module never activates a bundle or skips dependency resolution.
 use super::{
     BundleBudget, BundleError, BundleProfile, bundle,
+    dependencies::{self, DependencyReport, DependencyResolver},
     lease::InstallerLease,
     manifest::{Manifest, ManifestError, RuntimeKind, Scope},
     recovery,
@@ -62,6 +63,7 @@ pub struct LocalChecker {
     supervisor: Arc<Supervisor>,
     provider_secrets: std::collections::BTreeSet<String>,
     lease: Arc<OnceCell<Arc<InstallerLease>>>,
+    dependency_resolver: Option<Arc<DependencyResolver>>,
 }
 impl LocalChecker {
     pub fn new(
@@ -78,7 +80,13 @@ impl LocalChecker {
             supervisor,
             provider_secrets,
             lease: Arc::new(OnceCell::new()),
+            dependency_resolver: None,
         }
+    }
+
+    pub fn with_dependency_resolver(mut self, resolver: Arc<DependencyResolver>) -> Self {
+        self.dependency_resolver = Some(resolver);
+        self
     }
     /// Admit durably before opening source; all objective refusals retain their ID.
     pub async fn check_local(&self, source: &Path) -> Result<LocalReport, LocalError> {
@@ -328,63 +336,80 @@ impl LocalChecker {
             .map_err(|_| LocalError::Persistence {
                 proposal_id: proposal.id.clone(),
             })?;
-        // Vendored directories were intentionally discarded at receipt. Never
-        // pretend npm/uv dependencies were checked until stage 3 exists.
-        // A prepacked Node bundle without package.json dependencies needs no npm resolver.
-        let dependency_failure = match manifest.runtime.kind {
-            RuntimeKind::Binary | RuntimeKind::None => None,
-            RuntimeKind::Node => match node_dependencies(&destination) {
-                Ok(false) => None,
-                Ok(true) => Some("dependency resolver unavailable"),
-                Err(reason) => Some(reason),
+        let dependency_plan = dependencies::plan(manifest.runtime.kind, &destination);
+        let resolved = match dependency_plan {
+            Ok(Some(kind)) => match &self.dependency_resolver {
+                Some(resolver) => resolver
+                    .resolve(kind, &destination, lease.clone())
+                    .await
+                    .map(Some)
+                    .map_err(|error| error.reason()),
+                None => Err("dependency resolver unavailable"),
             },
-            _ => Some("dependency resolver unavailable"),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.reason()),
         };
-        if let Some(reason) = dependency_failure {
-            self.fail(&proposal.id, checks, "dependencies", reason)
-                .await?;
-            return Err(LocalError::Failed {
-                proposal_id: proposal.id,
-                reason,
-            });
-        }
-        checks.push(passed(
-            "dependencies",
-            Some("no runtime dependency installation required".into()),
-        ));
-        let inspected = destination.clone();
-        let inspection_lease = lease.clone();
-        let post = tokio::task::spawn_blocking(move || {
-            let _lease = inspection_lease;
-            bundle::inspect(
-                &inspected,
-                &BundleBudget::start(BundleProfile::PostDependencies),
-            )
-        })
-        .await;
-        let post = match post {
-            Ok(Ok(post)) => post,
-            Ok(Err(error)) => {
-                let reason = error.receipt_reason();
-                self.fail(&proposal.id, checks, "bundle", reason).await?;
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                self.fail(&proposal.id, checks, "dependencies", reason)
+                    .await?;
                 return Err(LocalError::Failed {
                     proposal_id: proposal.id,
                     reason,
                 });
             }
-            Err(_) => {
-                self.fail(
-                    &proposal.id,
-                    checks,
-                    "bundle",
-                    "bundle inspection interrupted",
+        };
+        checks.push(passed(
+            "dependencies",
+            Some(if resolved.is_some() {
+                "installed from locked dependencies with scripts and source builds disabled".into()
+            } else {
+                "no runtime dependency installation required".into()
+            }),
+        ));
+        let (post, packages) = if let Some(DependencyReport {
+            inspection,
+            packages,
+        }) = resolved
+        {
+            (inspection, packages)
+        } else {
+            let inspected = destination.clone();
+            let inspection_lease = lease.clone();
+            let post = tokio::task::spawn_blocking(move || {
+                let _lease = inspection_lease;
+                bundle::inspect(
+                    &inspected,
+                    &BundleBudget::start(BundleProfile::PostDependencies),
                 )
-                .await?;
-                return Err(LocalError::Failed {
-                    proposal_id: proposal.id,
-                    reason: "bundle inspection interrupted",
-                });
-            }
+            })
+            .await;
+            let post = match post {
+                Ok(Ok(post)) => post,
+                Ok(Err(error)) => {
+                    let reason = error.receipt_reason();
+                    self.fail(&proposal.id, checks, "bundle", reason).await?;
+                    return Err(LocalError::Failed {
+                        proposal_id: proposal.id,
+                        reason,
+                    });
+                }
+                Err(_) => {
+                    self.fail(
+                        &proposal.id,
+                        checks,
+                        "bundle",
+                        "bundle inspection interrupted",
+                    )
+                    .await?;
+                    return Err(LocalError::Failed {
+                        proposal_id: proposal.id,
+                        reason: "bundle inspection interrupted",
+                    });
+                }
+            };
+            (post, vec![])
         };
         checks.push(passed("bundle", None));
         let key = format!("{}-{}", manifest.version, &post.bundle_hash[7..19]);
@@ -455,7 +480,7 @@ impl LocalChecker {
                 ProposalUpdate {
                     checks: Some(checks),
                     hash: Some(post.bundle_hash),
-                    packages: Some(vec![]),
+                    packages: Some(packages),
                     ..Default::default()
                 },
             )
@@ -586,42 +611,6 @@ impl LocalChecker {
             })?;
         Ok(())
     }
-}
-fn node_dependencies(bundle: &Path) -> Result<bool, &'static str> {
-    let text = match read_manifest(&bundle.join("package.json")) {
-        Ok(text) => text,
-        Err(LocalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(false);
-        }
-        Err(_) => return Err("invalid package metadata"),
-    };
-    let package: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "invalid package metadata")?;
-    let package = package.as_object().ok_or("invalid package metadata")?;
-    let mut dependencies = false;
-    for name in [
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ] {
-        if let Some(value) = package.get(name) {
-            dependencies |= !value
-                .as_object()
-                .ok_or("invalid package metadata")?
-                .is_empty();
-        }
-    }
-    for name in ["bundledDependencies", "bundleDependencies"] {
-        if let Some(value) = package.get(name) {
-            dependencies |= match value {
-                serde_json::Value::Array(entries) => !entries.is_empty(),
-                serde_json::Value::Bool(enabled) => *enabled,
-                _ => return Err("invalid package metadata"),
-            };
-        }
-    }
-    Ok(dependencies)
 }
 fn informative(name: &str, detail: serde_json::Value) -> ProposalCheck {
     ProposalCheck {
