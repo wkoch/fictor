@@ -1,7 +1,7 @@
 //! Prepare approved bytes for activation. This operation never changes the lock,
 //! proposal state, audit log, or running processes; activation recovery awaits ADR.
 use super::{
-    BundleBudget, BundleError, BundleProfile, Inspection, bundle,
+    BundleBudget, BundleError, BundleProfile, Inspection, bundle, dependencies,
     lease::InstallerLease,
     manifest::{Manifest, RuntimeKind, Scope},
 };
@@ -73,6 +73,7 @@ fn materialize_owned(
     home: &Path,
     proposal: Proposal,
 ) -> Result<MaterializedBundle, PromotionError> {
+    let budget = BundleBudget::start(BundleProfile::PostDependencies);
     let (manifest, hash) = approved(&proposal)?;
     let key = format!("{}-{}", manifest.version, &hash[7..19]);
     let home_file = open_directory(home)?;
@@ -86,16 +87,19 @@ fn materialize_owned(
     // Unverified bytes remain outside the store. A crash can leave unreferenced
     // staging directories for later architectural recovery; none imply activation.
     let mut staging = Staging::new(&quarantine_path)?;
-    let inspection = bundle::copy_local(
-        &source,
-        &staging.bundle,
-        &BundleBudget::start(BundleProfile::PostDependencies),
-    )?;
+    let inspection = bundle::copy_local(&source, &staging.bundle, &budget)?;
     if inspection.bundle_hash != hash {
         return Err(PromotionError::Changed);
     }
-    check_manifest(&staging.bundle, &proposal)?;
-    staging.freeze(&inspection)?;
+    check_manifest(&staging.bundle, &proposal, &budget)?;
+    check_inventory(
+        &staging.bundle,
+        manifest.runtime.kind,
+        &proposal,
+        &inspection,
+        &budget,
+    )?;
+    staging.freeze(&inspection, &budget)?;
     let id = CString::new(manifest.id.as_str()).map_err(|_| PromotionError::UnsafePath)?;
     // SAFETY: store is a live directory descriptor and id is a validated single
     // manifest component. Existing directories are opened without following links.
@@ -118,15 +122,12 @@ fn materialize_owned(
     if existing {
         // A retry may reuse exactly these immutable bytes; collisions and
         // tampering fail closed, preserving the existing version and last lock.
-        let existing = bundle::inspect(
-            &destination,
-            &BundleBudget::start(BundleProfile::PostDependencies),
-        )?;
+        let existing = bundle::inspect(&destination, &budget)?;
         if existing.bundle_hash != hash || !existing.ignored.is_empty() {
             return Err(PromotionError::Changed);
         }
-        check_manifest(&destination, &proposal)?;
-        check_immutable(&destination)?;
+        check_manifest(&destination, &proposal, &budget)?;
+        check_immutable(&destination, &budget)?;
     } else {
         let staging_directory = open_directory(staging.temporary.path())?;
         let candidate = open_directory(&staging.bundle)?;
@@ -176,6 +177,7 @@ fn materialize_owned(
         staging_directory.sync_all()?;
         quarantine.sync_all()?;
     }
+    budget.check_time()?;
     Ok(MaterializedBundle {
         proposal_id: proposal.id,
         ext_id: manifest.id,
@@ -188,6 +190,7 @@ fn materialize_owned(
 fn approved(proposal: &Proposal) -> Result<(Manifest, String), PromotionError> {
     if proposal.state != ProposalState::Approved
         || proposal.decided_by.as_deref() != Some("user")
+        || proposal.packages.is_none()
         || proposal
             .source
             .get("kind")
@@ -245,7 +248,12 @@ fn approved(proposal: &Proposal) -> Result<(Manifest, String), PromotionError> {
     Ok((manifest, hash.clone()))
 }
 
-fn check_manifest(root: &Path, proposal: &Proposal) -> Result<(), PromotionError> {
+fn check_manifest(
+    root: &Path,
+    proposal: &Proposal,
+    budget: &BundleBudget,
+) -> Result<(), PromotionError> {
+    budget.check_time()?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -260,6 +268,54 @@ fn check_manifest(root: &Path, proposal: &Proposal) -> Result<(), PromotionError
     if proposal.manifest.as_ref() != Some(&normalized) {
         return Err(PromotionError::Changed);
     }
+    budget.check_time()?;
+    Ok(())
+}
+
+fn check_inventory(
+    root: &Path,
+    runtime: RuntimeKind,
+    proposal: &Proposal,
+    inspection: &Inspection,
+    budget: &BundleBudget,
+) -> Result<(), PromotionError> {
+    budget.check_time()?;
+    // Re-read package metadata only. An old successful check may predate an
+    // inventory fix; publication must not preserve an incomplete review list.
+    let planned = dependencies::plan(runtime, root).map_err(|_| PromotionError::Changed)?;
+    // A prepacked Node receipt skips npm and cannot acquire a dependency tree.
+    // Missing declarations must not hide physical packages from this review.
+    if runtime == RuntimeKind::Node
+        && planned.is_none()
+        && inspection
+            .files
+            .iter()
+            .any(|file| file.path.starts_with("node_modules"))
+    {
+        return Err(PromotionError::Changed);
+    }
+    let current = match planned {
+        Some(kind) => {
+            dependencies::inventory(kind, root, inspection).map_err(|_| PromotionError::Changed)?
+        }
+        None => vec![],
+    };
+    let approved = proposal
+        .packages
+        .as_deref()
+        .ok_or(PromotionError::Unapproved)?;
+    let current: BTreeSet<_> = current
+        .iter()
+        .map(|package| (&package.ecosystem, &package.name, &package.version))
+        .collect();
+    let approved: BTreeSet<_> = approved
+        .iter()
+        .map(|package| (&package.ecosystem, &package.name, &package.version))
+        .collect();
+    if current != approved {
+        return Err(PromotionError::Changed);
+    }
+    budget.check_time()?;
     Ok(())
 }
 
@@ -283,9 +339,14 @@ impl Staging {
         })
     }
 
-    fn freeze(&mut self, inspection: &Inspection) -> Result<(), PromotionError> {
+    fn freeze(
+        &mut self,
+        inspection: &Inspection,
+        budget: &BundleBudget,
+    ) -> Result<(), PromotionError> {
         let mut directories = BTreeSet::from([self.bundle.clone()]);
         for entry in &inspection.files {
+            budget.check_time()?;
             let path = self.bundle.join(&entry.path);
             let file = OpenOptions::new()
                 .read(true)
@@ -312,6 +373,7 @@ impl Staging {
         // Retain cleanup ownership before the first directory becomes read-only.
         self.directories = directories.into_iter().collect();
         for path in self.directories.iter().rev() {
+            budget.check_time()?;
             if path == &self.bundle {
                 continue;
             }
@@ -319,6 +381,7 @@ impl Staging {
             directory.set_permissions(fs::Permissions::from_mode(0o555))?;
             directory.sync_all()?;
         }
+        budget.check_time()?;
         Ok(())
     }
 }
@@ -337,14 +400,16 @@ impl Drop for Staging {
     }
 }
 
-fn check_immutable(root: &Path) -> Result<(), PromotionError> {
+fn check_immutable(root: &Path, budget: &BundleBudget) -> Result<(), PromotionError> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
+        budget.check_time()?;
         let directory = open_directory(&path)?;
         if directory.metadata()?.mode() & 0o7777 != 0o555 {
             return Err(PromotionError::UnsafePath);
         }
         for entry in fs::read_dir(&path)? {
+            budget.check_time()?;
             let entry = entry?;
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.is_dir() {
@@ -357,6 +422,7 @@ fn check_immutable(root: &Path) -> Result<(), PromotionError> {
             }
         }
     }
+    budget.check_time()?;
     Ok(())
 }
 

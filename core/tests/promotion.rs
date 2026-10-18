@@ -2,16 +2,21 @@ use fictor::{
     installer::{
         BundleBudget, BundleProfile, inspect,
         lease::InstallerLease,
-        manifest::Manifest,
+        manifest::{Manifest, RuntimeKind},
         promotion::{PromotionError, materialize},
     },
     store::{
         HumanDecision, NewProposal, ProposalCheck, ProposalIdentity, ProposalState, ProposalUpdate,
-        Store,
+        ResolvedPackage, Store,
     },
 };
 use serde_json::json;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -24,6 +29,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(approve: bool) -> Self {
+        Self::with_bundle(approve, |_, _| vec![]).await
+    }
+
+    async fn with_bundle(
+        approve: bool,
+        prepare: impl FnOnce(&Path, &mut Manifest) -> Vec<ResolvedPackage>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         fictor::home::prepare(&home).unwrap();
@@ -36,7 +48,7 @@ impl Fixture {
             })
             .await
             .unwrap();
-        let manifest = Manifest::parse(
+        let mut manifest = Manifest::parse(
             &json!({
                 "schema":1,"id":"sample","version":"1.0.0","description":"Fixture",
                 "runtime":{"kind":"binary","entry":"server"},
@@ -47,15 +59,16 @@ impl Fixture {
         .unwrap();
         let source = home.join("extensions/quarantine").join(&proposal.id);
         fs::create_dir(&source).unwrap();
+        fs::write(source.join("server"), b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(source.join("server"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/data"), b"approved payload").unwrap();
+        let packages = prepare(&source, &mut manifest);
         fs::write(
             source.join("fictor.yaml"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(source.join("server"), b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(source.join("server"), fs::Permissions::from_mode(0o755)).unwrap();
-        fs::create_dir(source.join("nested")).unwrap();
-        fs::write(source.join("nested/data"), b"approved payload").unwrap();
         let inspected = inspect(
             &source,
             &BundleBudget::start(BundleProfile::PostDependencies),
@@ -86,7 +99,7 @@ impl Fixture {
                 ProposalState::Checked,
                 ProposalUpdate {
                     hash: Some(inspected.bundle_hash),
-                    packages: Some(vec![]),
+                    packages: Some(packages),
                     checks: Some(
                         [
                             "manifest",
@@ -148,6 +161,128 @@ impl Fixture {
         )
         .await
     }
+}
+
+fn npm_snapshot(source: &Path, manifest: &mut Manifest, unlisted: bool) -> Vec<ResolvedPackage> {
+    manifest.runtime.kind = RuntimeKind::Node;
+    manifest.runtime.entry = Some("server.mjs".into());
+    fs::write(source.join("server.mjs"), "process.exit(0);\n").unwrap();
+    fs::write(
+        source.join("package.json"),
+        json!({"dependencies":{"fixture-pkg":"1.0.0"}}).to_string(),
+    )
+    .unwrap();
+    let locked = json!({"node_modules/fixture-pkg":{"version":"1.0.0"}});
+    fs::write(
+        source.join("package-lock.json"),
+        json!({"lockfileVersion":3,"packages":locked}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(source.join("node_modules/fixture-pkg")).unwrap();
+    fs::write(
+        source.join("node_modules/.package-lock.json"),
+        json!({"lockfileVersion":3,"packages":locked}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        source.join("node_modules/fixture-pkg/package.json"),
+        json!({"name":"fixture-pkg","version":"1.0.0"}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        source.join("node_modules/fixture-pkg/index.js"),
+        "module.exports = 1;\n",
+    )
+    .unwrap();
+    if unlisted {
+        fs::create_dir_all(source.join("node_modules/fixture-pkg/node_modules/extra-pkg")).unwrap();
+        fs::write(
+            source.join("node_modules/fixture-pkg/node_modules/extra-pkg/package.json"),
+            json!({"name":"extra-pkg","version":"9.9.9"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            source.join("node_modules/fixture-pkg/node_modules/extra-pkg/index.js"),
+            "module.exports = 2;\n",
+        )
+        .unwrap();
+    }
+    vec![ResolvedPackage {
+        ecosystem: "npm".into(),
+        name: "fixture-pkg".into(),
+        version: "1.0.0".into(),
+    }]
+}
+
+#[tokio::test]
+async fn approved_legacy_inventory_cannot_publish_unlisted_physical_packages() {
+    for missing_declarations in [false, true] {
+        let fixture = Fixture::with_bundle(true, |source, manifest| {
+            let packages = npm_snapshot(source, manifest, true);
+            if missing_declarations {
+                fs::write(source.join("package.json"), "{}").unwrap();
+                vec![]
+            } else {
+                packages
+            }
+        })
+        .await;
+        assert!(matches!(
+            fixture.materialize().await,
+            Err(PromotionError::Changed)
+        ));
+        assert!(!fixture.destination().exists());
+        assert!(fixture.source.is_dir());
+        assert_eq!(
+            fixture
+                .store
+                .proposal(fixture.id.clone())
+                .await
+                .unwrap()
+                .state,
+            ProposalState::Approved
+        );
+    }
+}
+
+#[tokio::test]
+async fn approved_inventory_must_match_the_current_verified_package_metadata() {
+    let fixture = Fixture::with_bundle(true, |source, manifest| {
+        let mut packages = npm_snapshot(source, manifest, false);
+        packages[0].version = "9.9.9".into();
+        packages
+    })
+    .await;
+    assert!(matches!(
+        fixture.materialize().await,
+        Err(PromotionError::Changed)
+    ));
+    assert!(!fixture.destination().exists());
+    assert!(fixture.source.is_dir());
+}
+
+#[tokio::test]
+async fn approved_complete_package_inventory_is_materialized_without_resolving_again() {
+    let fixture = Fixture::with_bundle(true, |source, manifest| {
+        npm_snapshot(source, manifest, false)
+    })
+    .await;
+    let before = fixture.store.proposal(fixture.id.clone()).await.unwrap();
+    let materialized = fixture.materialize().await.unwrap();
+    assert_eq!(materialized.path, fixture.destination());
+    assert!(
+        materialized
+            .path
+            .join("node_modules/fixture-pkg/index.js")
+            .is_file()
+    );
+    let after = fixture.store.proposal(fixture.id.clone()).await.unwrap();
+    assert_eq!(after.state, ProposalState::Approved);
+    assert_eq!(
+        serde_json::to_value(after.packages).unwrap(),
+        serde_json::to_value(before.packages).unwrap()
+    );
+    assert!(!fixture.home.join("extensions/lock.json").exists());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
