@@ -1,15 +1,25 @@
 # Pendências para o arquiteto
 
-ARQ-029 aberta em 2026-10-18. ARQ-020–028 resolvidas pelos ADRs 036–044.
+ARQ-020–029 resolvidas pelos ADRs 036–045. ARQ-030 planejada para antes do M0.9;
+não bloqueia o M0.5.
 Resolução do spec não significa implementação concluída.
+
+## ARQ-030 — Contratos administrativos do M0.9 e durabilidade de rollback
+
+- **Status: planejada; decidir antes de iniciar M0.9. Não bloqueia M0.5.**
+- **Referências:** `spec/02-core.md`, CLI/runtimes/update; `spec/06-lifecycle.md`, rollback; ADRs 036/045.
+- **Dúvida:** seleção de versão anterior e commit conjunto de rollback com `ext.rolled_back` não têm journal próprio; `promotion_intents` exige proposta e não deve receber proposta artificial. Runtime/update em lote e login também precisam métodos administrativos, autoridade e resultados definidos.
+- **Necessário:** ADR antes dos handlers do M0.9, definindo seleção/durabilidade/recuperação de rollback, lotes de update e runtimes, nonce/revisão e login de uso único. Manter `update --core` exclusivo da CLI e sem caminho por UI/extensão.
+- **Impacto:** não inventar esses handlers, reutilizar journal de proposta à força nem executar esses itens fora da ordem do roadmap. Resolver no início da preparação arquitetural do M0.9.
 
 ## ARQ-029 — Contrato administrativo das mutações da Fase 0
 
-- **Status: aberta em 2026-10-18.**
+- **Status: resolvida em 2026-10-18 — [ADR-045](../spec/11-decisions.md#adr-045--mutações-administrativas-e-instalação-local-online-resolve-arq-029).**
 - **Referências:** `spec/02-core.md`, CLI, Reabilitação humana e Canal administrativo mínimo; ADRs 038/039/041.
 - **Dúvida:** a CLI encaminha mutações ao core ativo e `ext reset-crashes` deve funcionar online. Entretanto, o canal mínimo define somente `ext.list` e determina que outros métodos exigem contrato próprio. Não há método/envelope/parâmetros/resultados de reset, enable/disable ou instalação autorizados para esse canal. A semântica de comandos e o transporte não determinam por si sós seu protocolo de mutação.
 - **Necessário:** ADR com os métodos administrativos da Fase 0 que podem mutar estado, campos exatos, autoridade/decisão humana, erros e limites; especificar seleção de versão/sessão no reset, sem permitir comandos equivalentes por Kernel Protocol. Aprovação de proposta e segredo pelo TTY precisam conservar suas fronteiras, caso façam parte desse contrato.
-- **Impacto:** implementar normalmente estado durável de crash, APIs internas de promoção e listagem `ext.list`; não inventar handlers administrativos de mutação. O trecho online dos comandos afetados aguarda o ADR. As demais entregas do M0.5 continuam.
+- **Resolução:** ADR-045 define habilitação, reset, instalação local em quatro operações e segredos online. Revisão vinculada a nonce/hash/base/overrides, trabalho longo observado por status, efeitos incertos sem retry. Critérios 66–70; implementação e testes ainda pendentes.
+- **Escopo restante:** operações do M0.9 rastreadas em ARQ-030; não autorizadas implicitamente por este contrato.
 
 ## ARQ-028 — Grants sobre mounts internos e fontes de pseudo-filesystems
 

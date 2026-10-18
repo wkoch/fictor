@@ -21,7 +21,8 @@ Aprovação agora fixa base e overrides; o journal de promoção e seu coordenad
 o estado durável de crash loop e a listagem administrativa estão implementados.
 A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
 bootstrap antes do init continuam em desenvolvimento. As mutações pelo canal
-administrativo dependem do contrato solicitado na ARQ-029.
+administrativo têm contrato no ADR-045 (ARQ-029 resolvida); handlers e testes
+permanecem pendentes.
 Os ADRs 043/044 estão implementados parcialmente; o SDK ainda pertence ao M0.8.
 Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
@@ -651,3 +652,12 @@ O sandbox deve proteger os destinos e o bootstrap antes do init, admitir somente
 as origens definidas e manter as exceções do Toolbx restritas às bases fixas.
 Critérios 57–65 definidos; nenhuma implementação é afirmada por esta resolução.
 As edições de arquitetura ficam na main sem commit para integração pelo dev.
+
+
+## Entrega arquitetural — ARQ-029 / ADR-045
+
+Contrato do M0.5 definido em 2026-10-18: habilitação/reset, instalação local online
+com revisão e retomada, e segredos pelo admin. Critérios 66–70 são trabalho do dev;
+a resolução não afirma handlers implementados ou testes aprovados. ARQ-030 registra
+a preparação de contratos do M0.9, incluindo durabilidade de rollback. Edições de
+arquitetura ficam sem stage/commit para integração exclusivamente pelo dev.

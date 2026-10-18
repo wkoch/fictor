@@ -559,3 +559,8 @@ A cada inicialização da extensão e a cada `notifications/tools/list_changed`,
 | `fictor ext remove <id>` | Sai do lock. Store e `data/<id>` ficam até `fictor gc` / `--purge-data`. |
 
 As versões antigas ficam no store; `fictor gc` mantém as 5 mais recentes por extensão.
+
+
+### CLI local online da Fase 0
+
+O fluxo `ext install` usa [o contrato administrativo do ADR-045](02-core.md#mutações-administrativas-do-m05): receipt/checks, revisão completa com nonce/hash, decisão humana e pedido de promoção separados. A confirmação ocorre na CLI confiável, com retomada explícita por ID; não autoriza a CLI geral de propostas da Fase 1. Os estados, overrides, comparação de base e journal definidos acima continuam obrigatórios.

@@ -661,7 +661,7 @@ CLI e core se comunicam pelo Unix stream socket `run/admin.sock` (0600), em `run
 
 O transporte usa JSON-RPC 2.0 em UTF-8, uma mensagem por linha terminada em LF, com limite de 16 MiB por mensagem, excluindo LF. Um cliente envia uma requisição, o servidor envia uma resposta e fecha. Sem batches, notificações, streaming, callbacks ou encaminhamento para extensões. O envelope da requisição tem exatamente `jsonrpc`, `id`, `method`, `params`; `jsonrpc` é `"2.0"`, `id` é string não vazia de até 128 bytes e `params` é objeto. Campos desconhecidos e chaves JSON duplicadas são recusados. A resposta repete o mesmo `id`; erros sem ID recuperável usam `id: null`. Mensagem recebida acima do limite encerra a conexão sem processamento; resultado acima do limite retorna erro pequeno `too_large`, sem truncamento.
 
-Esta decisão define somente o método administrativo `ext.list`; outros métodos exigem seu próprio contrato. Exemplo:
+O ADR-041 define `ext.list`; o ADR-045 acrescenta os métodos da seção seguinte. Métodos fora dessas listas exigem contrato próprio. Exemplo:
 
 ```json
 {"jsonrpc":"2.0","id":"cli-1","method":"ext.list","params":{}}
@@ -685,3 +685,219 @@ Erros de protocolo seguem JSON-RPC: `-32700` para UTF-8/JSON inválido; `-32600`
 | `too_large` | Resultado ultrapassa o limite do transporte. |
 
 A CLI offline usa os mesmos motivos para diagnóstico e termina com status diferente de zero em falhas. Erros locais de transporte/autenticação também falham sem fallback. Mensagens não incluem dados brutos do lock/journal, valores de env/segredos ou caminhos privados. A CLI termina com status zero somente depois de validar e apresentar o resultado inteiro; zero extensões é um sucesso explícito.
+
+
+#### Mutações administrativas do M0.5
+
+O ADR-045 autoriza somente os métodos abaixo, além de `ext.list`. Herdam identidade,
+envelope, parser estrito e limite de 16 MiB do canal mínimo. Não existem equivalentes
+no Kernel Protocol, MCP ou surfaces. A autoridade é a CLI confiável do mesmo usuário,
+não um campo `actor`, `approved_by`, `is_tty` ou token enviado pelo cliente. A futura
+UI confiável conserva seu próprio protocolo e as mesmas decisões do ciclo de vida.
+Campos extras são recusados em todos os objetos definidos aqui; `?` indica campo
+opcional, omitido quando ausente, nunca `null`, salvo nulabilidade expressa.
+
+| Método | `params` exatos | `result` exato |
+|---|---|---|
+| `ext.set_enabled` | `{ext_id: string, enabled: boolean}` | `{schema: 1, ext_id: string, key: string, enabled: boolean, changed: boolean}` |
+| `ext.reset_crashes` | `{ext_id: string, key?: string, session_id?: string}` | `{schema: 1, ext_id: string, key: string, session_id: string \| null, cleared: integer}` |
+| `ext.install.prepare` | `{path: string}` | `{schema: 1, proposal_id: string}` |
+| `ext.install.status` | `{proposal_id: string, overrides?: object}` | Snapshot definido abaixo. |
+| `ext.install.decision` | `{proposal_id: string, nonce: string, review_hash: string, decision: "approve" \| "reject", overrides: object}` | `{schema: 1, proposal_id: string, state: "approved" \| "rejected"}` |
+| `ext.install.promote` | `{proposal_id: string}` | `{schema: 1, proposal_id: string, operation_id: string}` |
+| `secrets.list` | `{}` | `{schema: 1, names: string[]}` |
+| `secrets.set` | `{name: string, value: string}` | `{schema: 1, name: string}` |
+| `secrets.rm` | `{name: string}` | `{schema: 1, name: string, removed: boolean}` |
+
+IDs, chaves, hashes, nonce e nomes de segredo usam os formatos dos respectivos
+contratos persistidos. `path` é caminho absoluto no host do core, sem NUL; a CLI
+resolve o caminho relativo a seu diretório antes do envio. Não é URL, upload,
+comando shell nem autorização para reabrir a origem durante aprovação/promoção.
+`overrides` usa o objeto completo do ADR-037; ausência em `status` significa
+`{"permissions":{},"tools":{}}` para `checked` e os overrides já persistidos para
+`approved`/`promoted`. Não se acrescentam chaves arbitrárias a esse schema.
+
+**Habilitação e reset.** Resolver ID/chave sob a seção crítica do instalador, depois
+da reconciliação obrigatória. `set_enabled` muda só `enabled`, preservando versões,
+aprovações, overrides e recuperação de crash. `changed` compara o valor anterior.
+Sucesso confirma lock durável e admissão/catálogo atualizados; habilitar não inicia
+processo. Desabilitar impede novas admissões e solicita o encerramento pelo ADR-038;
+a resposta não atesta término nem autoriza liberar recursos de `cleanup_failed`.
+Uma chamada que já encontra o valor pedido ainda confere a publicação desse estado.
+
+`reset_crashes` sem `key` fixa a chave ativa nessa seção; chave explícita deve existir
+em `versions`. Sessão explícita deve existir e é inválida para bundle global.
+Sem sessão, seleciona todas as linhas da chave e devolve `session_id: null`;
+com sessão, devolve a seleção exata. `cleared` é inteiro não negativo, contando
+linhas removidas. O writer serializa seleção, remoção e um `ext.crash_reset` por
+linha numa transação FULL; observações posteriores não são apagadas. Zero é sucesso
+sem evento fictício. Não altera `enabled`, integridade, recursos retidos nem inicia
+processos. Valem integralmente as restrições de [reabilitação humana](#reabilitação-humana).
+
+**Recebimento e revisão.** `prepare` cria o receipt `source.kind: local`, com
+`tainted: false` derivado desta entrada confiável, e evento duráveis antes de tocar
+a origem (ADR-035). Retorna o ID após esse commit; cópia e checks continuam no core
+até `checked` ou `failed`, inclusive se o cliente desconectar. Nunca aprova ou
+promove por efeito de `prepare`/`status`, mesmo se o perfil permitir autoaprovação
+em outro fluxo. Reinício aplica `recovery:interrupted`, sem retomar checks. Se a
+resposta se perder, não repetir automaticamente: pode existir receipt com ID que
+a CLI não recebeu, mas ele não adquire autoridade de aprovação.
+
+`status` é somente leitura e aceita apenas propostas locais desse fluxo. Copia um
+snapshot coerente do writer/journal e libera os locks antes de responder. Resultado:
+
+```ts
+{
+  schema: 1,
+  proposal_id: string,
+  state: "received" | "checking" | "checked" | "approved" | "promoted" | "failed" | "rejected",
+  ext_id: string | null,
+  version: string | null,
+  reason: string | null,
+  review: Review | null,
+  nonce: string | null,
+  review_hash: string | null,
+  promotion: { operation_id: string, state: "prepared" | "committed" | "aborted" } | null
+}
+```
+
+`reason` é somente o código estável do primeiro check bloqueante em `failed`, ou
+`null`; nunca stderr/erro bruto. `promotion` é a última tentativa da proposta,
+ordenada por `(created_at, operation_id)`, ou `null`; não contém snapshots privados
+do lock. `review`, `review_hash` existem em `checked`/`approved`/`promoted`; nos outros
+estados são `null`. `nonce` só é exposto em `checked`. Não liberar review parcial.
+
+`Review` contém exatamente:
+
+```ts
+{
+  source: { kind: "local" },
+  tainted: false,
+  manifest: object,
+  bundle_hash: string,
+  tools: object[],
+  tools_hash: string,
+  update_of: string | null,
+  review_base_hash: string,
+  base: { active: string, enabled: boolean, version: object } | null,
+  packages: { ecosystem: string, name: string, version: string }[],
+  checks: { name: string, passed: boolean, blocking: boolean, detail: string | null }[],
+  omitted_fs: string[],
+  overrides: object
+}
+```
+
+`manifest` é o manifest normalizado validado pelo schema de extensão; `tools` é o
+catálogo MCP fixado e canônico, e `base.version` é o registro completo do lock
+(ADR-036). Pacotes e checks vêm da verificação persistida; detalhes de checks são
+diagnósticos estruturados/sanitizados do core, nunca saída bruta de processos.
+`omitted_fs` lista grants absolutos/`~/` e entradas `sandbox.home_ro_files`
+omitidos no smoke, fixados durante a verificação e ordenados por bytes UTF-8.
+Não reler uma configuração diferente para construir essa lista na decisão.
+A revisão conserva as ordens persistidas de checks/pacotes e a ordem canônica de
+tools. O core calcula `review_hash = sha256(JCS(Review))`, no formato `sha256:<hex>`;
+isso inclui base, bytes aprovados, catálogo, limitações do smoke e overrides exatos.
+A base é reconstruída sob exclusão e deve corresponder ao hash fixado em `checked`;
+se mudou, retornar `stale_base`, sem oferecer revisão silenciosamente renovada.
+Durante uma intenção `prepared`, `status` não adquire a exclusão retida pela
+promoção: usa exclusivamente o `before_lock` imutável do journal para reconstruir
+a base e conferir seu hash; nunca lê o lock candidato como base confirmada.
+Em `approved`/`promoted`, fora desse caso, a revisão usa a base atual se seu hash ainda corresponder
+ao fixado, ou a base histórica do journal, se disponível;
+se não puder reconstruí-la integralmente, `review` e `review_hash` são `null` nesses
+dois estados. Isso não impede consultar estado nem recuperar promoção. Overrides
+explicitamente diferentes dos persistidos nesses estados retornam `invalid_state`.
+
+Na CLI, exibir manifest/permissões, base e diferenças, catálogo/classificações,
+pacotes, checks, grants omitidos e overrides antes de pedir consentimento. Todo
+texto vindo do bundle é dado: escapar controles, ANSI e sequências de terminal;
+nenhum texto da proposta vira prompt de comando. Não aceitar aprovação se o
+snapshot completo não couber no limite, se houver checks bloqueantes, campos
+faltantes ou divergência de hash. `too_large` não autoriza truncar para aprovar.
+
+`decision` exige estado `checked`, nonce vigente, hash da revisão recalculado e
+mesmos overrides validados. Aprovação confere base atual sob exclusão e faz a
+transição/evento com `actor: user`, overrides imutáveis e consumo do nonce na mesma
+transação. Rejeição consome o nonce e registra `rejected`/evento; não exige que a
+base ainda seja atual, mas exige hash/nonce da revisão originalmente apresentada.
+Para isso, o cliente conserva a revisão e o core conserva a base revisada até a
+decisão; pode mantê-la em memória, pois reinício exige nova consulta e base válida.
+Após reinício, sem essa base e sem correspondência atual, rejeição retorna
+`stale_base` e não inventa dados. Nenhuma decisão aceita flags de aprovação prontas,
+reabre a origem, muda checks ou ignora a comparação de hash. Replay da decisão
+retorna `invalid_state`, sem novo evento.
+
+**Promoção e reconexão.** Para uma tentativa nova, `promote` exige proposta local
+`approved`, revalida o
+ADR-036 e grava a intenção `prepared` durável antes de responder com seu ID. O
+core continua publicação/commit de forma independente da conexão. Não mantém o
+socket aberto durante cópia, fsync de bundles ou hot swap. A exclusão do instalador
+cobre a tentativa até seu resultado; `status` pode ler o journal sem esperar pela
+conclusão dessa publicação. A resposta significa admissão durável, não instalação
+concluída. A CLI consulta `status` até `promoted` e intenção `committed`; falha,
+`aborted` ou transporte incerto não viram sucesso. Em reinício, reconciliação do
+ADR-036 decide entre abortar e completar; não se reexecutam checks nem a origem.
+Uma proposta com tentativa `prepared` devolve o mesmo `operation_id`, sem segundo
+worker. Com tentativa `committed`, devolve o ID registrado sem reativar versão que
+possa ter sido substituída depois. Após `aborted`, uma nova chamada humana explícita
+pode tentar novamente, com novo ID e revalidação da base; nunca retry automático.
+
+`fictor ext install <path> [--yes]` conduz esse fluxo. Sem `--yes`, confirmação vem
+do TTY controlador, nunca de stdin redirecionado. `--yes` é consentimento explícito
+da invocação confiável para a proposta exibida; registra `user` e não dispensa
+revisão, checks, nonce, limites ou comparação de base. Overrides interativos exigem
+nova consulta/revisão antes de decidir. EOF/interrupção antes da próxima operação
+impede enviá-la; consulta não aprova/promove. `fictor ext install --resume <proposal_id>`
+consulta a tentativa sem reler a origem: em `checked` oferece revisão e confirmação;
+em `approved` pede confirmação atual antes de `promote`; em `promoted` apenas
+informa o resultado; em `received`/`checking` acompanha; `failed`/`rejected` exigem
+nova instalação. `--resume` é mutuamente exclusivo com path e `--yes`. Após resultado
+incerto, a CLI imprime o ID conhecido e orienta retomada explícita, sem reenviar.
+Isso não antecipa a CLI geral `proposal` da Fase 1.
+
+**Segredos.** `secrets.set` coleta o valor somente no TTY local sem eco; não aceita
+valor em argv, ambiente, stdin redirecionado ou arquivo. Verificar a identidade do
+servidor antes de transmitir. Nome e valor obedecem ao contrato de segredos: nome
+`^[a-z0-9_]+$`, valor string não vazia. Usar exclusivamente o backend configurado,
+sem seletor por requisição ou fallback. Nunca logar frames/params, buffers, erros
+brutos ou respostas do backend. A exclusão de frames, params e erros brutos dos
+logs vale desde a recepção e parsing genérico de todo o admin, inclusive JSON
+inválido, método desconhecido ou parâmetros recusados antes de identificar
+`secrets.set`; um valor novo ainda não está no redator. Não gravar valor em eventos,
+propostas, journal ou tracing. Registrar máscara antes de persistir o novo valor;
+falha nessa proteção impede `set`. Serializar mutação e publicação do cache: sucesso
+só após backend durável e novas leituras refletirem o resultado. Manter máscaras
+anteriores enquanto ainda houver operações que possam conter o valor antigo.
+`list` retorna somente nomes únicos ordenados por bytes UTF-8; não existe `get` ou
+export. `rm` ausente é sucesso com `removed: false`. Não promete apagar valores de
+processos/requisições já em andamento; novas leituras/spawns usam o estado novo.
+
+**Erros e limites.** Mantêm-se os erros de protocolo do canal mínimo, antes de
+qualquer efeito do método. Domínio usa `code: -32000`, `message: "<method> failed"`,
+`data: {reason: string, effect: "none" | "committed" | "unknown"}`. Motivos admitidos:
+os do canal mínimo e `not_found`, `invalid_state`, `stale_base`, `invalid_nonce`,
+`review_mismatch`, `invalid_overrides`, `integrity_failed`, `backend_unavailable`.
+Razões de checks ficam no snapshot, não são novos códigos de RPC. `not_found` cobre
+ID, chave, sessão ou proposta ausente; `invalid_state` cobre escopo global com
+sessão e operação incompatível com o estado/origem. Não expor paths privados,
+segredos ou detalhes brutos. `effect` descreve apenas a operação pedida, não efeitos
+da reconciliação prévia: `none` quando comprovadamente não houve commit; `committed`
+quando houve persistência, mas falhou a conclusão/publicação; `unknown` quando não
+se pode afirmar. Consulta usa `none`. Nunca declarar `none` após commit incerto.
+
+O prazo para adquirir a seção crítica/admitir operação é 5 s; sem admissão, `busy`.
+Cliente lento nunca segura locks após o resultado copiado. A CLI mantém timeout
+sem progresso de 5 s por RPC; espera de checks/promoção usa novas consultas
+somente leitura, no máximo uma por segundo. Timeout/EOF após envio significa efeito
+desconhecido: não deduzir rollback, repetir mutação ou tentar escrita offline.
+ID JSON-RPC é correlação, não chave de idempotência. Operação já admitida conclui ou
+é reconciliada mesmo sem cliente. Falha após lock durável impede novas admissões
+incompatíveis até publicação/reconciliação; não desfaz o lock em segredo.
+
+Offline, somente comandos já autorizados na CLI usam posse exclusiva e os mesmos
+contratos semânticos; não se cria servidor auxiliar para contornar a posse. Home,
+banco e lock devem existir e o schema deve ser o atual; sem init/migração implícitos.
+Reconciliação e barreiras de recursos antecedem mutações, conforme ADRs 036/038.
+Instalação local exige core ativo; ausência dele falha. Rollback, runtime/update e
+login pertencem ao M0.9 e não ganham handlers por este ADR: ARQ-030 registra a
+obrigação de definir seus contratos antes de implementar esse marco.

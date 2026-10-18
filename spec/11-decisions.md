@@ -411,3 +411,13 @@ Contrato normativo em [03-kernel-protocol.md](03-kernel-protocol.md#ids-admissã
 - **Consequências.** FUSE, NFS, filesystems de controle do kernel, outros tipos e overlay de dados arbitrário ficam fora da Fase 0. Não copiar/remapear fontes, retirar submounts ou relaxar provas automaticamente. Suporte adicional exige ADR e validação. Não muda o conteúdo aprovado, os escopos, as exceções de sockets próprios ou a fase de Landlock/seccomp. Sem migração.
 
 Contrato normativo em [05-security.md](05-security.md#árvores-de-montagem-e-origens-admitidas); critérios 61–65 da Fase 0.
+
+
+## ADR-045 — Mutações administrativas e instalação local online (resolve ARQ-029)
+
+- **Data:** 2026-10-18.
+- **Contexto.** O socket administrativo só contratava listagem, embora a CLI devesse encaminhar mutações ao core ativo. Não é seguro inferir autoridade, seleção de reset, confirmação humana ou efeitos após EOF a partir de APIs internas.
+- **Decisão.** Autorizar no M0.5 `ext.set_enabled`, `ext.reset_crashes`, os quatro métodos `ext.install.prepare/status/decision/promote` e `secrets.list/set/rm`, com shapes, erros e limites fechados em [02-core.md](02-core.md#mutações-administrativas-do-m05). Preservar `ext.list` e sua semântica. Mesmo UID é a fronteira da CLI confiável; nenhum método é exposto a extensões.
+- **Instalação.** Receipt e checks são separados de consentimento e promoção. Revisão completa e hash canônico vinculam bytes, catálogo, base e overrides ao nonce; decisão humana persistida precede a intenção durável. O trabalho longo continua no core, observado por consultas curtas. Reutilizar propostas e journal existentes, sem tabela genérica de jobs. Retomada explícita por ID não relê origem nem aprova automaticamente.
+- **Efeitos.** Reset seleciona chave/sessão sob exclusão e remove apenas linhas serializadas pelo writer; enable não reseta crashes. Resposta perdida não desfaz commit nem permite retry automático. Promoção consulta a intenção existente; journal decide recuperação. Segredos entram somente pelo TTY sem eco, com frames excluídos de logs e backend configurado sem fallback.
+- **Escopo.** Sem mudança de schema persistido, Kernel Protocol ou fases. O contrato não antecipa runtime/update/login/rollback do M0.9; sua lacuna remanescente é rastreada em ARQ-030, antes de qualquer handler. Critérios 66–70 da Fase 0. Implementação e gate permanecem responsabilidade do desenvolvimento.
