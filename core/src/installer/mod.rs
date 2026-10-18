@@ -1,8 +1,10 @@
 //! Phase-0 local receipt, validation and isolated checks. No automatic activation.
+pub mod activation;
 pub mod bundle;
 pub mod control;
 pub mod dependencies;
 pub mod lease;
+pub mod listing;
 pub mod local;
 pub mod lock;
 pub mod manifest;

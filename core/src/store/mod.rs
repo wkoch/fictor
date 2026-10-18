@@ -1,13 +1,18 @@
 pub mod blobs;
 mod budget;
+mod crashes;
 mod events;
 mod kv;
 mod migrations;
+pub(crate) use migrations::SCHEMA_VERSION;
+mod promotion;
 mod proposals;
+pub(crate) use promotion::read_promotion_intents;
+pub use promotion::{NewPromotionIntent, PromotionAbortReason, PromotionIntent, PromotionState};
 mod read_budget;
 pub use proposals::{
     HumanDecision, NewProposal, Proposal, ProposalCheck, ProposalIdentity, ProposalNonce,
-    ProposalState, ProposalUpdate, ResolvedPackage,
+    ProposalState, ProposalUpdate, ResolvedPackage, ReviewBase,
 };
 mod sessions;
 pub use budget::{BudgetExceeded, local_day};

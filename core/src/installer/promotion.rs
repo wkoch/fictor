@@ -56,14 +56,43 @@ pub async fn materialize(
     lease: Arc<InstallerLease>,
     proposal_id: String,
 ) -> Result<MaterializedBundle, PromotionError> {
+    materialize_attempt(home, store, lease, proposal_id, None).await
+}
+
+pub(crate) async fn materialize_intent(
+    home: &Path,
+    store: Arc<Store>,
+    lease: Arc<InstallerLease>,
+    proposal_id: String,
+    operation_id: String,
+) -> Result<MaterializedBundle, PromotionError> {
+    if operation_id.parse::<ulid::Ulid>().is_err() {
+        return Err(PromotionError::Unapproved);
+    }
+    materialize_attempt(home, store, lease, proposal_id, Some(operation_id)).await
+}
+
+async fn materialize_attempt(
+    home: &Path,
+    store: Arc<Store>,
+    lease: Arc<InstallerLease>,
+    proposal_id: String,
+    operation_id: Option<String>,
+) -> Result<MaterializedBundle, PromotionError> {
     if proposal_id.len() != 26 || proposal_id.parse::<ulid::Ulid>().is_err() {
         return Err(PromotionError::Unapproved);
     }
     let proposal = store.proposal(proposal_id).await?;
+    let owner = store.owner().clone();
+    if home.canonicalize()? != owner.home() {
+        return Err(PromotionError::UnsafePath);
+    }
     let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
-        materialize_owned(&home, proposal)
+        let _owner = owner;
+        _owner.verify().map_err(|_| PromotionError::UnsafePath)?;
+        materialize_owned(&home, proposal, operation_id.as_deref())
     })
     .await
     .map_err(|_| PromotionError::Task)?
@@ -72,6 +101,7 @@ pub async fn materialize(
 fn materialize_owned(
     home: &Path,
     proposal: Proposal,
+    operation_id: Option<&str>,
 ) -> Result<MaterializedBundle, PromotionError> {
     let budget = BundleBudget::start(BundleProfile::PostDependencies);
     let (manifest, hash) = approved(&proposal)?;
@@ -86,7 +116,7 @@ fn materialize_owned(
     let source = quarantine_path.join(&proposal.id);
     // Unverified bytes remain outside the store. A crash can leave unreferenced
     // staging directories for later architectural recovery; none imply activation.
-    let mut staging = Staging::new(&quarantine_path)?;
+    let mut staging = Staging::new(&quarantine_path, operation_id)?;
     let inspection = bundle::copy_local(&source, &staging.bundle, &budget)?;
     if inspection.bundle_hash != hash {
         return Err(PromotionError::Changed);
@@ -131,8 +161,13 @@ fn materialize_owned(
     } else {
         let staging_directory = open_directory(staging.temporary.path())?;
         let candidate = open_directory(&staging.bundle)?;
-        let pending = CString::new(format!(".promotion-{}", ulid::Ulid::generate()))
-            .map_err(|_| PromotionError::UnsafePath)?;
+        let pending = CString::new(format!(
+            ".promotion-{}",
+            operation_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| ulid::Ulid::generate().to_string())
+        ))
+        .map_err(|_| PromotionError::UnsafePath)?;
         // Linux requires directory write permission when moving between parents
         // to update '..'. Only verified approved bytes enter this private store
         // staging entry; freeze its root before the final same-parent rename.
@@ -187,10 +222,11 @@ fn materialize_owned(
     })
 }
 
-fn approved(proposal: &Proposal) -> Result<(Manifest, String), PromotionError> {
+pub(crate) fn approved(proposal: &Proposal) -> Result<(Manifest, String), PromotionError> {
     if proposal.state != ProposalState::Approved
         || proposal.decided_by.as_deref() != Some("user")
         || proposal.packages.is_none()
+        || proposal.audit_blob.is_some()
         || proposal
             .source
             .get("kind")
@@ -246,6 +282,56 @@ fn approved(proposal: &Proposal) -> Result<(Manifest, String), PromotionError> {
         })
         .ok_or(PromotionError::Unapproved)?;
     Ok((manifest, hash.clone()))
+}
+
+/// Recovery proves the already-published candidate without reading its origin,
+/// running smoke, installing dependencies or executing extension code.
+pub(crate) async fn verify_published(
+    store: Arc<Store>,
+    proposal_id: String,
+) -> Result<MaterializedBundle, PromotionError> {
+    let proposal = store.proposal(proposal_id).await?;
+    let owner = store.owner().clone();
+    tokio::task::spawn_blocking(move || {
+        owner.verify().map_err(|_| PromotionError::UnsafePath)?;
+        let (manifest, hash) = approved(&proposal)?;
+        let key = format!("{}-{}", manifest.version, &hash[7..19]);
+        let path = owner
+            .home()
+            .join("extensions/store")
+            .join(&manifest.id)
+            .join(&key);
+        let home = open_directory(owner.home())?;
+        let extensions = directory(&home, c"extensions")?;
+        let stored = directory(&extensions, c"store")?;
+        let id = CString::new(manifest.id.as_str()).map_err(|_| PromotionError::UnsafePath)?;
+        let name = CString::new(key.as_str()).map_err(|_| PromotionError::UnsafePath)?;
+        let extension = directory(&stored, &id)?;
+        directory(&extension, &name)?;
+        let budget = BundleBudget::start(BundleProfile::PostDependencies);
+        let inspection = bundle::inspect(&path, &budget)?;
+        if inspection.bundle_hash != hash || !inspection.ignored.is_empty() {
+            return Err(PromotionError::Changed);
+        }
+        check_manifest(&path, &proposal, &budget)?;
+        check_inventory(
+            &path,
+            manifest.runtime.kind,
+            &proposal,
+            &inspection,
+            &budget,
+        )?;
+        check_immutable(&path, &budget)?;
+        Ok(MaterializedBundle {
+            proposal_id: proposal.id,
+            ext_id: manifest.id,
+            key,
+            hash,
+            path,
+        })
+    })
+    .await
+    .map_err(|_| PromotionError::Task)?
 }
 
 fn check_manifest(
@@ -324,18 +410,28 @@ struct Staging {
     bundle: PathBuf,
     directories: Vec<PathBuf>,
     retained_in_store: bool,
+    journaled: bool,
 }
 impl Staging {
-    fn new(quarantine: &Path) -> Result<Self, PromotionError> {
-        let temporary = tempfile::Builder::new()
-            .prefix(".promotion-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(quarantine)?;
+    fn new(quarantine: &Path, operation_id: Option<&str>) -> Result<Self, PromotionError> {
+        let mut builder = tempfile::Builder::new();
+        builder.permissions(fs::Permissions::from_mode(0o700));
+        let prefix = operation_id
+            .map(|id| format!(".promotion-{id}"))
+            .unwrap_or_else(|| ".promotion-".into());
+        builder.prefix(&prefix);
+        if operation_id.is_some() {
+            // The journal owns cleanup. Retain on cancellation/error so a
+            // destructor cannot guess whether filesystem publication committed.
+            builder.rand_bytes(0).disable_cleanup(true);
+        }
+        let temporary = builder.tempdir_in(quarantine)?;
         Ok(Self {
             bundle: temporary.path().join("bundle"),
             temporary,
             directories: Vec::new(),
             retained_in_store: false,
+            journaled: operation_id.is_some(),
         })
     }
 
@@ -387,7 +483,7 @@ impl Staging {
 }
 impl Drop for Staging {
     fn drop(&mut self) {
-        if self.retained_in_store {
+        if self.retained_in_store || self.journaled {
             return;
         }
         // These paths only describe the private copied tree. After successful

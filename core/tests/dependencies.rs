@@ -1048,7 +1048,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         Some(inspected.bundle_hash.as_str())
     );
     assert!(!source.join("node_modules").exists());
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
     drop(checker);
     // The CLI is an offline owner. End the in-process core, including the
     // proxy's audit tasks and SQLite writer, before handing it the same home.
@@ -1097,7 +1102,12 @@ for await (const line of createInterface({ input: process.stdin })) {
     assert_eq!(cli_packages[0].name, "fixture-pkg");
     assert_eq!(cli_packages[0].version, "1.0.0");
     assert!(!source.join("node_modules").exists());
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
     store.shutdown().await.unwrap();
 }
 

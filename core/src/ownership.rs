@@ -33,6 +33,7 @@ pub struct HomeLease {
     owner_id: String,
     writer_claimed: AtomicBool,
     secrets_mutation: Mutex<()>,
+    installer_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) struct WriterLease(Arc<HomeLease>);
@@ -81,6 +82,7 @@ impl HomeLease {
             owner_id: ulid::Ulid::generate().to_string(),
             writer_claimed: AtomicBool::new(false),
             secrets_mutation: Mutex::new(()),
+            installer_gate: Arc::new(tokio::sync::Mutex::new(())),
         });
         lease.verify()?;
         Ok(lease)
@@ -108,6 +110,12 @@ impl HomeLease {
     }
     pub fn owner_id(&self) -> &str {
         &self.owner_id
+    }
+
+    /// One section covers lock snapshots, promotion and online configuration
+    /// reads. The file lease separately excludes other processes/legacy callers.
+    pub fn installer_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.installer_gate.clone()
     }
 
     /// Core-only access below the pinned inode, never a sandbox import. The

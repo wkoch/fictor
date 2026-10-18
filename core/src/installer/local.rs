@@ -102,6 +102,20 @@ impl LocalChecker {
     }
 
     async fn check_owned(&self, source: &Path) -> Result<LocalReport, LocalError> {
+        let owner = self.store.owner().clone();
+        owner.verify().map_err(|_| LocalError::Admission)?;
+        if self
+            .home
+            .canonicalize()
+            .map_err(|_| LocalError::Admission)?
+            != owner.home()
+        {
+            return Err(LocalError::Admission);
+        }
+        let _section = owner.installer_gate().lock_owned().await;
+        if self.store.pending_promotion().await?.is_some() {
+            return Err(LocalError::Admission);
+        }
         let lease = self.admission().await?;
         // No source access, including metadata or canonicalization, precedes this commit.
         let proposal = self
@@ -471,6 +485,21 @@ impl LocalChecker {
                 Some(json!({"tools":catalog.tools(),"tools_hash":catalog.hash()}).to_string()),
             ),
         ]);
+        let reviewed =
+            super::lock::Lock::load(&self.home).map_err(|_| LocalError::Persistence {
+                proposal_id: proposal.id.clone(),
+            })?;
+        let review_base = crate::store::ReviewBase {
+            update_of: reviewed
+                .extensions
+                .get(&manifest.id)
+                .map(|extension| extension.active.clone()),
+            hash: reviewed
+                .review_base_hash(&manifest.id)
+                .map_err(|_| LocalError::Persistence {
+                    proposal_id: proposal.id.clone(),
+                })?,
+        };
         let proposal = self
             .store
             .transition_proposal(
@@ -481,6 +510,7 @@ impl LocalChecker {
                     checks: Some(checks),
                     hash: Some(post.bundle_hash),
                     packages: Some(packages),
+                    review_base: Some(review_base),
                     ..Default::default()
                 },
             )

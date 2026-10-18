@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 const MIGRATIONS: [&str; 5] = [
     include_str!("../../migrations/0001_init.sql"),
     include_str!("../../migrations/0002_flow_budget.sql"),

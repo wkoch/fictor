@@ -117,6 +117,22 @@ async fn recover_owned(home: &Path, store: Arc<Store>) -> Result<RecoveryReport,
     Ok(report)
 }
 
+/// Caller has resolved the journal and holds installer exclusion. Only the
+/// recognized quarantine namespace is collectible; store staging is retained.
+pub(crate) fn remove_orphan_promotion_staging(home: &Path) -> io::Result<()> {
+    let quarantine = Quarantine::open(home)?;
+    for name in directory_names(quarantine.directory.as_raw_fd())? {
+        if let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".promotion-"))
+            && ulid::Ulid::from_string(id).is_ok_and(|parsed| parsed.to_string() == id)
+        {
+            remove_promotion_staging(home, id)?;
+        }
+    }
+    Ok(())
+}
+
 impl RecoveryReport {
     fn failed(&mut self, proposal_id: Option<String>) {
         let diagnostic = RecoveryDiagnostic {
@@ -133,6 +149,25 @@ impl RecoveryReport {
 /// `include_final` is true only for failed attempts without validated identity.
 pub fn remove_receipt(home: &Path, id: &str, include_final: bool) -> io::Result<()> {
     Quarantine::open(home)?.remove(id, include_final)
+}
+
+/// Only a validated promotion operation may select this deterministic name.
+/// Published store versions are deliberately outside this cleanup surface.
+pub(crate) fn remove_promotion_staging(home: &Path, operation_id: &str) -> io::Result<()> {
+    if !valid_id(operation_id) {
+        return Err(io::Error::other("invalid promotion id"));
+    }
+    let quarantine = Quarantine::open(home)?;
+    let name = CString::new(format!(".promotion-{operation_id}"))
+        .map_err(|_| io::Error::other("invalid promotion id"))?;
+    let result = remove_tree_at_mode(quarantine.directory.as_raw_fd(), &name, true);
+    // SAFETY: quarantine retains this live owned directory descriptor.
+    let synced = if unsafe { libc::fsync(quarantine.directory.as_raw_fd()) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    result.and(synced)
 }
 
 struct Quarantine {
@@ -278,6 +313,30 @@ fn unlink(parent: RawFd, name: &CStr, flags: i32) -> io::Result<()> {
     }
 }
 fn remove_tree_at(parent: RawFd, name: &CStr) -> io::Result<()> {
+    remove_tree_at_mode(parent, name, false)
+}
+
+fn writable_staging_directory(directory: RawFd) -> io::Result<()> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: metadata is aligned writable storage for this live descriptor.
+    if unsafe { libc::fstat(directory, metadata.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized metadata; geteuid has no preconditions.
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || metadata.st_uid != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::other("unsafe promotion staging"));
+    }
+    // SAFETY: fchmod affects only the owned, NO_XDEV-pinned quarantine directory.
+    if unsafe { libc::fchmod(directory, 0o700) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn remove_tree_at_mode(parent: RawFd, name: &CStr, writable: bool) -> io::Result<()> {
     // unlinkat never follows the last component: regular files, special files,
     // and symlinks are removed directly. A mount point fails with EBUSY.
     match unlink(parent, name, 0) {
@@ -291,6 +350,9 @@ fn remove_tree_at(parent: RawFd, name: &CStr) -> io::Result<()> {
         children: VecDeque<OsString>,
     }
     let directory = open_directory(parent, name)?;
+    if writable {
+        writable_staging_directory(directory.as_raw_fd())?;
+    }
     let children = directory_names(directory.as_raw_fd())?.into();
     let mut stack = vec![Frame {
         directory,
@@ -305,6 +367,9 @@ fn remove_tree_at(parent: RawFd, name: &CStr) -> io::Result<()> {
                 Ok(()) => {}
                 Err(error) if matches!(error.raw_os_error(), Some(libc::EISDIR | libc::EPERM)) => {
                     let directory = open_directory(frame.directory.as_raw_fd(), &child)?;
+                    if writable {
+                        writable_staging_directory(directory.as_raw_fd())?;
+                    }
                     let children = directory_names(directory.as_raw_fd())?.into();
                     stack.push(Frame {
                         directory,
@@ -321,6 +386,11 @@ fn remove_tree_at(parent: RawFd, name: &CStr) -> io::Result<()> {
                 return Err(io::Error::other("cleanup stack"));
             };
             let parent = stack.last().map_or(parent, |f| f.directory.as_raw_fd());
+            // SAFETY: this descriptor remains live until after its subtree is
+            // durably removed from its parent.
+            if unsafe { libc::fsync(frame.directory.as_raw_fd()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
             unlink(parent, &frame.name, libc::AT_REMOVEDIR)?;
         }
     }

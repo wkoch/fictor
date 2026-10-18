@@ -91,7 +91,12 @@ async fn checked_local_bundle_stays_quarantined_and_persists_audited_checks() {
             .join("fictor.yaml")
             .exists()
     );
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
     assert!(
         fs::read_dir(home.join("extensions/store"))
             .unwrap()
@@ -143,7 +148,12 @@ async fn runtime_dependencies_are_not_silently_skipped() {
             .iter()
             .any(|check| check.name == "dependencies" && !check.passed)
     );
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -294,7 +304,12 @@ for await (const line of createInterface({ input: process.stdin })) {
                     .any(|check| check.name == "smoke" && !check.passed)
             );
         }
-        assert!(!home.join("extensions/lock.json").exists());
+        assert!(
+            fictor::installer::lock::Lock::load_required(&home)
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
     }
 }
 
@@ -332,7 +347,12 @@ async fn global_process_fails_before_dependency_resolution_or_smoke() {
             .iter()
             .any(|check| check.name == "manifest" && !check.passed)
     );
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
     assert!(!home.join("logs/ext/fixture.log").exists());
 }
 #[tokio::test]
@@ -391,7 +411,12 @@ async fn receipt_rejects_5001_empty_files_before_parsing() {
     assert_eq!(proposal.state, ProposalState::Failed);
     assert!(proposal.ext_id.is_none());
     assert!(proposal.version.is_none());
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -430,7 +455,12 @@ async fn cli_check_reports_hashes_and_never_activates_the_bundle() {
             .unwrap()
             .starts_with("sha256:")
     );
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -511,7 +541,12 @@ async fn review_preserves_requested_permissions_omitted_paths_and_ignored_receip
             .iter()
             .any(|check| check.name == "smoke" && !check.passed)
     );
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -573,7 +608,12 @@ async fn cancellation_of_caller_does_not_strand_the_core_owned_check() {
     })
     .await
     .unwrap();
-    assert!(!home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 
 #[tokio::test]

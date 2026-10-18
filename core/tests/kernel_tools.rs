@@ -38,7 +38,7 @@ fn lock(home: &Path) {
     let tools =
         vec![json!({"name":"echo","description":"Pinned echo","inputSchema":{"type":"object"}})];
     let catalog = PinnedCatalog::new(tools.clone()).unwrap();
-    let value = json!({"schema":1,"extensions":{"example":{
+    let value = json!({"schema":1,"runtimes":{},"extensions":{"example":{
         "enabled":true,"active":key,"versions":{key:{
             "version":"1.0.0","hash":format!("sha256:{}","a".repeat(64)),"path":relative,
             "source":{"kind":"local"},"approved":{"by":"user","at":"2026-10-18T12:00:00Z","approval_id":null},
@@ -154,6 +154,7 @@ async fn missing_lock_is_empty_but_broken_active_state_is_an_error() {
     let workspace = root.path().join("w");
     fs::create_dir(&workspace).unwrap();
     fictor::initialize(&home).await.unwrap();
+    fs::remove_file(home.join("extensions/lock.json")).unwrap();
     let store = Arc::new(Store::open(&home).await.unwrap());
     let id = session(&store, &workspace).await;
     let (mut server, mut socket) = client(&home, store, &id, &["tools"]).await;
@@ -166,5 +167,59 @@ async fn missing_lock_is_empty_but_broken_active_state_is_an_error() {
     let error = call(&mut socket, "tools.list", json!({"session_id":id})).await;
     assert_eq!(error["error"]["code"], -32603);
     assert!(error.get("result").is_none());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discovery_waits_for_the_installers_snapshot_section() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fictor::initialize(&home).await.unwrap();
+    let store = Arc::new(Store::open(&home).await.unwrap());
+    let id = session(&store, &workspace).await;
+    let (mut server, mut socket) = client(&home, store.clone(), &id, &["tools", "catalog"]).await;
+    for method in ["tools.list", "catalog.list"] {
+        let section = store.owner().installer_gate().lock_owned().await;
+        socket
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"session_id":id}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), socket.read_line(&mut line))
+                .await
+                .is_err()
+        );
+        // Publish while the reader is excluded. It must see the complete new
+        // committed snapshot, rather than the previously empty registry.
+        if method == "tools.list" {
+            lock(&home);
+        } else {
+            fs::write(
+                home.join("extensions/lock.json"),
+                serde_json::to_vec(&fictor::installer::lock::Lock::default()).unwrap(),
+            )
+            .unwrap();
+        }
+        drop(section);
+        tokio::time::timeout(Duration::from_secs(5), socket.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert!(response.get("result").is_some(), "{response}");
+        if method == "tools.list" {
+            assert_eq!(response["result"]["tools"][0]["name"], "example__echo");
+        }
+    }
     server.shutdown().await.unwrap();
 }

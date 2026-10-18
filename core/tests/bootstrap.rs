@@ -7,8 +7,13 @@ use rusqlite::Connection;
 use std::{fs, path::PathBuf, process::Command};
 use tempfile::tempdir;
 
+// fork temporarily inherits another test's flock descriptors until exec. Keep
+// CLI children outside every fixture's ownership lifetime; never retry Busy.
+static PROCESS_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn init_is_idempotent_and_preserves_configuration() {
+    let _fixture = PROCESS_FIXTURES.lock().await;
     let dir = tempdir().unwrap();
     let home = dir.path().join("fictor");
     fictor::initialize(&home).await.unwrap();
@@ -93,6 +98,35 @@ fn home_resolution_uses_xdg_and_linux_defaults() {
     assert!(home::resolve_with(Some("".into()), user, None).is_err());
 }
 
+#[tokio::test]
+async fn init_never_reconstructs_a_lost_or_corrupt_lock_in_an_existing_home() {
+    let _fixture = PROCESS_FIXTURES.lock().await;
+    let root = tempdir().unwrap();
+    let home = root.path().join("home");
+    fictor::initialize(&home).await.unwrap();
+    let path = home.join("extensions/lock.json");
+    let config = fs::read(home.join("config.toml")).unwrap();
+    assert!(
+        fictor::installer::lock::Lock::load_required(&home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        fictor::initialize(&home).await,
+        Err(fictor::InitError::Lock(_))
+    ));
+    assert!(!path.exists());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+    fs::write(&path, b"unrecognized lock").unwrap();
+    assert!(matches!(
+        fictor::initialize(&home).await,
+        Err(fictor::InitError::Lock(_))
+    ));
+    assert_eq!(fs::read(path).unwrap(), b"unrecognized lock");
+}
+
 #[test]
 fn config_rejects_exposed_listener_and_invalid_modes_without_echoing_input() {
     for address in [
@@ -119,6 +153,7 @@ fn config_rejects_exposed_listener_and_invalid_modes_without_echoing_input() {
 
 #[tokio::test]
 async fn migrations_match_spec_and_protect_events() {
+    let _fixture = PROCESS_FIXTURES.lock().await;
     assert_eq!(
         include_str!("../migrations/0001_init.sql"),
         include_str!("../../spec/schemas/0001_init.sql")
@@ -162,6 +197,7 @@ async fn migrations_match_spec_and_protect_events() {
 
 #[test]
 fn cli_receipt_failures_report_durable_id_and_safe_reason() {
+    let _fixture = PROCESS_FIXTURES.blocking_lock();
     let root = tempdir().unwrap();
     let home = root.path().join("core");
     let real = root.path().join("user");
@@ -235,6 +271,7 @@ fn cli_receipt_failures_report_durable_id_and_safe_reason() {
 
 #[test]
 fn cli_terminal_persistence_error_reports_id_without_claiming_audited_failure() {
+    let _fixture = PROCESS_FIXTURES.blocking_lock();
     let root = tempdir().unwrap();
     let home = root.path().join("core");
     let real = root.path().join("user");
@@ -297,6 +334,7 @@ fn cli_terminal_persistence_error_reports_id_without_claiming_audited_failure() 
 
 #[tokio::test]
 async fn future_schema_is_refused() {
+    let _fixture = PROCESS_FIXTURES.lock().await;
     let dir = tempdir().unwrap();
     fs::set_permissions(
         dir.path(),
@@ -318,6 +356,7 @@ async fn future_schema_is_refused() {
 
 #[test]
 fn cli_init_and_unsupported_install_are_honest() {
+    let _fixture = PROCESS_FIXTURES.blocking_lock();
     let dir = tempdir().unwrap();
     let home = dir.path().join("data");
     let output = Command::new(env!("CARGO_BIN_EXE_fictor"))
@@ -342,6 +381,7 @@ fn cli_init_and_unsupported_install_are_honest() {
 
 #[test]
 fn doctor_reports_development_runtime_status_without_modifying_config() {
+    let _fixture = PROCESS_FIXTURES.blocking_lock();
     let dir = tempdir().unwrap();
     let home = dir.path().join("data");
     home::prepare(&home).unwrap();
@@ -397,6 +437,7 @@ fn runtime_sources_match_the_spec_and_reject_legacy_executable_overrides() {
 
 #[test]
 fn secrets_cli_never_accepts_or_echoes_secret_values_in_arguments() {
+    let _fixture = PROCESS_FIXTURES.blocking_lock();
     let result = Command::new(env!("CARGO_BIN_EXE_fictor"))
         .args(["secrets", "set", "provider", "fake-sensitive-argv-value"])
         .output()
@@ -414,6 +455,7 @@ fn secrets_cli_never_accepts_or_echoes_secret_values_in_arguments() {
 
 #[tokio::test]
 async fn init_refuses_symlinked_private_directories() {
+    let _fixture = PROCESS_FIXTURES.lock().await;
     use std::os::unix::fs::symlink;
     let root = tempdir().unwrap();
     let home = root.path().join("data");

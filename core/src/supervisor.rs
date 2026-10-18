@@ -1,7 +1,10 @@
-//! Trusted launch and process ownership. No active lock or restart policy is
-//! inferred here: the installer supplies a validated bundle and explicit identity.
+//! Trusted launch, process ownership and lazy crash admission. The installer
+//! supplies a validated bundle and explicit identity; no call is replayed here.
 use crate::{
     config::Config,
+    crash_recovery::{
+        CrashClock, CrashObservation, CrashStderr, LinuxCrashClock, RecoveryKey, RecoveryStatus,
+    },
     gateway::{AuditIdentity, CatalogInvalidation, McpConnection, PinnedCatalog},
     installer::{
         bundle::{self, BundleBudget, BundleProfile},
@@ -61,6 +64,12 @@ pub enum SupervisorError {
     Audit,
     #[error("conexão MCP indisponível")]
     Mcp,
+    #[error("extensão em backoff por {retry_after_ms} ms")]
+    Backoff { retry_after_ms: i64 },
+    #[error("extensão bloqueada por crash loop")]
+    CrashLoop,
+    #[error("promoção pendente impede admissão da extensão")]
+    PromotionPending,
 }
 
 pub struct Supervisor {
@@ -76,6 +85,8 @@ pub struct Supervisor {
     fictor_exe: PathBuf,
     active: Arc<Mutex<BTreeSet<String>>>,
     logs: Mutex<BTreeMap<String, Arc<Mutex<RotatingLog>>>>,
+    crash_clock: Arc<dyn CrashClock>,
+    pending_crashes: Arc<Mutex<BTreeMap<RecoveryKey, CrashObservation>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +154,53 @@ impl Supervisor {
             fictor_exe,
             active: Arc::default(),
             logs: Mutex::default(),
+            crash_clock: Arc::new(LinuxCrashClock),
+            pending_crashes: Arc::default(),
         })
+    }
+
+    /// Trusted injection for deterministic recovery tests; extensions cannot
+    /// select the host clock or request resets through the Kernel Protocol.
+    pub fn with_crash_clock(mut self, clock: Arc<dyn CrashClock>) -> Self {
+        self.crash_clock = clock;
+        self
+    }
+
+    async fn require_recovery(&self, key: &RecoveryKey) -> Result<(), SupervisorError> {
+        let pending = self
+            .pending_crashes
+            .lock()
+            .map_err(|_| SupervisorError::Audit)?
+            .get(key)
+            .cloned();
+        if let Some(observation) = pending {
+            self.store
+                .record_crash(observation.clone(), self.crash_clock.clone())
+                .await
+                .map_err(|_| SupervisorError::Audit)?;
+            let mut pending = self
+                .pending_crashes
+                .lock()
+                .map_err(|_| SupervisorError::Audit)?;
+            if pending
+                .get(key)
+                .is_some_and(|current| current.instance_id == observation.instance_id)
+            {
+                pending.remove(key);
+            }
+        }
+        match self
+            .store
+            .crash_availability(key.clone(), self.crash_clock.clone())
+            .await
+            .map_err(|_| SupervisorError::Audit)?
+        {
+            RecoveryStatus::Ready => Ok(()),
+            RecoveryStatus::Backoff { retry_after_ms } => {
+                Err(SupervisorError::Backoff { retry_after_ms })
+            }
+            RecoveryStatus::CrashLoop => Err(SupervisorError::CrashLoop),
+        }
     }
 
     /// A trusted host executable override, principally for integration-test
@@ -409,6 +466,24 @@ impl Supervisor {
                 _ => return Err(SupervisorError::Invalid),
             }
         };
+        // A smoke Supervisor owns a separate disposable Store/home; its gate
+        // cannot deadlock the original installer's admission section.
+        let mut admission = Some(self.store.owner().installer_gate().lock_owned().await);
+        let recovery = RecoveryKey {
+            ext_id: manifest.id.clone(),
+            key: key.into(),
+            session_id: session_id.map(str::to_owned),
+        };
+        if !smoke
+            && self
+                .store
+                .pending_promotion()
+                .await
+                .map_err(|_| SupervisorError::Audit)?
+                .is_some()
+        {
+            return Err(SupervisorError::PromotionPending);
+        }
         let reservation = Reservation::new(self.active.clone(), logical)?;
         let bundle = canonical_directory(bundle)?;
         let quarantine = self.home.join("extensions/quarantine");
@@ -486,6 +561,9 @@ impl Supervisor {
             {
                 return Err(SupervisorError::Invalid);
             }
+        }
+        if !smoke {
+            self.require_recovery(&recovery).await?;
         }
         let data_base = self.home.join("extensions/data");
         let data = if smoke {
@@ -773,6 +851,8 @@ impl Supervisor {
             stop,
             exit,
         };
+        let crash_clock = self.crash_clock.clone();
+        let pending_crashes = self.pending_crashes.clone();
         tokio::spawn(async move {
             // Mount source descriptors stay pinned until reap, including the
             // interval before __sandbox-init verifies its post-mount proof.
@@ -789,6 +869,9 @@ impl Supervisor {
             }
             let success = startup_error.is_none();
             let failed_ready = if success {
+                // The detached owner holds admission across caller cancellation
+                // after fork, but not throughout the process's active lifetime.
+                admission.take();
                 let _ = ready.send(Ok(()));
                 None
             } else {
@@ -841,7 +924,7 @@ impl Supervisor {
             let outcome = outcome.unwrap_or(ProcessExit {
                 code: None,
                 signal: None,
-                crashed: true,
+                crashed: false, // A monitor failure is not an observed crash.
             });
             let mut references = Vec::new();
             let mut payload = json!({"ext_id":audit.ext_id,"instance_id":id,"key":audit.key,"code":outcome.code,"signal":outcome.signal,"smoke":smoke});
@@ -864,17 +947,44 @@ impl Supervisor {
             if process_failed {
                 payload["process_error"] = true.into();
             }
-            let audited = audit_event(
-                &audit,
-                if outcome.crashed {
-                    "ext.crashed"
-                } else {
-                    "ext.stopped"
-                },
-                payload,
-                references,
-            )
-            .await;
+            let audited = if outcome.crashed && !smoke {
+                let observation = CrashObservation {
+                    recovery,
+                    instance_id: id.clone(),
+                    code: outcome.code,
+                    signal: outcome.signal,
+                    stderr: CrashStderr {
+                        blob: references.first().cloned(),
+                        unavailable: stderr_failed || blob_failed,
+                    },
+                };
+                let result = audit
+                    .store
+                    .record_crash(observation.clone(), crash_clock)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SupervisorError::Audit);
+                if result.is_err()
+                    && let Ok(mut pending) = pending_crashes.lock()
+                {
+                    // Keep this before releasing the active reservation. A new
+                    // demand can retry only this audit, never the failed call.
+                    pending.insert(observation.recovery.clone(), observation);
+                }
+                result
+            } else {
+                audit_event(
+                    &audit,
+                    if outcome.crashed {
+                        "ext.crashed"
+                    } else {
+                        "ext.stopped"
+                    },
+                    payload,
+                    references,
+                )
+                .await
+            };
             let final_result = if audited.is_ok()
                 && !stderr_failed
                 && !kernel_failed
@@ -891,6 +1001,7 @@ impl Supervisor {
             drop(reservation);
             drop(guard);
             drop(_ownership);
+            admission.take();
             exit_sender.send_replace(Some(final_result));
             if let Some(ready) = failed_ready {
                 // An error hands control back only after bwrap has been reaped
@@ -1045,7 +1156,7 @@ async fn supervise(
         reservation,
         catalog_invalidation,
     } = cleanup;
-    let (status, crashed) = if !started {
+    let (status, mut crashed) = if !started {
         let _ = registration.proxy.revoke(&registration.token);
         if let Some(kernel) = &kernel {
             kernel.revoke();
@@ -1137,6 +1248,9 @@ async fn supervise(
     }
     let mut status = status;
     if status.is_err() {
+        // No exit was observed before the core requested cleanup. Do not infer
+        // another crash from cleanup_failed or from a forced termination.
+        crashed = false;
         signal_group(guard.pid, libc::SIGKILL);
         let _ = audit_event(
             audit,

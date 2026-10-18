@@ -62,7 +62,7 @@ impl Fixture {
         });
         fs::write(bundle.join("fictor.yaml"), manifest.to_string()).unwrap();
         freeze(&bundle);
-        let value = json!({"schema":1,"extensions":{"example":{
+        let value = json!({"schema":1,"runtimes":{},"extensions":{"example":{
             "enabled":true,"active":key,"versions":{key:{
                 "version":"1.0.0","hash":format!("sha256:{}","a".repeat(64)),"path":relative,
                 "source":{"kind":"local"},"approved":{"by":"user","at":"2026-10-18T12:00:00Z","approval_id":null},

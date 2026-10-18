@@ -40,6 +40,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ExtCommand {
+    /// Lista a configuração registrada, com ou sem core ativo.
+    List,
     /// Valida, calcula hash e executa smoke isolado; não aprova nem promove.
     Check { path: PathBuf },
     /// Habilita uma extensão no lock com o core parado.
@@ -102,6 +104,12 @@ async fn main() -> anyhow::Result<()> {
             {
                 bail!("doctor encontrou requisitos ausentes");
             }
+        }
+        Command::Ext {
+            command: ExtCommand::List,
+        } => {
+            let snapshot = fictor::installer::listing::list(&home).await?;
+            print!("{}", snapshot.human()?);
         }
         Command::Ext {
             command: ExtCommand::Check { path },
@@ -212,8 +220,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn set_extension_enabled(home: &std::path::Path, id: &str, enabled: bool) -> anyhow::Result<()> {
-    let owner = fictor::ownership::HomeLease::acquire(home)?;
-    let change = fictor::installer::control::set_enabled(owner.home(), id, enabled)?;
+    let change = fictor::installer::control::set_enabled(home, id, enabled)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

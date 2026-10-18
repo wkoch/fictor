@@ -325,15 +325,29 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
                 return Err(RpcError::SCOPE);
             }
             state.store.session(p.session_id).await?;
+            let section = state.store.owner().installer_gate().lock_owned().await;
+            if state.store.pending_promotion().await?.is_some() {
+                return Err(RpcError::INTERNAL);
+            }
+            let owner = state.store.owner().clone();
             let home = state.home.clone();
-            let tools =
-                tokio::task::spawn_blocking(move || crate::gateway::registry::model_tools(&home))
-                    .await
-                    .map_err(|_| RpcError::INTERNAL)?
-                    .map_err(|error| match error {
-                        crate::gateway::registry::RegistryError::TooLarge => RpcError::TOO_LARGE,
-                        _ => RpcError::INTERNAL,
-                    })?;
+            let tools = tokio::task::spawn_blocking(move || {
+                let _section = section;
+                owner
+                    .verify()
+                    .map_err(|_| crate::gateway::registry::RegistryError::Unavailable)?;
+                let result = crate::gateway::registry::model_tools(&home);
+                owner
+                    .verify()
+                    .map_err(|_| crate::gateway::registry::RegistryError::Unavailable)?;
+                result
+            })
+            .await
+            .map_err(|_| RpcError::INTERNAL)?
+            .map_err(|error| match error {
+                crate::gateway::registry::RegistryError::TooLarge => RpcError::TOO_LARGE,
+                _ => RpcError::INTERNAL,
+            })?;
             Ok(json!({"tools":tools}))
         }
         "catalog.list" => {
@@ -343,14 +357,29 @@ pub(super) async fn call(state: &State, method: &str, value: Value) -> Result<Va
                 return Err(RpcError::SCOPE);
             }
             state.store.session(p.session_id).await?;
+            let section = state.store.owner().installer_gate().lock_owned().await;
+            if state.store.pending_promotion().await?.is_some() {
+                return Err(RpcError::INTERNAL);
+            }
+            let owner = state.store.owner().clone();
             let home = state.home.clone();
-            let catalog = tokio::task::spawn_blocking(move || super::catalog::list(&home))
-                .await
-                .map_err(|_| RpcError::INTERNAL)?
-                .map_err(|error| match error {
-                    super::catalog::CatalogError::TooLarge => RpcError::TOO_LARGE,
-                    _ => RpcError::INTERNAL,
-                })?;
+            let catalog = tokio::task::spawn_blocking(move || {
+                let _section = section;
+                owner
+                    .verify()
+                    .map_err(|_| super::catalog::CatalogError::Invalid)?;
+                let result = super::catalog::list(&home);
+                owner
+                    .verify()
+                    .map_err(|_| super::catalog::CatalogError::Invalid)?;
+                result
+            })
+            .await
+            .map_err(|_| RpcError::INTERNAL)?
+            .map_err(|error| match error {
+                super::catalog::CatalogError::TooLarge => RpcError::TOO_LARGE,
+                _ => RpcError::INTERNAL,
+            })?;
             serialize(catalog)
         }
         "config.get" => {

@@ -17,6 +17,10 @@ use std::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
+    #[error(transparent)]
+    Ownership(#[from] crate::ownership::OwnershipError),
+    #[error(transparent)]
+    Snapshot(#[from] super::listing::ListingError),
     #[error("não foi possível obter exclusividade do instalador")]
     Admission(#[source] io::Error),
     #[error("há um endpoint administrativo; controle offline recusado")]
@@ -46,9 +50,18 @@ pub fn set_enabled(
     ext_id: &str,
     enabled: bool,
 ) -> Result<ControlChange, ControlError> {
+    let owner = crate::ownership::HomeLease::acquire(home)?;
+    let home = owner.home();
+    let _section = owner
+        .installer_gate()
+        .try_lock_owned()
+        .map_err(|_| ControlError::Snapshot(super::listing::ListingError::Busy))?;
     let _lease = InstallerLease::acquire(home).map_err(ControlError::Admission)?;
     require_offline(home)?;
-    let mut lock = Lock::load(home)?;
+    // Read the real WAL and validate the journal without migration or recovery.
+    // A pending intent must not become a third lock state through an offline edit.
+    super::listing::read_owned(owner.clone())?;
+    let mut lock = Lock::load_required(home)?;
     let extension = lock
         .extensions
         .get_mut(ext_id)
@@ -60,6 +73,7 @@ pub fn set_enabled(
         // publishing its endpoint. Recheck the marker before the atomic writer;
         // this milestone provides no server protocol or process coordination.
         require_offline(home)?;
+        owner.verify()?;
         lock.write_atomic(home)?;
     }
     Ok(ControlChange {

@@ -1,6 +1,6 @@
 use fictor::store::{
     HumanDecision, NewProposal, ProposalCheck, ProposalIdentity, ProposalState as State,
-    ProposalUpdate, ResolvedPackage, Store,
+    ProposalUpdate, ResolvedPackage, ReviewBase, Store,
 };
 use serde_json::json;
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
@@ -63,8 +63,11 @@ fn checked() -> ProposalUpdate {
                 name: "smoke".into(),
                 passed: true,
                 blocking: true,
-                detail: Some("passed".into()),
+                detail: Some(smoke_detail()),
             },
+            passed("dependencies"),
+            passed("bundle"),
+            passed("declarations"),
         ]),
         packages: Some(vec![ResolvedPackage {
             ecosystem: "fixture".into(),
@@ -72,8 +75,29 @@ fn checked() -> ProposalUpdate {
             version: "1.0.0".into(),
         }]),
         decision: None,
+        review_base: Some(base()),
         ..Default::default()
     }
+}
+fn passed(name: &str) -> ProposalCheck {
+    ProposalCheck {
+        name: name.into(),
+        passed: true,
+        blocking: true,
+        detail: None,
+    }
+}
+fn base() -> ReviewBase {
+    ReviewBase {
+        update_of: None,
+        hash: fictor::installer::lock::Lock::default()
+            .review_base_hash("sample")
+            .unwrap(),
+    }
+}
+fn smoke_detail() -> String {
+    let catalog = fictor::gateway::PinnedCatalog::new(vec![]).unwrap();
+    json!({"tools":catalog.tools(),"tools_hash":catalog.hash()}).to_string()
 }
 async fn ready(store: &Store) -> String {
     let p = store.begin_attempt(input()).await.unwrap();
@@ -91,6 +115,250 @@ async fn ready(store: &Store) -> String {
         .await
         .unwrap();
     p.id
+}
+
+#[tokio::test]
+async fn checked_binds_current_base_and_approval_never_refreshes_a_stale_review() {
+    let (_root, store) = store().await;
+    let p = store.begin_attempt(input()).await.unwrap();
+    let mut identity = identifying();
+    identity.identity.as_mut().unwrap().update_of = Some("0.0.1-0123456789ab".into());
+    store
+        .transition_proposal(p.id.clone(), State::Received, State::Checking, identity)
+        .await
+        .unwrap();
+    let mut incomplete = checked();
+    incomplete.review_base = None;
+    assert!(
+        store
+            .transition_proposal(p.id.clone(), State::Checking, State::Checked, incomplete)
+            .await
+            .is_err()
+    );
+    let reviewed = store
+        .transition_proposal(p.id.clone(), State::Checking, State::Checked, checked())
+        .await
+        .unwrap();
+    assert_eq!(reviewed.update_of, None);
+    assert_eq!(reviewed.review_base_hash, Some(base().hash));
+    let nonce = store
+        .proposal_nonce(p.id.clone())
+        .await
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let head = store.session("sys".into()).await.unwrap().head_id;
+    for review_base in [
+        None,
+        Some(ReviewBase {
+            update_of: Some("0.0.2-abcdef123456".into()),
+            ..base()
+        }),
+        Some(ReviewBase {
+            hash: format!("sha256:{}", "f".repeat(64)),
+            ..base()
+        }),
+    ] {
+        let decision = store.proposal_nonce(p.id.clone()).await.unwrap();
+        let result = store
+            .transition_proposal(
+                p.id.clone(),
+                State::Checked,
+                State::Approved,
+                ProposalUpdate {
+                    decision: Some(HumanDecision::User(decision)),
+                    review_base,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(fictor::store::StoreError::Invalid("promotion:stale_base"))
+        ));
+        let current = store.proposal(p.id.clone()).await.unwrap();
+        assert_eq!(current.state, State::Checked);
+        assert_eq!(current.review_base_hash, reviewed.review_base_hash);
+        assert_eq!(
+            store.proposal_nonce(p.id.clone()).await.unwrap().as_str(),
+            nonce
+        );
+        assert_eq!(store.session("sys".into()).await.unwrap().head_id, head);
+    }
+    // A migrated approval without a review base must be reviewed again.
+    let id = p.id.clone();
+    store
+        .write(move |db| {
+            db.execute(
+                "UPDATE proposals SET review_base_hash=NULL WHERE id=?1",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let decision = store.proposal_nonce(p.id.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .transition_proposal(
+                p.id,
+                State::Checked,
+                State::Approved,
+                ProposalUpdate {
+                    decision: Some(HumanDecision::User(decision)),
+                    review_base: Some(base()),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(fictor::store::StoreError::Invalid("promotion:stale_base"))
+    ));
+}
+
+#[tokio::test]
+async fn exact_overrides_commit_with_decision_and_survive_reopen_while_expansion_fails() {
+    use fictor::installer::overrides::Overrides;
+    let (root, store) = store().await;
+    let p = store.begin_attempt(input()).await.unwrap();
+    let mut identity = identifying();
+    identity.identity.as_mut().unwrap().manifest["runtime"] =
+        json!({"kind":"node","entry":"index.mjs"});
+    identity.identity.as_mut().unwrap().manifest["scope"] = json!("session");
+    identity.identity.as_mut().unwrap().manifest["mcp"] = json!(false);
+    identity.identity.as_mut().unwrap().manifest["kernel"] = json!(["kv"]);
+    identity.identity.as_mut().unwrap().manifest["permissions"] =
+        json!({"env":{"APP_LABEL":"fake-only"}});
+    store
+        .transition_proposal(p.id.clone(), State::Received, State::Checking, identity)
+        .await
+        .unwrap();
+    store
+        .transition_proposal(p.id.clone(), State::Checking, State::Checked, checked())
+        .await
+        .unwrap();
+    let original_nonce = store
+        .proposal_nonce(p.id.clone())
+        .await
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let head = store.session("sys".into()).await.unwrap().head_id;
+    for patch in [
+        json!({"permissions":{"env":{"NEW":"forbidden"}}}),
+        json!({"tools":{"missing":{}}}),
+    ] {
+        let nonce = store.proposal_nonce(p.id.clone()).await.unwrap();
+        assert!(
+            store
+                .transition_proposal(
+                    p.id.clone(),
+                    State::Checked,
+                    State::Approved,
+                    ProposalUpdate {
+                        decision: Some(HumanDecision::User(nonce)),
+                        review_base: Some(base()),
+                        overrides: Some(Overrides::from_value(patch).unwrap()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.proposal(p.id.clone()).await.unwrap().state,
+            State::Checked
+        );
+        assert_eq!(
+            store.proposal_nonce(p.id.clone()).await.unwrap().as_str(),
+            original_nonce
+        );
+        assert_eq!(store.session("sys".into()).await.unwrap().head_id, head);
+    }
+    let exact = json!({"permissions":{"env":{}},"tools":{"default":{"model_visible":false}}});
+    let nonce = store.proposal_nonce(p.id.clone()).await.unwrap();
+    let approved = store
+        .transition_proposal(
+            p.id.clone(),
+            State::Checked,
+            State::Approved,
+            ProposalUpdate {
+                decision: Some(HumanDecision::User(nonce)),
+                review_base: Some(base()),
+                overrides: Some(Overrides::from_value(exact.clone()).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.overrides.as_value(), &exact);
+    assert!(
+        store
+            .transition_proposal(
+                p.id.clone(),
+                State::Approved,
+                State::Promoted,
+                ProposalUpdate {
+                    overrides: Some(Overrides::default()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+    );
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let reopened = Store::open(root.path()).await.unwrap();
+    let persisted = reopened.proposal(p.id).await.unwrap();
+    assert_eq!(persisted.overrides.as_value(), &exact);
+    assert_eq!(persisted.review_base_hash, Some(base().hash));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn approval_audit_failure_rolls_back_patch_decision_and_nonce_together() {
+    let (_root, store) = store().await;
+    let id = ready(&store).await;
+    let old_nonce = store
+        .proposal_nonce(id.clone())
+        .await
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let head = store.session("sys".into()).await.unwrap().head_id;
+    store.write(|db| { db.execute_batch("CREATE TRIGGER refuse_approval BEFORE INSERT ON events WHEN NEW.kind='ext.approved' BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;Ok(()) }).await.unwrap();
+    let nonce = store.proposal_nonce(id.clone()).await.unwrap();
+    assert!(
+        store
+            .transition_proposal(
+                id.clone(),
+                State::Checked,
+                State::Approved,
+                ProposalUpdate {
+                    decision: Some(HumanDecision::User(nonce)),
+                    review_base: Some(base()),
+                    overrides: Some(
+                        fictor::installer::overrides::Overrides::parse("{\"permissions\":{}}")
+                            .unwrap()
+                    ),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+    );
+    let current = store.proposal(id.clone()).await.unwrap();
+    assert_eq!(current.state, State::Checked);
+    assert!(current.decided_by.is_none());
+    assert_eq!(
+        current.overrides,
+        fictor::installer::overrides::Overrides::default()
+    );
+    assert_eq!(store.proposal_nonce(id).await.unwrap().as_str(), old_nonce);
+    assert_eq!(store.session("sys".into()).await.unwrap().head_id, head);
 }
 
 #[tokio::test]
@@ -346,6 +614,7 @@ async fn human_decision_requires_matching_nonce_rotates_it_and_blocks_replay() {
                 State::Approved,
                 ProposalUpdate {
                     decision: Some(HumanDecision::User(wrong)),
+                    review_base: Some(base()),
                     ..ProposalUpdate::default()
                 }
             )
@@ -362,6 +631,7 @@ async fn human_decision_requires_matching_nonce_rotates_it_and_blocks_replay() {
             State::Approved,
             ProposalUpdate {
                 decision: Some(HumanDecision::User(nonce)),
+                review_base: Some(base()),
                 ..ProposalUpdate::default()
             },
         )
@@ -379,6 +649,7 @@ async fn human_decision_requires_matching_nonce_rotates_it_and_blocks_replay() {
                 State::Approved,
                 ProposalUpdate {
                     decision: Some(HumanDecision::User(replay)),
+                    review_base: Some(base()),
                     ..ProposalUpdate::default()
                 }
             )
@@ -592,7 +863,7 @@ async fn proposals_survive_reopen_with_nonce_and_checked_results() {
     let p = reopened.proposal(id.clone()).await.unwrap();
     assert_eq!(p.state, State::Checked);
     assert!(p.hash.is_some());
-    assert_eq!(p.checks.unwrap().len(), 2);
+    assert_eq!(p.checks.unwrap().len(), 5);
     assert!(reopened.proposal_nonce(id).await.unwrap().as_str() == nonce);
     reopened.shutdown().await.unwrap();
 }
@@ -728,6 +999,7 @@ async fn recovery_preserves_checks_identity_and_terminal_states_and_is_idempoten
             State::Approved,
             ProposalUpdate {
                 decision: Some(HumanDecision::User(nonce)),
+                review_base: Some(base()),
                 ..Default::default()
             },
         )

@@ -198,29 +198,73 @@ fn launch_pid(home: &Path) -> (PathBuf, u32) {
     (records[0].clone(), pid)
 }
 
+struct PausedAdmissionClock {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl fictor::crash_recovery::CrashClock for PausedAdmissionClock {
+    fn now(&self) -> Result<fictor::crash_recovery::CrashTime, fictor::store::StoreError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+            // Dropping the sender on a test failure releases this pause too.
+            let _ = self.resume.lock().unwrap().recv();
+        }
+        fictor::crash_recovery::CrashClock::now(&fictor::crash_recovery::LinuxCrashClock)
+    }
+}
+fn pause_first_admission(
+    mut fixture: Fixture,
+) -> (
+    Fixture,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (resume, held) = std::sync::mpsc::channel();
+    fixture.supervisor = fixture
+        .supervisor
+        .with_crash_clock(Arc::new(PausedAdmissionClock {
+            entered: std::sync::Mutex::new(Some(entered)),
+            resume: std::sync::Mutex::new(held),
+        }));
+    (fixture, waiting, resume)
+}
 async fn hold_store_writer(
     store: Arc<Store>,
+    resume_admission: Option<std::sync::mpsc::Sender<()>>,
 ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, held) = std::sync::mpsc::channel();
-    let task = tokio::spawn(async move {
+    let mut task = Box::pin(async move {
         store
             .write(move |_| {
                 let _ = entered.send(());
-                // Dropping the sender on a test failure also releases the writer.
                 let _ = held.recv();
                 Ok(())
             })
             .await
             .unwrap();
     });
+    // Queue the blocker while the first admission sample still owns the writer.
+    // One poll sends the job into the empty bounded queue, then waits for its
+    // reply. No timing heuristic or external SQLite lock selects this point.
+    assert!(
+        std::future::poll_fn(|context| std::task::Poll::Ready(task.as_mut().poll(context)))
+            .await
+            .is_pending()
+    );
+    if let Some(resume) = resume_admission {
+        resume.send(()).unwrap();
+    }
+    let task = tokio::spawn(task);
     waiting.await.unwrap();
     (release, task)
 }
 
 #[tokio::test]
 async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resources() {
-    let fixture = Arc::new(Fixture::new().await);
+    let (fixture, admission, resume) = pause_first_admission(Fixture::new().await);
+    let fixture = Arc::new(fixture);
     let session = fixture.session().await;
     let bundle = fixture.bundle(
         false,
@@ -234,7 +278,6 @@ async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resou
     );
     let database = rusqlite::Connection::open(fixture.home.join("fictor.db")).unwrap();
     database.execute_batch("CREATE TRIGGER reject_extension_start BEFORE INSERT ON events WHEN NEW.kind='ext.started' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
-    let (release, writer) = hold_store_writer(fixture.store.clone()).await;
     let external = Arc::new(tempfile::tempdir().unwrap());
     let external_path = external.path().to_owned();
     let retained = Arc::downgrade(&external);
@@ -252,6 +295,8 @@ async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resou
             )
             .await
     });
+    admission.await.unwrap();
+    let (release, writer) = hold_store_writer(fixture.store.clone(), Some(resume)).await;
     wait_file(&fixture.workspace.join("launch.started")).await;
     let (pid_path, pid) = launch_pid(&fixture.home);
     assert!(retained.upgrade().is_some());
@@ -272,7 +317,8 @@ async fn startup_audit_failure_reaps_the_sandbox_before_releasing_external_resou
 
 #[tokio::test]
 async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped() {
-    let fixture = Arc::new(Fixture::new().await);
+    let (fixture, admission, resume) = pause_first_admission(Fixture::new().await);
+    let fixture = Arc::new(fixture);
     let session = fixture.session().await;
     let bundle = fixture.bundle(
         false,
@@ -284,7 +330,6 @@ async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped
         true,
         false,
     );
-    let (release, writer) = hold_store_writer(fixture.store.clone()).await;
     let external = Arc::new(tempfile::tempdir().unwrap());
     let external_path = external.path().to_owned();
     let retained = Arc::downgrade(&external);
@@ -302,6 +347,8 @@ async fn cancelled_launch_retains_external_resources_until_the_sandbox_is_reaped
             )
             .await
     });
+    admission.await.unwrap();
+    let (release, writer) = hold_store_writer(fixture.store.clone(), Some(resume)).await;
     wait_file(&fixture.workspace.join("launch.started")).await;
     let (pid_path, pid) = launch_pid(&fixture.home);
     launch.abort();
@@ -1045,7 +1092,7 @@ async fn changed_pin_reaps_before_blocked_audit_and_reports_audit_failure() {
         database.execute_batch("CREATE TRIGGER reject_catalog_audit BEFORE INSERT ON events WHEN NEW.kind='ext.tools_changed' BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
         Ok(())
     }).await.unwrap();
-    let (release, writer) = hold_store_writer(fixture.store.clone()).await;
+    let (release, writer) = hold_store_writer(fixture.store.clone(), None).await;
     instance.connection().unwrap().resources().await.unwrap();
     let pid = instance.pid();
     let socket = fixture
@@ -2062,4 +2109,322 @@ assert.match(status, /^HTTP\/1\.[01] 403 /);
     let log = fs::read_to_string(fixture.home.join("logs/ext/test-extension.log")).unwrap();
     assert_eq!(outcome.unwrap().unwrap().code, Some(0), "{log}");
     assert_eq!(fs::read_to_string(canary).unwrap(), "original data");
+}
+
+mod crash_admission {
+    use super::*;
+    use fictor::{
+        crash_recovery::{
+            CrashClock, CrashTime, RecoveryKey, RecoveryScope, RecoveryStatus, ResetCrashes,
+        },
+        store::StoreError,
+    };
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    const KEY: &str = "1.0.0-000000000000";
+
+    struct Clock(AtomicI64);
+    impl CrashClock for Clock {
+        fn now(&self) -> Result<CrashTime, StoreError> {
+            Ok(CrashTime {
+                boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+                boottime_ms: self.0.load(Ordering::SeqCst),
+                unix_ms: 1_700_000_000_000,
+            })
+        }
+    }
+    fn recovery(session: &str) -> RecoveryKey {
+        RecoveryKey {
+            ext_id: "test-extension".into(),
+            key: KEY.into(),
+            session_id: Some(session.into()),
+        }
+    }
+    async fn events(fixture: &Fixture, kind: &str) -> Vec<fictor::store::Event> {
+        fixture
+            .store
+            .query_events(EventQuery {
+                kinds: vec![kind.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+    fn runs(fixture: &Fixture) -> usize {
+        fs::read(fixture.workspace.join("recovery.runs"))
+            .unwrap_or_default()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn zero_exit_obeys_persisted_delays_then_blocks_without_respawn_or_replay() {
+        let mut fixture = Fixture::new().await;
+        let clock = Arc::new(Clock(AtomicI64::new(0)));
+        fixture.supervisor = fixture.supervisor.with_crash_clock(clock.clone());
+        let session = fixture.session().await;
+        let bundle = fixture.bundle(
+            false,
+            r#"printf x >> "$FICTOR_WORKSPACE/recovery.runs"
+exit 0"#,
+        );
+        let manifest = manifest(
+            json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+            true,
+            false,
+        );
+        for (index, delay) in [1000, 2000, 4000, 8000, 16000, 0].into_iter().enumerate() {
+            let mut instance = fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    KEY,
+                    Some(&session),
+                    Some(&fixture.workspace),
+                )
+                .await
+                .unwrap();
+            let exit = tokio::time::timeout(Duration::from_secs(5), instance.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(exit.code, Some(0));
+            assert!(exit.crashed);
+            assert_eq!(runs(&fixture), index + 1);
+            let denied = fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    KEY,
+                    Some(&session),
+                    Some(&fixture.workspace),
+                )
+                .await;
+            if delay == 0 {
+                assert!(matches!(denied, Err(SupervisorError::CrashLoop)));
+            } else {
+                assert!(
+                    matches!(denied, Err(SupervisorError::Backoff { retry_after_ms }) if retry_after_ms == delay)
+                );
+                clock.0.fetch_add(delay, Ordering::SeqCst);
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(
+                runs(&fixture),
+                index + 1,
+                "elapsed time never starts a process"
+            );
+        }
+        assert_eq!(events(&fixture, "ext.crashed").await.len(), 6);
+        assert_eq!(events(&fixture, "ext.crash_blocked").await.len(), 1);
+        // The block belongs to the exact session/key, not every instance of an extension.
+        let other = fixture.session().await;
+        assert_eq!(
+            fixture
+                .store
+                .crash_availability(recovery(&other), clock.clone())
+                .await
+                .unwrap(),
+            RecoveryStatus::Ready
+        );
+        let reset = fixture
+            .store
+            .reset_crashes(
+                ResetCrashes {
+                    ext_id: "test-extension".into(),
+                    key: KEY.into(),
+                    scope: RecoveryScope::Session,
+                    session_id: Some(session.clone()),
+                },
+                1_700_000_000_001,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset.cleared, 1);
+        assert_eq!(runs(&fixture), 6);
+        let mut instance = fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                KEY,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        assert!(instance.wait().await.unwrap().crashed);
+        assert_eq!(runs(&fixture), 7);
+        assert!(matches!(
+            fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    KEY,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await,
+            Err(SupervisorError::Backoff {
+                retry_after_ms: 1000
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_crash_audit_blocks_memory_admission_until_the_same_observation_commits() {
+        let mut fixture = Fixture::new().await;
+        let clock = Arc::new(Clock(AtomicI64::new(0)));
+        fixture.supervisor = fixture.supervisor.with_crash_clock(clock.clone());
+        let session = fixture.session().await;
+        let bundle = fixture.bundle(
+            false,
+            r#"printf x >> "$FICTOR_WORKSPACE/recovery.runs"
+exit 0"#,
+        );
+        let manifest = manifest(
+            json!({"fs":{"write":["${workspace}"]},"spawn":true}),
+            true,
+            false,
+        );
+        fixture.store.write(|database| {
+            database.execute_batch("CREATE TRIGGER refuse_crash BEFORE INSERT ON events WHEN NEW.kind='ext.crashed' BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        let mut instance = fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                KEY,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        let instance_id = instance.instance_id.clone();
+        assert!(matches!(instance.wait().await, Err(SupervisorError::Audit)));
+        assert_eq!(
+            fixture
+                .store
+                .crash_availability(recovery(&session), clock.clone())
+                .await
+                .unwrap(),
+            RecoveryStatus::Ready,
+            "failed transaction changes neither row nor event"
+        );
+        assert!(events(&fixture, "ext.crashed").await.is_empty());
+        assert!(matches!(
+            fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    KEY,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await,
+            Err(SupervisorError::Audit)
+        ));
+        assert_eq!(runs(&fixture), 1);
+        assert_eq!(events(&fixture, "ext.started").await.len(), 1);
+        fixture
+            .store
+            .write(|database| {
+                database.execute_batch("DROP TRIGGER refuse_crash")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .supervisor
+                .spawn(
+                    &manifest,
+                    &bundle,
+                    KEY,
+                    Some(&session),
+                    Some(&fixture.workspace)
+                )
+                .await,
+            Err(SupervisorError::Backoff {
+                retry_after_ms: 1000
+            })
+        ));
+        let crashes = events(&fixture, "ext.crashed").await;
+        assert_eq!(crashes.len(), 1);
+        assert_eq!(crashes[0].payload["instance_id"], instance_id);
+        assert_eq!(crashes[0].payload["recovery_count"], 1);
+        assert_eq!(runs(&fixture), 1, "retry persists audit only");
+        clock.0.store(1000, Ordering::SeqCst);
+        let mut instance = fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                KEY,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        assert!(instance.wait().await.unwrap().crashed);
+        assert_eq!(runs(&fixture), 2);
+        assert_eq!(events(&fixture, "ext.crashed").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn requested_stop_and_smoke_do_not_count_and_admission_gate_is_not_a_process_lease() {
+        let mut fixture = Fixture::new().await;
+        let clock = Arc::new(Clock(AtomicI64::new(0)));
+        fixture.supervisor = fixture.supervisor.with_crash_clock(clock.clone());
+        let session = fixture.session().await;
+        let bundle = fixture.bundle(false, "/bin/sleep 60");
+        let manifest = manifest(json!({"spawn":true}), true, false);
+        let mut instance = fixture
+            .supervisor
+            .spawn(
+                &manifest,
+                &bundle,
+                KEY,
+                Some(&session),
+                Some(&fixture.workspace),
+            )
+            .await
+            .unwrap();
+        let gate = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.store.owner().installer_gate().lock_owned(),
+        )
+        .await
+        .unwrap();
+        drop(gate);
+        assert!(!instance.shutdown().await.unwrap().crashed);
+        assert_eq!(
+            fixture
+                .store
+                .crash_availability(recovery(&session), clock.clone())
+                .await
+                .unwrap(),
+            RecoveryStatus::Ready
+        );
+        assert!(events(&fixture, "ext.crashed").await.is_empty());
+        assert_eq!(events(&fixture, "ext.stopped").await.len(), 1);
+        let smoke = fixture.bundle(true, "exit 0");
+        let gate = fixture.store.owner().installer_gate().lock_owned().await;
+        clock.0.store(-1, Ordering::SeqCst); // Original recovery clock must not be consulted by smoke.
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.supervisor.smoke(&manifest, &smoke, KEY),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(report.catalog.tools().is_empty());
+        assert!(events(&fixture, "ext.crashed").await.is_empty());
+        drop(gate);
+    }
 }

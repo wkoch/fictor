@@ -30,11 +30,16 @@ impl Fixture {
         let serial = CONTROL_FIXTURES.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
-        fictor::home::prepare(&home).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fictor::initialize(&home))
+            .unwrap();
         let versions = [version(&home, "1.0.0", "a"), version(&home, "2.0.0", "b")];
         let mut other_version = versions[0].1.clone();
         other_version["path"] = format!("store/other/{}", versions[0].0).into();
-        let lock = json!({"schema":1,"extensions":{
+        let lock = json!({"schema":1,"runtimes":{},"extensions":{
             "sample":{"enabled":true,"active":versions[1].0,"versions":{
                 (versions[0].0.clone()):versions[0].1.clone(), (versions[1].0.clone()):versions[1].1.clone()
             }},
@@ -107,7 +112,7 @@ fn disable_and_enable_change_only_the_requested_flag_and_preserve_versions_and_m
         fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o7777,
         0o600
     );
-    assert!(!fixture.home.join("fictor.db").exists());
+    assert!(fixture.home.join("fictor.db").is_file());
     let changed = set_enabled(&fixture.home, "sample", true).unwrap();
     assert!(changed.changed && changed.enabled);
     assert_eq!(fixture.value(), original);
@@ -136,7 +141,7 @@ fn disable_and_enable_change_only_the_requested_flag_and_preserve_versions_and_m
         json!({"ext_id":"sample","enabled":true,"changed":true})
     );
     assert_eq!(fixture.value(), original);
-    assert!(!fixture.home.join("fictor.db").exists());
+    assert!(fixture.home.join("fictor.db").is_file());
 }
 
 #[test]
@@ -155,7 +160,9 @@ fn unchanged_flag_is_a_validated_noop_and_missing_extension_does_not_create_a_lo
     fs::remove_file(fixture.path()).unwrap();
     assert!(matches!(
         set_enabled(&fixture.home, "sample", false),
-        Err(ControlError::NotFound)
+        Err(ControlError::Snapshot(
+            fictor::installer::listing::ListingError::NotInitialized
+        ))
     ));
     assert!(!fixture.path().exists());
 }
@@ -232,7 +239,15 @@ fn invalid_lock_or_existing_writer_temporary_never_loses_the_previous_lock() {
     fs::remove_file(pending).unwrap();
     fs::write(fixture.path(), b"{malformed").unwrap();
     let result = set_enabled(&fixture.home, "sample", false);
-    assert!(matches!(&result, Err(ControlError::Lock(_))), "{result:?}");
+    assert!(
+        matches!(
+            &result,
+            Err(ControlError::Snapshot(
+                fictor::installer::listing::ListingError::InvalidSnapshot
+            ))
+        ),
+        "{result:?}"
+    );
     assert_eq!(fixture.bytes(), b"{malformed");
 }
 

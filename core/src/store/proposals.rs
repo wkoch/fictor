@@ -1,6 +1,7 @@
 //! Trusted installer API only; never deserialize these commands from extensions.
 //! Every state change and its sys audit event commit in one writer transaction.
 use super::{Event, Sensitivity, Store, StoreError, Trust, events, now_ms};
+use crate::{gateway::PinnedCatalog, installer::overrides::Overrides};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,7 +18,7 @@ pub enum ProposalState {
     Failed,
 }
 impl ProposalState {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Received => "received",
             Self::Checking => "checking",
@@ -67,6 +68,8 @@ pub struct Proposal {
     pub source: Value,
     pub state: ProposalState,
     pub update_of: Option<String>,
+    pub review_base_hash: Option<String>,
+    pub overrides: Overrides,
     pub tainted: bool,
     pub manifest: Option<Value>,
     pub checks: Option<Vec<ProposalCheck>>,
@@ -89,6 +92,13 @@ impl ProposalNonce {
 pub enum HumanDecision {
     User(ProposalNonce),
 }
+/// Captured by the installer in the same protected lock read. Checking fixes
+/// both fields together; approval compares them without refreshing the review.
+#[derive(Clone, Debug)]
+pub struct ReviewBase {
+    pub update_of: Option<String>,
+    pub hash: String,
+}
 #[derive(Default)]
 pub struct ProposalUpdate {
     pub identity: Option<ProposalIdentity>,
@@ -97,6 +107,8 @@ pub struct ProposalUpdate {
     pub hash: Option<String>,
     pub packages: Option<Vec<ResolvedPackage>>,
     pub decision: Option<HumanDecision>,
+    pub review_base: Option<ReviewBase>,
+    pub overrides: Option<Overrides>,
 }
 
 impl Store {
@@ -164,6 +176,22 @@ impl Store {
         if !valid {
             return Err(StoreError::Invalid("invalid proposal transition"));
         }
+        let binds_review = expected == ProposalState::Checking && next == ProposalState::Checked;
+        let approves = expected == ProposalState::Checked && next == ProposalState::Approved;
+        if update.review_base.as_ref().is_some_and(|base| {
+            !valid_hash(&base.hash)
+                || base
+                    .update_of
+                    .as_ref()
+                    .is_some_and(|key| key.is_empty() || key.chars().any(char::is_control))
+        }) || (update.review_base.is_some() && !binds_review && !approves)
+            || (update.overrides.is_some() && !approves)
+        {
+            return Err(StoreError::Invalid("invalid proposal review"));
+        }
+        if (binds_review || approves) && update.review_base.is_none() {
+            return Err(StoreError::Invalid("promotion:stale_base"));
+        }
         if update.hash.as_ref().is_some_and(|hash| !valid_hash(hash)) {
             return Err(StoreError::Invalid("invalid proposal hash"));
         }
@@ -211,6 +239,14 @@ impl Store {
             if current.state != expected {
                 return Err(StoreError::Invalid("proposal state changed"));
             }
+            if approves {
+                let base = update.review_base.as_ref().ok_or(StoreError::Invalid("promotion:stale_base"))?;
+                if current.review_base_hash.as_deref() != Some(base.hash.as_str()) || current.update_of != base.update_of {
+                    return Err(StoreError::Invalid("promotion:stale_base"));
+                }
+                let patch = update.overrides.as_ref().cloned().unwrap_or_default();
+                validate_approval(&current, &patch)?;
+            }
             if let Some(HumanDecision::User(confirmed)) = &update.decision {
                 let existing: String = tx.query_row(
                     "SELECT nonce FROM proposals WHERE id=?1", [&id], |row| row.get(0),
@@ -219,7 +255,7 @@ impl Store {
                     return Err(StoreError::Invalid("invalid proposal decision"));
                 }
             }
-            let (ext_id, version, manifest, update_of) = match update.identity {
+            let (ext_id, version, manifest, mut update_of) = match update.identity {
                 Some(identity) => {
                     if current.ext_id.is_some() || current.version.is_some() {
                         return Err(StoreError::Invalid("proposal identity already bound"));
@@ -228,6 +264,17 @@ impl Store {
                 }
                 None => (current.ext_id, current.version, current.manifest, current.update_of),
             };
+            let review_base_hash = if binds_review {
+                if current.review_base_hash.is_some() {
+                    return Err(StoreError::Invalid("proposal review already bound"));
+                }
+                let base = update.review_base.ok_or(StoreError::Invalid("promotion:stale_base"))?;
+                update_of = base.update_of;
+                Some(base.hash)
+            } else {
+                current.review_base_hash
+            };
+            let overrides = if approves { update.overrides.unwrap_or_default() } else { current.overrides };
             if next != ProposalState::Failed && (ext_id.is_none() || version.is_none()) {
                 return Err(StoreError::Invalid("proposal identity required"));
             }
@@ -257,11 +304,12 @@ impl Store {
                 None
             };
             let changed = tx.execute(
-                "UPDATE proposals SET state=?1,checks=?2,hash=?3,packages=?4,decided_by=CASE WHEN ?5 THEN 'user' ELSE decided_by END,nonce=COALESCE(?6,nonce),updated_at=?7,ext_id=?10,version=?11,manifest=?12,update_of=?13 WHERE id=?8 AND state=?9",
+                "UPDATE proposals SET state=?1,checks=?2,hash=?3,packages=?4,decided_by=CASE WHEN ?5 THEN 'user' ELSE decided_by END,nonce=COALESCE(?6,nonce),updated_at=?7,ext_id=?10,version=?11,manifest=?12,update_of=?13,review_base_hash=?14,overrides=?15 WHERE id=?8 AND state=?9",
                 params![next.name(), checks.as_ref().map(serde_json::to_string).transpose()?, hash,
                     packages.as_ref().map(serde_json::to_string).transpose()?, decision, replacement,
                     timestamp, id, expected.name(), ext_id, version,
-                    manifest.as_ref().map(serde_json::to_string).transpose()?, update_of],
+                    manifest.as_ref().map(serde_json::to_string).transpose()?, update_of,
+                    review_base_hash, serde_json::to_string(&overrides)?],
             )?;
             if changed != 1 {
                 return Err(StoreError::Invalid("proposal state changed"));
@@ -345,6 +393,82 @@ fn validate_identity(identity: &mut ProposalIdentity) -> Result<(), StoreError> 
     identity.manifest = serde_json::to_value(manifest)?;
     Ok(())
 }
+/// Replay the stored approval inputs, never a new MCP discovery or a caller's
+/// replacement catalog. Configured NAT64 context is also checked by the
+/// installer; this generic subset validation cannot introduce a new grant.
+pub(super) fn validate_approval(
+    proposal: &Proposal,
+    patch: &Overrides,
+) -> Result<PinnedCatalog, StoreError> {
+    let invalid = || StoreError::Invalid("promotion:integrity");
+    if proposal.source.get("kind").and_then(Value::as_str) != Some("local")
+        || proposal.packages.is_none()
+        || proposal.audit_blob.is_some()
+        || proposal
+            .hash
+            .as_deref()
+            .is_none_or(|hash| !valid_hash(hash))
+    {
+        return Err(invalid());
+    }
+    let checks = proposal.checks.as_deref().ok_or_else(invalid)?;
+    if checks.iter().any(|check| check.blocking && !check.passed)
+        || [
+            "manifest",
+            "dependencies",
+            "bundle",
+            "declarations",
+            "smoke",
+        ]
+        .iter()
+        .any(|name| {
+            checks
+                .iter()
+                .filter(|check| check.name == *name && check.passed && check.blocking)
+                .count()
+                != 1
+        })
+    {
+        return Err(invalid());
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Smoke {
+        tools: Vec<Value>,
+        tools_hash: String,
+    }
+    let detail = checks
+        .iter()
+        .find(|check| check.name == "smoke")
+        .and_then(|check| check.detail.as_deref())
+        .ok_or_else(invalid)?;
+    let value = crate::strict_json::parse(detail.as_bytes()).map_err(|_| invalid())?;
+    let smoke: Smoke = serde_json::from_value(value).map_err(|_| invalid())?;
+    let catalog = PinnedCatalog::new(smoke.tools).map_err(|_| invalid())?;
+    if catalog.hash() != smoke.tools_hash {
+        return Err(invalid());
+    }
+    let manifest = crate::installer::manifest::Manifest::parse(
+        &proposal.manifest.as_ref().ok_or_else(invalid)?.to_string(),
+    )
+    .map_err(|_| invalid())?;
+    if proposal.ext_id.as_deref() != Some(manifest.id.as_str())
+        || proposal.version.as_deref() != Some(manifest.version.as_str())
+        || (manifest.scope == crate::installer::manifest::Scope::Global
+            && manifest.runtime.kind != crate::installer::manifest::RuntimeKind::None)
+    {
+        return Err(invalid());
+    }
+    crate::installer::overrides::resolve(
+        &manifest,
+        &catalog,
+        patch,
+        "user",
+        &crate::proxy::nat64::Nat64Prefixes::default(),
+    )
+    .map_err(|_| invalid())?;
+    Ok(catalog)
+}
 fn failure_check_name(reason: &str) -> Option<&'static str> {
     match reason {
         "limit:entries"
@@ -377,7 +501,7 @@ fn receipt_failure_matches(checks: Option<&[ProposalCheck]>, reason: &str) -> bo
             })
         })
 }
-fn valid_hash(hash: &str) -> bool {
+pub(super) fn valid_hash(hash: &str) -> bool {
     hash.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64
             && hex
@@ -450,10 +574,10 @@ fn audit(
     )?;
     Ok(())
 }
-fn get(db: &Connection, id: &str) -> Result<Proposal, StoreError> {
-    db.query_row("SELECT id,ext_id,version,hash,source,state,update_of,tainted,manifest,checks,packages,audit_blob,decided_by,note,created_at,updated_at FROM proposals WHERE id=?1",[id],|r|{
+pub(super) fn get(db: &Connection, id: &str) -> Result<Proposal, StoreError> {
+    db.query_row("SELECT id,ext_id,version,hash,source,state,update_of,tainted,manifest,checks,packages,audit_blob,decided_by,note,created_at,updated_at,review_base_hash,overrides FROM proposals WHERE id=?1",[id],|r|{
         let source:String=r.get(4)?;let state:String=r.get(5)?;
-        Ok(Proposal{id:r.get(0)?,ext_id:r.get(1)?,version:r.get(2)?,hash:r.get(3)?,source:decode(&source,4)?,state:decode(&format!("\"{state}\""),5)?,update_of:r.get(6)?,tainted:r.get(7)?,manifest:decode_optional(r.get(8)?,8)?,checks:decode_optional(r.get(9)?,9)?,packages:decode_optional(r.get(10)?,10)?,audit_blob:r.get(11)?,decided_by:r.get(12)?,note:r.get(13)?,created_at:r.get(14)?,updated_at:r.get(15)?})
+        Ok(Proposal{id:r.get(0)?,ext_id:r.get(1)?,version:r.get(2)?,hash:r.get(3)?,source:decode(&source,4)?,state:decode(&format!("\"{state}\""),5)?,update_of:r.get(6)?,tainted:r.get(7)?,manifest:decode_optional(r.get(8)?,8)?,checks:decode_optional(r.get(9)?,9)?,packages:decode_optional(r.get(10)?,10)?,audit_blob:r.get(11)?,decided_by:r.get(12)?,note:r.get(13)?,created_at:r.get(14)?,updated_at:r.get(15)?,review_base_hash:r.get(16)?,overrides:decode(&r.get::<_,String>(17)?,17)?})
     }).optional()?.ok_or(StoreError::NotFound)
 }
 fn decode<T: serde::de::DeserializeOwned>(value: &str, index: usize) -> rusqlite::Result<T> {

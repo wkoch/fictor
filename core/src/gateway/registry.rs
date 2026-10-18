@@ -210,6 +210,7 @@ mod tests {
         };
         let lock = Lock {
             schema: 1,
+            runtimes: BTreeMap::new(),
             extensions: BTreeMap::from([(
                 "example".into(),
                 LockedExtension {

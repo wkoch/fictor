@@ -17,8 +17,11 @@ Os ADRs 036–044 estão disponíveis e ARQ-020–028 estão resolvidas no spec.
 já aplica as migrações 0004/0005, FULL no writer, registros exatos de dependências,
 snapshots de overrides, leitura protegida dos controles, IDs limitados do Kernel,
 posse exclusiva do home e plano único de montagens com classificação de origens.
-Promoção recuperável, barreira durável/recuperação de instâncias, proteção do
-bootstrap antes do init, crash loop e listagem administrativa continuam pendentes.
+Aprovação agora fixa base e overrides; o journal de promoção e seu coordenador,
+o estado durável de crash loop e a listagem administrativa estão implementados.
+A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
+bootstrap antes do init continuam em desenvolvimento. As mutações pelo canal
+administrativo dependem do contrato solicitado na ARQ-029.
 Os ADRs 043/044 estão implementados parcialmente; o SDK ainda pertence ao M0.8.
 Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
@@ -29,7 +32,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; instalador parcial | Recebimento/recuperação, npm/uv com autoridades exatas e transporte protegido, smoke, materialização imutável, catálogo com overrides, logs e controles offline no lock. Migrações, controles protegidos, IDs do Kernel, posse exclusiva e plano de montagens disponíveis. Restam persistência dos overrides na aprovação/promoção, journal funcional, barreira/recuperação de instâncias, proteção pré-init do bootstrap, crash loop, listagem administrativa e integração first-party. |
+| M0.5 | Pipeline local ampliado; integração em andamento | Recebimento/recuperação, npm/uv com autoridades exatas, smoke, materialização imutável, aprovação com base e overrides, journal/coordenador de promoção, crash loop durável e listagem administrativa. Catálogo e admissão respeitam promoção pendente. Restam integração de boot, barreira/recuperação de instâncias, proteção pré-init do bootstrap, contrato de mutações administrativas e integração first-party. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
@@ -39,14 +42,48 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 
 ## Posse exclusiva e contratos de transporte/montagens (2026-10-18)
 
+`HomeLease` compartilha uma seção crítica assíncrona entre checker, coordenador,
+admissão do supervisor, descoberta pelo Kernel e listagem administrativa. Trabalhos
+bloqueantes retêm a posse e a seção até terminar, inclusive após cancelamento do
+chamador. Enquanto houver promoção `prepared`, catálogo e novos processos falham
+sem usar a candidata. Os controles offline obtêm sua própria posse, verificam o
+banco read-only com WAL e recusam journal pendente antes de alterar `enabled`.
+
+O checker fixa o hash JCS da base no término das checagens. Aprovação compara essa
+base e persiste o patch exato; promoção compara novamente. O coordenador registra
+snapshots UTF-8 exatos no writer antes de materializar, publica o lock durável e
+só então confirma proposta, evento e journal numa transação. Sua recuperação usa
+somente lock final e bundle publicado: não relê origem nem repete smoke. O
+temporário do lock não decide recuperação. Staging de quarentena tem nome da
+operação e limpeza por descritores; cópias publicadas permanecem inertes se a
+tentativa abortar. A ligação dessa recuperação ao boot depende da recuperação de
+instâncias terminar primeiro.
+
+Um home novo recebe lock vazio explícito. `init` não reconstrói lock perdido em
+home existente. O parser recusa chaves JSON duplicadas em qualquer profundidade.
+O campo `runtimes` é obrigatório; nesta etapa só o mapa vazio é suportado, com
+recusa explícita de mapas não vazios até o consumidor do M0.9 estar disponível.
+
+`ext list` lê configuração, sem rótulo de processo em execução. Offline usa posse
+exclusiva, SQLite read-only na versão exata e snapshot completo do lock. Online
+usa somente `ext.list` autenticado por UID no socket privado, com schema e envelope
+estritos, limite de 16 MiB e prazo de cinco segundos. Posse ocupada não permite
+fallback para arquivos. A consulta nunca reconcilia journal nem executa extensão.
+
+O controle de crash usa `(ext_id, key, session_id)`, `CLOCK_BOOTTIME` e boot ID.
+Crash e espera/bloqueio são persistidos atomicamente; o sexto crash na janela
+bloqueia a combinação. Reset é API interna de decisão humana com auditoria,
+sem mudar `enabled`. A CLI online correspondente aguarda a ARQ-029; a API não
+reenvia chamadas interrompidas nem inicia processos por expiração de prazo.
+
 O core adquire `flock(LOCK_EX | LOCK_NB)` no próprio inode do home canônico,
 privado e do usuário, antes de preparar seus descendentes ou abrir o writer.
 O FD é CLOEXEC e vive em `Arc<HomeLease>`; writer, pool de leitura, capturas,
 segredos e trabalhos independentes conservam a posse até terminarem. Uma mesma
 posse não abre dois writers simultâneos. Os backends de segredos compartilham
 um mutex da posse, sem tentar adquirir novamente o flock do mesmo diretório.
-CLI ocupada falha antes de mutar; encaminhamento pelo admin ainda depende do
-canal administrativo. Isso não implementa nem substitui o journal/barreira e a
+CLI ocupada falha antes de mutar; a listagem usa o admin, enquanto encaminhamento
+de mutações aguarda o contrato da ARQ-029. Isso não substitui o journal/barreira e a
 confirmação de saída do ADR-038.
 
 O Kernel mantém Number IDs como tokens JSON validados (`serde_json/raw_value`,
@@ -176,7 +213,7 @@ Definido pelo usuário em 2026-10-18:
 - Propostas têm transições e eventos `ext.*` na mesma transação. Aprovação/rejeição
   exigem nonce humano rotacionado, omitido de JSON/Debug. O lock schema 1 valida paths,
   ausência de symlinks e tools_hash; escreve arquivo privado com exclusão, fsync e
-  rename. A escrita ainda não está ligada à promoção.
+  rename. O coordenador liga essa escrita ao journal e ao compromisso da promoção.
 - `ext check` permite `binary`/`none` e Node sem dependências a instalar; npm/uv
   falham antes de executar quando precisam de resolver. `tools.default` é apenas
   classificação padrão, sem exigir uma tool MCP com esse nome. Checks aprovados

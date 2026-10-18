@@ -7,7 +7,7 @@ use fictor::{
     },
     store::{
         HumanDecision, NewProposal, ProposalCheck, ProposalIdentity, ProposalState, ProposalUpdate,
-        ResolvedPackage, Store,
+        ResolvedPackage, ReviewBase, Store,
     },
 };
 use serde_json::json;
@@ -38,7 +38,7 @@ impl Fixture {
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
-        fictor::home::prepare(&home).unwrap();
+        fictor::initialize(&home).await.unwrap();
         let store = Arc::new(Store::open(&home).await.unwrap());
         let lease = Arc::new(InstallerLease::acquire(&home).unwrap());
         let proposal = store
@@ -75,6 +75,13 @@ impl Fixture {
         )
         .unwrap();
         let key = format!("1.0.0-{}", &inspected.bundle_hash[7..19]);
+        let review_base = ReviewBase {
+            update_of: None,
+            hash: fictor::installer::lock::Lock::default()
+                .review_base_hash("sample")
+                .unwrap(),
+        };
+        let catalog = fictor::gateway::PinnedCatalog::new(vec![]).unwrap();
         store
             .transition_proposal(
                 proposal.id.clone(),
@@ -99,6 +106,7 @@ impl Fixture {
                 ProposalState::Checked,
                 ProposalUpdate {
                     hash: Some(inspected.bundle_hash),
+                    review_base: Some(review_base.clone()),
                     packages: Some(packages),
                     checks: Some(
                         [
@@ -113,7 +121,9 @@ impl Fixture {
                             name: name.into(),
                             passed: true,
                             blocking: true,
-                            detail: None,
+                            detail: (name == "smoke").then(|| {
+                                json!({"tools":[],"tools_hash":catalog.hash()}).to_string()
+                            }),
                         })
                         .collect(),
                     ),
@@ -131,6 +141,7 @@ impl Fixture {
                     ProposalState::Approved,
                     ProposalUpdate {
                         decision: Some(HumanDecision::User(nonce)),
+                        review_base: Some(review_base),
                         ..Default::default()
                     },
                 )
@@ -282,7 +293,12 @@ async fn approved_complete_package_inventory_is_materialized_without_resolving_a
         serde_json::to_value(after.packages).unwrap(),
         serde_json::to_value(before.packages).unwrap()
     );
-    assert!(!fixture.home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&fixture.home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -339,7 +355,12 @@ async fn approved_bytes_are_materialized_immutable_without_activation_or_audit_t
         materialized.hash
     );
     assert!(fixture.source.is_dir());
-    assert!(!fixture.home.join("extensions/lock.json").exists());
+    assert!(
+        fictor::installer::lock::Lock::load_required(&fixture.home)
+            .unwrap()
+            .extensions
+            .is_empty()
+    );
     assert_eq!(
         fixture
             .store

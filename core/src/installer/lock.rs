@@ -22,12 +22,14 @@ pub enum LockError {
 pub struct Lock {
     pub schema: u32,
     pub extensions: BTreeMap<String, LockedExtension>,
+    pub runtimes: BTreeMap<String, Value>,
 }
 impl Default for Lock {
     fn default() -> Self {
         Self {
             schema: 1,
             extensions: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
         }
     }
 }
@@ -88,18 +90,92 @@ impl Lock {
     /// Missing lock means no extensions have been activated. Malformed existing
     /// state is an error, never an implicit empty catalog.
     pub fn load(home: &Path) -> Result<Self, LockError> {
-        unix::load(home)
+        match unix::snapshot(home)? {
+            Some(bytes) => Self::parse_snapshot(&bytes),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn load_required(home: &Path) -> Result<Self, LockError> {
+        let bytes = Self::read_snapshot(home)?
+            .ok_or_else(|| LockError::Io(std::io::ErrorKind::NotFound.into()))?;
+        Self::parse_snapshot(&bytes)
+    }
+
+    /// Exact UTF-8 bytes are the promotion journal's authority. Missing is
+    /// distinguishable from an initialized, explicitly empty lock.
+    pub fn read_snapshot(home: &Path) -> Result<Option<Vec<u8>>, LockError> {
+        unix::snapshot(home)
+    }
+
+    pub fn parse_snapshot(bytes: &[u8]) -> Result<Self, LockError> {
+        let value = crate::strict_json::parse(bytes).map_err(|_| LockError::Invalid)?;
+        let lock: Self = serde_json::from_value(value).map_err(|_| LockError::Invalid)?;
+        lock.validate()?;
+        Ok(lock)
+    }
+
+    pub fn encode_snapshot(&self) -> Result<String, LockError> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|_| LockError::Invalid)
+    }
+
+    pub(crate) fn write_snapshot(home: &Path, bytes: &[u8]) -> Result<(), LockError> {
+        let lock = Self::parse_snapshot(bytes)?;
+        unix::write_bytes(&lock, home, bytes, false)
+    }
+
+    pub(crate) fn initialize_empty(home: &Path) -> Result<(), LockError> {
+        let lock = Self::default();
+        let bytes = lock.encode_snapshot()?;
+        unix::write_bytes(&lock, home, bytes.as_bytes(), true)
+    }
+
+    pub(crate) fn sync_snapshot(home: &Path) -> Result<(), LockError> {
+        let home = unix::home_directory(home)?;
+        let extensions = unix::directory(&home, c"extensions")?;
+        let file = unix::open_at(&extensions, c"lock.json", libc::O_RDONLY, 0)?;
+        unix::check_lock(&file)?;
+        file.sync_all().map_err(LockError::Io)?;
+        extensions.sync_all().map_err(LockError::Io)
+    }
+
+    pub fn review_base_hash(&self, ext_id: &str) -> Result<String, LockError> {
+        use sha2::{Digest, Sha256};
+        self.validate()?;
+        let base = match self.extensions.get(ext_id) {
+            None => Value::Null,
+            Some(extension) => serde_json::json!({
+                "active": extension.active,
+                "enabled": extension.enabled,
+                "version": extension.versions.get(&extension.active).ok_or(LockError::Invalid)?,
+            }),
+        };
+        let bytes = serde_json_canonicalizer::to_vec(&base).map_err(|_| LockError::Invalid)?;
+        let hex: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(format!("sha256:{hex}"))
     }
 
     /// Only the installer writes the lock. Call after the immutable store entry
     /// exists; this operation does not perform approval, promotion or hot swap.
-    #[allow(dead_code)] // Promotion is deliberately not wired in this milestone.
     pub(crate) fn write_atomic(&self, home: &Path) -> Result<(), LockError> {
         unix::write(self, home)
     }
 
+    /// A leftover writer temporary is never an authority for recovery. Call
+    /// only under installer exclusion, after resolving the durable intent.
+    pub(crate) fn discard_temporary(home: &Path) -> Result<(), LockError> {
+        unix::discard_temporary(home)
+    }
+
     fn validate(&self) -> Result<(), LockError> {
-        if self.schema != 1 {
+        // Managed runtime records are consumed in M0.9. Until that reader is
+        // implemented, refuse unsupported records rather than erase or trust
+        // unvalidated executable metadata while updating extensions.
+        if self.schema != 1 || !self.runtimes.is_empty() {
             return Err(LockError::Invalid);
         }
         // Reuse the manifest's normative spelling instead of a second semver dialect.
@@ -179,6 +255,33 @@ fn valid_hash(hash: &str) -> bool {
     })
 }
 
+pub fn approval_at_ms(milliseconds: i64) -> Result<String, LockError> {
+    if milliseconds < 0 {
+        return Err(LockError::Invalid);
+    }
+    let seconds = milliseconds / 1000;
+    let mut utc = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: the input time_t and output tm are live, aligned values.
+    if unsafe { libc::gmtime_r(&seconds, utc.as_mut_ptr()) }.is_null() {
+        return Err(LockError::Invalid);
+    }
+    // SAFETY: successful gmtime_r initialized the complete structure.
+    let utc = unsafe { utc.assume_init() };
+    let year = utc.tm_year.checked_add(1900).ok_or(LockError::Invalid)?;
+    if !(1970..=9999).contains(&year) {
+        return Err(LockError::Invalid);
+    }
+    Ok(format!(
+        "{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.tm_mon + 1,
+        utc.tm_mday,
+        utc.tm_hour,
+        utc.tm_min,
+        utc.tm_sec,
+        milliseconds % 1000
+    ))
+}
+
 mod unix {
     use super::*;
     use std::{
@@ -191,14 +294,14 @@ mod unix {
         },
     };
 
-    fn directory(parent: &File, name: &CStr) -> Result<File, LockError> {
+    pub(super) fn directory(parent: &File, name: &CStr) -> Result<File, LockError> {
         open_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0).and_then(|file| {
             check_directory(&file)?;
             Ok(file)
         })
     }
 
-    fn open_at(
+    pub(super) fn open_at(
         parent: &File,
         name: &CStr,
         flags: i32,
@@ -233,7 +336,7 @@ mod unix {
         Ok(())
     }
 
-    fn check_lock(file: &File) -> Result<(), LockError> {
+    pub(super) fn check_lock(file: &File) -> Result<(), LockError> {
         let metadata = file.metadata().map_err(LockError::Io)?;
         // SAFETY: geteuid has no arguments or memory preconditions.
         if !metadata.is_file()
@@ -246,7 +349,7 @@ mod unix {
         Ok(())
     }
 
-    fn home_directory(home: &Path) -> Result<File, LockError> {
+    pub(super) fn home_directory(home: &Path) -> Result<File, LockError> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -271,27 +374,44 @@ mod unix {
         Ok(())
     }
 
-    pub(super) fn load(home: &Path) -> Result<Lock, LockError> {
+    pub(super) fn snapshot(home: &Path) -> Result<Option<Vec<u8>>, LockError> {
         let home = home_directory(home)?;
         let extensions = match directory(&home, c"extensions") {
             Err(LockError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Lock::default());
+                return Ok(None);
             }
             result => result?,
         };
         let mut file = match open_at(&extensions, c"lock.json", libc::O_RDONLY, 0) {
             Err(LockError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Lock::default());
+                return Ok(None);
             }
             result => result?,
         };
         check_lock(&file)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(LockError::Io)?;
-        let lock: Lock = serde_json::from_slice(&bytes).map_err(|_| LockError::Invalid)?;
-        lock.validate()?;
+        let lock = Lock::parse_snapshot(&bytes)?;
         bundles(&lock, &extensions)?;
-        Ok(lock)
+        Ok(Some(bytes))
+    }
+
+    pub(super) fn discard_temporary(home: &Path) -> Result<(), LockError> {
+        let home = home_directory(home)?;
+        let extensions = directory(&home, c"extensions")?;
+        let temporary = match open_at(&extensions, c"lock.json.tmp", libc::O_RDONLY, 0) {
+            Err(LockError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            other => other?,
+        };
+        check_lock(&temporary)?;
+        // SAFETY: remove only the fixed entry in the held private directory;
+        // no link target is followed and no candidate bytes are consumed.
+        if unsafe { libc::unlinkat(extensions.as_raw_fd(), c"lock.json.tmp".as_ptr(), 0) } < 0 {
+            return Err(LockError::Io(std::io::Error::last_os_error()));
+        }
+        extensions.sync_all().map_err(LockError::Io)
     }
 
     struct Pending<'a> {
@@ -310,6 +430,16 @@ mod unix {
     }
 
     pub(super) fn write(lock: &Lock, home: &Path) -> Result<(), LockError> {
+        let bytes = lock.encode_snapshot()?;
+        write_bytes(lock, home, bytes.as_bytes(), false)
+    }
+
+    pub(super) fn write_bytes(
+        lock: &Lock,
+        home: &Path,
+        bytes: &[u8],
+        require_absent: bool,
+    ) -> Result<(), LockError> {
         lock.validate()?;
         let home = home_directory(home)?;
         // SAFETY: home is live and the child name is static NUL-terminated.
@@ -338,7 +468,6 @@ mod unix {
             Err(LockError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let bytes = serde_json::to_vec_pretty(lock).map_err(|_| LockError::Invalid)?;
         let mut temporary = match open_at(
             &extensions,
             c"lock.json.tmp",
@@ -355,15 +484,20 @@ mod unix {
             active: true,
         };
         check_lock(&temporary)?;
-        temporary.write_all(&bytes).map_err(LockError::Io)?;
+        temporary.write_all(bytes).map_err(LockError::Io)?;
         temporary.sync_all().map_err(LockError::Io)?;
         // SAFETY: both directory descriptors and both static names remain live.
         if unsafe {
-            libc::renameat(
+            libc::renameat2(
                 extensions.as_raw_fd(),
                 c"lock.json.tmp".as_ptr(),
                 extensions.as_raw_fd(),
                 c"lock.json".as_ptr(),
+                if require_absent {
+                    libc::RENAME_NOREPLACE
+                } else {
+                    0
+                },
             )
         } < 0
         {
@@ -383,6 +517,63 @@ mod tests {
         os::unix::fs::{PermissionsExt, symlink},
     };
 
+    #[test]
+    fn exact_snapshots_reject_duplicates_and_preserve_bytes_without_initializing_absence() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(Lock::load_required(home.path()).is_err());
+        assert!(Lock::read_snapshot(home.path()).unwrap().is_none());
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+        for bytes in [
+            br#"{"schema":1,"extensions":{},"runtimes":{},"schema":1}"#.as_slice(),
+            br#"{"schema":1,"extensions":{},"runtimes":{},"runti\u006des":{}}"#,
+            br#"{"schema":1,"extensions":{}}"#,
+            br#"{"schema":1,"extensions":{},"runtimes":{"node":{}}}"#,
+        ] {
+            assert!(Lock::parse_snapshot(bytes).is_err());
+        }
+        let exact = b"{ \"schema\":1, \"runtimes\":{}, \"extensions\":{} }\n";
+        Lock::write_snapshot(home.path(), exact).unwrap();
+        assert_eq!(Lock::read_snapshot(home.path()).unwrap().unwrap(), exact);
+        Lock::sync_snapshot(home.path()).unwrap();
+        assert!(Lock::initialize_empty(home.path()).is_err());
+        assert_eq!(Lock::read_snapshot(home.path()).unwrap().unwrap(), exact);
+    }
+
+    #[test]
+    fn review_base_covers_the_complete_selected_version_and_enabled_flag() {
+        let empty = Lock::default();
+        assert_eq!(
+            empty.review_base_hash("example").unwrap(),
+            "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+        );
+        let home = tempfile::tempdir().unwrap();
+        let original = fixture(home.path());
+        let base = original.review_base_hash("example").unwrap();
+        let mut changed = original.clone();
+        changed.extensions.get_mut("example").unwrap().enabled = false;
+        assert_ne!(changed.review_base_hash("example").unwrap(), base);
+        let mut changed = original;
+        let extension = changed.extensions.get_mut("example").unwrap();
+        extension
+            .versions
+            .get_mut(&extension.active)
+            .unwrap()
+            .source["reviewed"] = Value::Bool(true);
+        assert_ne!(changed.review_base_hash("example").unwrap(), base);
+        let duplicate = serde_json::to_string(&changed).unwrap().replacen(
+            "\"kind\":\"local\"",
+            "\"kind\":\"local\",\"k\\u0069nd\":\"local\"",
+            1,
+        );
+        assert!(Lock::parse_snapshot(duplicate.as_bytes()).is_err());
+        assert_eq!(approval_at_ms(0).unwrap(), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            approval_at_ms(1_761_234_567_890).unwrap(),
+            "2025-10-23T15:49:27.890Z"
+        );
+        assert!(approval_at_ms(-1).is_err());
+    }
+
     fn fixture(home: &Path) -> Lock {
         let tools = vec![
             serde_json::json!({"name":"echo","description":"Pinned description","inputSchema":{"type":"object"}}),
@@ -392,6 +583,7 @@ mod tests {
         fs::create_dir_all(home.join("extensions/store/example").join(key)).unwrap();
         Lock {
             schema: 1,
+            runtimes: BTreeMap::new(),
             extensions: BTreeMap::from([(
                 "example".into(),
                 LockedExtension {
