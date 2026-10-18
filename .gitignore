@@ -1,0 +1,6 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+/core/target/
+
+# Workspace-local toolchain caches (ADR-031).
+.fictor/

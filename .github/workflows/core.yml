@@ -1,0 +1,103 @@
+name: Core
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  ubuntu:
+    name: Ubuntu 22.04 x86-64 — complete suite and real sandbox
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: core
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install sandbox dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap ripgrep
+          bwrap --version
+          rg --version
+        # Keep kernel/userns/AppArmor policies intact: unavailable isolation fails tests.
+
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          cache: false
+          rust-src-dir: core
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+
+      - name: Test complete suite with real Linux sandbox
+        # Fake secrets and local endpoints only; no test is skipped on this host.
+        run: cargo test --locked --offline
+
+  fedora:
+    name: Fedora 44 x86-64 container — build and tests without real sandbox
+    runs-on: ubuntu-22.04
+    # Stable COSMIC Atomic release checked against the Fedora Project on 2026-10-17.
+    # Match this version to the user's release when the validated target advances.
+    container: registry.fedoraproject.org/fedora:44
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: core
+    steps:
+      - name: Install build dependencies
+        working-directory: /
+        run: dnf install --assumeyes gcc gcc-c++ make git curl-minimal tar gzip xz pkgconf-pkg-config openssl-devel ca-certificates findutils
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          cache: false
+          rust-src-dir: core
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Build all test targets
+        run: cargo test --no-run --locked --offline
+
+      - name: Test without nested sandbox
+        # Real namespace tests (sandbox, sandbox_init, supervisor) run in full on
+        # Ubuntu and on the user's desktop. The doctor test also invokes bwrap.
+        # Unit tests, protocols, proxies and inert local bundles need no userns.
+        run: >-
+          cargo test --locked --offline --lib
+          --test bootstrap --test budget --test kernel --test local_checker
+          --test manifest --test model_tls --test models --test proposals
+          --test proxy --test store
+          -- --skip doctor_reports_missing_runtime_without_modifying_config

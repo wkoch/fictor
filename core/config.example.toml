@@ -1,0 +1,82 @@
+[server]
+listen = "127.0.0.1:7350"        # shell (UI confiável)
+surface_port = 7351              # surfaces servidas em http://localhost:7351
+
+[paths]
+default_workspace = "~/Projetos"
+
+[runtimes]                       # vazio = procurar no PATH em `fictor doctor`
+deno = ""
+node = ""
+uv = ""
+python = ""
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+auth_header = "x-api-key"
+auth_prefix = ""
+secret = "anthropic_api_key"
+
+[providers.openai]
+base_url = "https://api.openai.com"
+auth_header = "authorization"
+auth_prefix = "Bearer "
+secret = "openai_api_key"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+auth_header = "authorization"
+auth_prefix = "Bearer "
+secret = "deepseek_api_key"
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434"   # sem secret
+
+[policy]
+default_mode = "default"         # plan | default | auto
+trusted_domains = []             # domínios cujo conteúdo não acende U
+
+# [[policy.rules]]               # opcional; ver 05-security.md#decisão
+# tool = "fs-tools__*"
+# decision = "allow"
+
+[secrets]
+backend = "keyring"              # keyring | file
+
+[egress]
+nat64_prefixes = []              # prefixos NAT64 específicos da rede, ex.: "2001:db8:64::/96"
+
+[budget]
+max_model_requests_per_day = 2000
+max_model_requests_per_session = 300
+
+[harness]
+default = "harness"              # ext_id com role=harness
+idle_timeout_min = 30
+
+[sandbox]
+home_ro_files = ["~/.gitconfig"] # arquivos do HOME real montados só leitura em instâncias de sessão
+
+[sandbox.toolchains]             # só para extensões com permissions.toolchains = true
+mounts = ["~/.rustup", "~/.cargo/bin", "~/.deno"]   # somente leitura; caminho sensível é recusado
+path = ["~/.cargo/bin", "~/.deno/bin"]              # prefixados ao PATH
+env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "${workspace}/.fictor/cargo" }   # sem nomes reservados
+
+[installer]
+registries = ["jsr.io", "registry.npmjs.org", "deno.land", "pypi.org", "files.pythonhosted.org"]
+trusted_packages = ["jsr:@std/*", "npm:@modelcontextprotocol/sdk", "npm:zod"]   # não contam como dependência nova
+
+[evals]                          # Fase 2
+judge_model = "main"             # chave de [ext.harness.models]
+max_call_ratio = 1.25
+
+[ext.harness]                    # seção opaca: só a extensão "harness" lê via config.get
+default_model = "main"           # chave de [ext.harness.models]
+
+# Preencha antes da primeira conversa. Ver 07-harness.md#configuração.
+# [ext.harness.models.main]
+# provider = "anthropic"         # id em [providers]
+# api = "anthropic"              # anthropic | openai-chat
+# model = "<nome exato do modelo no provider>"
+# context_window = 200000
+# max_output_tokens = 16000
