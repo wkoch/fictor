@@ -12,14 +12,22 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{Mutex, MutexGuard},
 };
+
+// A parallel CLI fork briefly inherits other tests' flock descriptors until
+// exec closes CLOEXEC fds. Keep those forks outside each fixture's lease lifetime.
+// https://man7.org/linux/man-pages/man2/flock.2.html
+static CONTROL_FIXTURES: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     _root: tempfile::TempDir,
     home: PathBuf,
+    _serial: MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
+        let serial = CONTROL_FIXTURES.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         fictor::home::prepare(&home).unwrap();
@@ -44,7 +52,11 @@ impl Fixture {
         )
         .unwrap();
         Lock::load(&home).unwrap();
-        Self { _root: root, home }
+        Self {
+            _root: root,
+            home,
+            _serial: serial,
+        }
     }
     fn path(&self) -> PathBuf {
         self.home.join("extensions/lock.json")
@@ -213,18 +225,14 @@ fn invalid_lock_or_existing_writer_temporary_never_loses_the_previous_lock() {
     let before = fixture.bytes();
     let pending = fixture.home.join("extensions/lock.json.tmp");
     fs::write(&pending, b"another writer").unwrap();
-    assert!(matches!(
-        set_enabled(&fixture.home, "sample", false),
-        Err(ControlError::Lock(_))
-    ));
+    let result = set_enabled(&fixture.home, "sample", false);
+    assert!(matches!(&result, Err(ControlError::Lock(_))), "{result:?}");
     assert_eq!(fixture.bytes(), before);
     assert_eq!(fs::read(&pending).unwrap(), b"another writer");
     fs::remove_file(pending).unwrap();
     fs::write(fixture.path(), b"{malformed").unwrap();
-    assert!(matches!(
-        set_enabled(&fixture.home, "sample", false),
-        Err(ControlError::Lock(_))
-    ));
+    let result = set_enabled(&fixture.home, "sample", false);
+    assert!(matches!(&result, Err(ControlError::Lock(_))), "{result:?}");
     assert_eq!(fixture.bytes(), b"{malformed");
 }
 
