@@ -383,8 +383,22 @@ async fn failed_database_reconciliation_prevents_cleanup() {
 async fn cancelling_recovery_keeps_the_lease_until_its_detached_worker_finishes() {
     let (home, store) = fixture().await;
     let id = begin(&store).await;
-    let db = rusqlite::Connection::open(home.path().join("fictor.db")).unwrap();
-    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // A SQLite read-to-write upgrade can fail BUSY immediately; park the actual
+    // writer instead so recovery is guaranteed to remain pending after abort.
+    let (writer_started, writer_ready) = tokio::sync::oneshot::channel();
+    let (release_writer, writer_release) = std::sync::mpsc::channel();
+    let blocked_store = store.clone();
+    let blocker = tokio::spawn(async move {
+        blocked_store
+            .write(move |_| {
+                let _ = writer_started.send(());
+                // Sender Drop also releases the writer if the test unwinds.
+                let _ = writer_release.recv();
+                Ok(())
+            })
+            .await
+    });
+    writer_ready.await.unwrap();
     let lease = Arc::new(InstallerLease::acquire(home.path()).unwrap());
     let path = home.path().to_path_buf();
     let worker_store = store.clone();
@@ -397,11 +411,22 @@ async fn cancelling_recovery_keeps_the_lease_until_its_detached_worker_finishes(
     // schedules the owning blocking worker before polling this receiver again.
     ready.await.unwrap();
     task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
+    let cancellation = task.await;
+    let acquired = InstallerLease::acquire(home.path());
+    let retained =
+        matches!(&acquired, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock);
+    let acquisition_error = acquired.as_ref().err().map(std::io::Error::kind);
+    drop(acquired);
+    // Release before asserting, so a failing regression cannot park the writer.
+    let released = release_writer.send(());
+    let unblocked = blocker.await;
+    assert!(cancellation.unwrap_err().is_cancelled());
     assert!(
-        matches!(InstallerLease::acquire(home.path()), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        retained,
+        "lease released while recovery was pending: acquire error {acquisition_error:?}"
     );
-    db.execute_batch("ROLLBACK").unwrap();
+    released.unwrap();
+    unblocked.unwrap().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if store.proposal(id.clone()).await.unwrap().state == State::Failed
