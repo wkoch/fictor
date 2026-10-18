@@ -1,5 +1,41 @@
 # Verificação da implementação
 
+## SIGKILL, boot e publicação compartilhada — 2026-10-18
+
+Código validado: `08a6f06`, incluindo a correção `58e5640`, na `main`.
+Mesmo Toolbx Fedora 44/Bazzite e ferramentas do registro seguinte; nenhum pacote
+instalado no host, dados reais ou rede externa nos testes.
+
+| Verificação no Toolbx | Resultado |
+|---|---|
+| Formatação e Clippy de todos os alvos com `-D warnings` | Passaram. |
+| Suíte completa `cargo test --offline --locked --no-fail-fast` | **520 testes principais**, 41 alvos incluindo doc-tests; zero falhas, ignorados ou filtros principais. |
+| `cargo build --offline --locked --release` | Passou. |
+| Seleção Fedora reproduzida no Toolbx | **433 testes**, 31 alvos; zero falhas/ignorados e os mesmos três filtros. |
+
+A contagem principal exclui o resumo adicional de um helper em subprocesso,
+conforme a metodologia do registro seguinte. Logs:
+`.fictor/logs/m05-crash-publication-{fmt,clippy,full-test,release,fedora-selection}.log`.
+
+- O teste real do supervisor usa PID/mount namespace e procfs privados. Captura
+  identidades reais, mata somente o core filho do teste com SIGKILL, confirma
+  launcher/init por pidfds e executa dois boots reais no mesmo observador.
+  Journal/tmp/sockets atribuídos são removidos; workspace e legados permanecem;
+  nenhum evento de crash, stop ou falha de limpeza é inventado.
+- Cinco cenários de promoção interrompem o filho após journal, materialização,
+  lock ou commit, incluindo origem/recibo ausentes. SQLite não é fechado pelo
+  filho; cópia do banco principal sem WAL não contém a intenção. Dois boots
+  reais abortam/completam uma única vez, preservando a versão anterior ou a nova.
+  Isso comprova recuperação após SIGKILL com WAL, não queda de energia física.
+- Controles e reconciliação compartilham o mesmo publicador. Falha anterior de
+  publicação impede enable/reset antes de seus commits; o efeito reportado é
+  somente o da operação pedida. Retomada explícita conclui a publicação sem
+  duplicar eventos. Propostas antigas sem snapshot dos caminhos omitidos
+  conservam estado com revisão nula; `checked` incompleto continua recusado.
+
+ARQ-031 e os gates COSMIC/CI continuam pendentes. Não houve alteração de spec,
+ordenação alternativa de tentativas ou avanço para M0.6.
+
 ## Instâncias duráveis e instalação administrativa — 2026-10-18
 
 Código validado: `5e573f1d917952c4a72808b55f6ff2292fc092f8`, diretamente na `main`.

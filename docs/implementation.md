@@ -22,9 +22,9 @@ o estado durável de crash loop e a listagem administrativa estão implementados
 A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
 bootstrap antes do init têm implementação e testes dirigidos no Toolbx. Os handlers
 administrativos do ADR-045 e a CLI de instalação local também passaram nos testes
-dirigidos. A validação integrada passou com 510 testes principais no Toolbx, além de Clippy,
+dirigidos. A validação integrada passou com 520 testes principais no Toolbx, além de Clippy,
 formatação e build release. A promoção já está ligada à drenagem de instâncias;
-as provas de recuperação após interrupção real ainda serão ampliadas.
+há provas de SIGKILL real e dois boots idempotentes para instâncias e promoções.
 A ARQ-031 pede ao Arquiteto a regra de ordenação das
 tentativas de promoção quando o relógio civil recua; essa parte conserva o contrato
 vigente até a decisão.
@@ -38,7 +38,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Fluxos locais integrados; provas de interrupção e gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. Restam ampliar provas de interrupção, resolver ARQ-031 e cumprir os gates de plataforma. |
+| M0.5 | Fluxos locais integrados; ARQ-031 e gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. SIGKILL e boot real testados. Restam ARQ-031 e aceitação no alvo/CI. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |

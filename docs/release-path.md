@@ -19,9 +19,27 @@ nº 27 e não entra duas vezes. Os ADRs 036–045 ampliaram a Fase 0 de 37 para 
 critérios. A contagem não mede percentual concluído: os critérios têm tamanhos
 diferentes e não enumeram cada item de implementação.
 
+## Estimativa de progresso — 2026-10-18
+
+Estimativa por esforço técnico total, com incerteza sobre as etapas ainda sem
+implementação:
+
+| Alvo | Progresso estimado | Esforço restante |
+|---|---:|---:|
+| v0.1 autossuficiente | 45–55% | 45–55% |
+| v1.0 | 20–30% | 70–80% |
+
+A base de confiança está avançada e o M0.5 tem fluxos locais integrados. Até a v0.1
+ainda faltam política/aprovações, servidor/shell, SDK/harness/tools, runtimes,
+atualizações/rollback e aceitação de autossuficiência. Até a v1.0 somam-se
+autoextensão/surfaces/hooks, evals/checkpoints/subagentes e terceiros/auditoria/
+Landlock/seccomp. A contagem de 89 critérios contém itens de tamanhos diferentes;
+essas faixas são julgamento de engenharia. Uma data exige medir a cadência nas
+próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
+
 ## Próxima sequência
 
-1. Fechar as provas de interrupção e recuperação do M0.5. Os fluxos dos
+1. Resolver ARQ-031 e concluir a aceitação do M0.5. SIGKILL e boot real já têm provas para instâncias e promoção. Os fluxos dos
    [ADRs 036–042](../spec/11-decisions.md) estão integrados: promoção, aprovação,
    journal/barreira de instâncias, crash loop, listagem, controles protegidos e
    autoridades exatas. ARQ-020–026 estão resolvidas; falta concluir sua aceitação.
@@ -34,14 +52,13 @@ diferentes e não enumeram cada item de implementação.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
 
 O próximo objetivo de uso é a **v0.1 autossuficiente**. O escopo da v1.0 inclui
-as outras três etapas da tabela. Não há estimativa confiável em dias ou percentual
-sem decompor e medir as entregas restantes.
+as outras três etapas da tabela. Ainda não há data confiável em dias; as faixas de esforço acima serão revisadas conforme as entregas restantes forem medidas.
 
 ## Evidência e release
 
-A base tem diagnóstico de **510 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **520 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 510 critérios de produto aceitos.
+Esse resultado não representa 520 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates
