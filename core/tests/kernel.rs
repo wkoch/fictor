@@ -114,13 +114,20 @@ impl Client {
         self.0.get_mut().write_all(&bytes).await.unwrap();
     }
     async fn read(&mut self) -> Value {
+        serde_json::from_str(&self.read_raw().await).unwrap()
+    }
+    async fn read_raw(&mut self) -> String {
         let mut line = String::new();
         let n = tokio::time::timeout(Duration::from_secs(5), self.0.read_line(&mut line))
             .await
             .unwrap()
             .unwrap();
         assert!(n > 0);
-        serde_json::from_str(&line).unwrap()
+        line
+    }
+    async fn send_raw(&mut self, text: &str) {
+        self.0.get_mut().write_all(text.as_bytes()).await.unwrap();
+        self.0.get_mut().write_all(b"\n").await.unwrap();
     }
     async fn closed(&mut self) {
         let mut line = String::new();
@@ -128,6 +135,7 @@ impl Client {
             .await
             .unwrap();
         assert!(matches!(n, Ok(0) | Err(_)));
+        assert!(line.is_empty(), "closed transport emitted a partial frame");
     }
 }
 fn error(value: &Value, name: &str) {
@@ -628,7 +636,6 @@ async fn oversized_input_and_output_are_bounded_and_shutdown_revokes_idle_connec
         bad
     });
     let mut bad = writer.await.unwrap();
-    error(&bad.read().await, "TOO_LARGE");
     bad.closed().await;
     let mut idle = Client::new(&server).await;
     server.shutdown().await.unwrap();
@@ -675,4 +682,383 @@ async fn connection_limit_counts_unauthenticated_streams_and_reclaims_finished_s
         Value::Null
     );
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_ids_preserve_decoded_unicode_null_and_original_number_tokens() {
+    #[derive(serde::Deserialize)]
+    struct Correlation<'a> {
+        #[serde(borrow)]
+        id: &'a serde_json::value::RawValue,
+    }
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    let mut c = Client::raw(&server).await;
+    let hello_id = "9".repeat(256);
+    c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{hello_id},\"method\":\"kernel.hello\",\"params\":{{\"protocol\":1,\"token\":\"{}\"}}}}", server.token())).await;
+    let hello = c.read_raw().await;
+    assert_eq!(
+        serde_json::from_str::<Correlation<'_>>(&hello)
+            .unwrap()
+            .id
+            .get(),
+        hello_id
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&hello).unwrap()["result"]["protocol"],
+        1
+    );
+    for id in [
+        String::new(),
+        "é".repeat(128),
+        "😀".repeat(64),
+        "\0".repeat(256),
+        "\n\r\t\"\\".repeat(50),
+        "é".into(),
+        "e\u{301}".into(),
+    ] {
+        c.send(json!({"jsonrpc":"2.0","id":id,"method":"kv.get","params":{"key":"missing"}}))
+            .await;
+        assert_eq!(c.read().await["id"], id);
+    }
+    let escaped = format!("\"{}\"", "\\uD83D\\uDE00".repeat(64));
+    c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{escaped},\"method\":\"kv.get\",\"params\":{{\"key\":\"missing\"}}}}" )).await;
+    assert_eq!(c.read().await["id"], "😀".repeat(64));
+    let numbers = [
+        "9".repeat(256),
+        format!("-{}", "9".repeat(255)),
+        format!("0.{}", "1".repeat(254)),
+        format!("1e+{}", "9".repeat(253)),
+        "90071992547409931234567890123456789".into(),
+        "-0".into(),
+        "-123.456e-012".into(),
+        "1.000e+003".into(),
+    ];
+    for number in numbers {
+        c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\": \t{number} \t,\"method\":\"kv.get\",\"params\":{{\"key\":\"missing\"}}}}" )).await;
+        let line = c.read_raw().await;
+        let response: Correlation<'_> = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            response.id.get(),
+            number,
+            "numeric correlation must not round or normalize"
+        );
+    }
+    c.send(
+        json!({"jsonrpc":"2.0","id":null,"method":"kv.set","params":{"key":"null-id","value":1}}),
+    )
+    .await;
+    let response = c.read().await;
+    assert_eq!(response["id"], Value::Null);
+    assert!(response.get("result").is_some());
+    // A notification produces neither a reply nor a request-only KV effect.
+    c.send(json!({"jsonrpc":"2.0","method":"kv.set","params":{"key":"notification","value":1}}))
+        .await;
+    c.send(json!({"jsonrpc":"2.0","method":"missing","params":{}}))
+        .await;
+    c.send(
+        json!({"jsonrpc":"2.0","id":"barrier","method":"kv.get","params":{"key":"notification"}}),
+    )
+    .await;
+    let response = c.read().await;
+    assert_eq!(response["id"], "barrier");
+    assert_eq!(response["result"]["value"], Value::Null);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_envelopes_preserve_only_a_unique_admitted_id_and_batches_have_no_effects() {
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    let mut c = Client::new(&server).await;
+    for (body, message) in [
+        (r#""jsonrpc":"2.0","method":"missing""#, "METHOD_NOT_FOUND"),
+        (
+            r#""jsonrpc":"2.0","method":"kv.get","params":{"extra":1}"#,
+            "INVALID_PARAMS",
+        ),
+        (r#""jsonrpc":"wrong","method":"kv.get""#, "INVALID_REQUEST"),
+        (
+            r#""jsonrpc":"2.0","method":"kv.get","params":[]"#,
+            "INVALID_REQUEST",
+        ),
+        (
+            r#""jsonrpc":"2.0","method":"kv.set","method":"kv.get""#,
+            "INVALID_REQUEST",
+        ),
+        (
+            r#""jsonrpc":"2.0","method":"kv.get","params":{"key":"one","key":"two"}"#,
+            "INVALID_REQUEST",
+        ),
+        (
+            r#""jsonrpc":"2.0","method":"kv.get","extra":"private-canary""#,
+            "INVALID_REQUEST",
+        ),
+        (
+            r#""jsonrpc":"2.0","method":"kv.set","params":{"key":"refused","value":1e9999}"#,
+            "INVALID_REQUEST",
+        ),
+    ] {
+        c.send_raw(&format!("{{{body},\"id\":\"known\"}}")).await;
+        let response = c.read().await;
+        assert_eq!(response["id"], "known", "{body}");
+        error(&response, message);
+        assert!(!response.to_string().contains("private-canary"));
+    }
+    for id in ["true", "{}", "[]", r#"1,"i\u0064":1"#] {
+        c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"kv.set\",\"params\":{{\"key\":\"refused\",\"value\":1}}}}" )).await;
+        let response = c.read().await;
+        assert_eq!(response["id"], Value::Null);
+        error(&response, "INVALID_REQUEST");
+    }
+    for surrogate in [r#""\uD83D""#, r#""\uDE00""#, r#""\uD83Dx""#] {
+        c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{surrogate},\"method\":\"kv.set\",\"params\":{{\"key\":\"refused\",\"value\":1}}}}" )).await;
+        let response = c.read().await;
+        assert_eq!(response["id"], Value::Null);
+        assert!(matches!(
+            response["error"]["code"].as_i64(),
+            Some(-32600 | -32700)
+        ));
+    }
+    c.send_raw(r#"{"jsonrpc":"2.0","id":"known","method":"kv.set","params": "#)
+        .await;
+    let response = c.read().await;
+    assert_eq!(response["id"], Value::Null);
+    error(&response, "PARSE_ERROR");
+    let member =
+        json!({"jsonrpc":"2.0","id":1,"method":"kv.set","params":{"key":"refused","value":1}});
+    for batch in [
+        json!([]),
+        json!([member]),
+        json!([member, {"jsonrpc":"2.0","id":"x".repeat(257),"method":"kv.set","params":{"key":"refused","value":2}}]),
+    ] {
+        c.send(batch).await;
+        let response = c.read().await;
+        assert_eq!(response["id"], Value::Null);
+        error(&response, "INVALID_REQUEST");
+    }
+    assert_eq!(
+        c.call("kv.get", json!({"key":"refused"})).await["result"]["value"],
+        Value::Null
+    );
+    let mut before_hello = Client::raw(&server).await;
+    before_hello.send(json!([{"jsonrpc":"2.0","id":1,"method":"kernel.hello","params":{"protocol":1,"token":server.token()}}])).await;
+    error(&before_hello.read().await, "INVALID_REQUEST");
+    before_hello.closed().await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn excessive_ids_close_before_hello_or_dispatch_without_a_fictitious_null_reply() {
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    let ids = [
+        serde_json::to_string(&"x".repeat(257)).unwrap(),
+        serde_json::to_string(&format!("{}x", "é".repeat(128))).unwrap(),
+        format!("\"{}x\"", "\\uD83D\\uDE00".repeat(64)),
+        format!("\"{}\"", "\\u0000".repeat(257)),
+        "9".repeat(257),
+        format!("-{}", "9".repeat(256)),
+        format!("0.{}", "1".repeat(255)),
+        format!("1e-{}", "9".repeat(254)),
+    ];
+    for authenticated in [false, true] {
+        for id in &ids {
+            let mut c = if authenticated {
+                Client::new(&server).await
+            } else {
+                Client::raw(&server).await
+            };
+            let (method, params) = if authenticated {
+                ("kv.set", json!({"key":"refused","value":1}))
+            } else {
+                ("kernel.hello", json!({"protocol":1,"token":server.token()}))
+            };
+            c.send_raw(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}"
+            ))
+            .await;
+            c.closed().await;
+        }
+    }
+    // Original ARQ-027 reproducer: ID consumes nearly an entire valid frame.
+    // Repeating it still cannot dispatch the write or generate an id:null error.
+    for _ in 0..2 {
+        let mut c = Client::new(&server).await;
+        c.send(json!({"jsonrpc":"2.0","id":"x".repeat(MAX_MESSAGE_BYTES - 256),"method":"kv.set","params":{"key":"refused","value":1}})).await;
+        c.closed().await;
+    }
+    let mut c = Client::new(&server).await;
+    assert_eq!(
+        c.call("kv.get", json!({"key":"refused"})).await["result"]["value"],
+        Value::Null
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_input_frame_is_admitted_and_one_extra_json_byte_closes_before_write() {
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["kv"]).await;
+    for (extra, key) in [(0, "boundary"), (1, "refused")] {
+        let mut c = Client::new(&server).await;
+        let mut frame = json!({"jsonrpc":"2.0","id":"boundary","method":"kv.set","params":{"key":key,"value":1}}).to_string();
+        frame.push_str(&" ".repeat(MAX_MESSAGE_BYTES + extra - frame.len()));
+        if extra == 0 {
+            c.send_raw(&frame).await;
+            let response = c.read().await;
+            assert_eq!(response["id"], "boundary");
+            assert!(response.get("result").is_some());
+        } else {
+            // A refused frame may close while the sender is still writing LF.
+            let _ =
+                c.0.get_mut()
+                    .write_all(format!("{frame}\n").as_bytes())
+                    .await;
+            c.closed().await;
+        }
+    }
+    let mut c = Client::new(&server).await;
+    assert_eq!(
+        c.call("kv.get", json!({"key":"boundary"})).await["result"]["value"],
+        1
+    );
+    assert_eq!(
+        c.call("kv.get", json!({"key":"refused"})).await["result"]["value"],
+        Value::Null
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_response_and_disconnected_delivery_preserve_each_committed_fork() {
+    #[derive(serde::Deserialize)]
+    struct Correlation<'a> {
+        #[serde(borrow)]
+        id: &'a serde_json::value::RawValue,
+    }
+    let f = Fixture::new().await;
+    let mut server = f.server(Some(f.session.clone()), &["sessions", "kv"]).await;
+    let mut c = Client::new(&server).await;
+    let mut lost = Client::new(&server).await;
+    let origin = f.append(&f.session, "fork origin").await;
+    let session = f.session.clone();
+    f.store
+        .write(move |db| {
+            db.execute(
+                "UPDATE sessions SET title=?1 WHERE id=?2",
+                rusqlite::params!["x".repeat(MAX_MESSAGE_BYTES), session],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let id = "90071992547409931234567890123456789.000e+004";
+    c.send_raw(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"sessions.fork\",\"params\":{{\"from_event_id\":\"{origin}\"}}}}" )).await;
+    let frame = c.read_raw().await;
+    assert!(
+        frame.len() <= 1608,
+        "only the minimal correlated error may be delivered"
+    );
+    let response: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Correlation<'_>>(&frame)
+            .unwrap()
+            .id
+            .get(),
+        id
+    );
+    error(&response, "TOO_LARGE");
+    // Ordered connection barrier: no second response, rollback or replay.
+    c.send(json!({"jsonrpc":"2.0","id":"after-fork","method":"kv.get","params":{"key":"barrier"}}))
+        .await;
+    assert_eq!(c.read().await["id"], "after-fork");
+    let parent = f.session.clone();
+    let (sessions, audits) = f
+        .store
+        .write(move |db| {
+            let sessions: i64 = db.query_row(
+                "SELECT count(*) FROM sessions WHERE parent_session_id=?1",
+                [parent],
+                |r| r.get(0),
+            )?;
+            let audits: i64 = db.query_row(
+                "SELECT count(*) FROM events WHERE kind='session.forked'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((sessions, audits))
+        })
+        .await
+        .unwrap();
+    assert_eq!((sessions, audits), (1, 1));
+
+    let session = f.session.clone();
+    f.store
+        .write(move |db| {
+            db.execute(
+                "UPDATE sessions SET title=?1 WHERE id=?2",
+                rusqlite::params!["x".repeat(MAX_MESSAGE_BYTES - 4096), session],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // The second reply fits but cannot be consumed: confirm its transaction
+    // before dropping a client that never reads any part of that large result.
+    lost.send(json!({"jsonrpc":"2.0","id":"undelivered","method":"sessions.fork","params":{"from_event_id":origin}})).await;
+    let child = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let parent = f.session.clone();
+            let ids = f
+                .store
+                .write(move |db| {
+                    let mut query = db.prepare(
+                        "SELECT id FROM sessions WHERE parent_session_id=?1 ORDER BY id",
+                    )?;
+                    Ok(query
+                        .query_map([parent], |r| r.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?)
+                })
+                .await
+                .unwrap();
+            if ids.len() == 2 {
+                break ids[1].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let committed = f.store.session(child).await.unwrap();
+    assert!(
+        json!({"jsonrpc":"2.0","id":"undelivered","result":committed})
+            .to_string()
+            .len()
+            <= MAX_MESSAGE_BYTES
+    );
+    drop(lost);
+    server.shutdown().await.unwrap();
+    let (sessions, audits) = f
+        .store
+        .write(move |db| {
+            let sessions: i64 = db.query_row(
+                "SELECT count(*) FROM sessions WHERE parent_session_id=?1",
+                [f.session.clone()],
+                |r| r.get(0),
+            )?;
+            let audits: i64 = db.query_row(
+                "SELECT count(*) FROM events WHERE kind='session.forked'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((sessions, audits))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (sessions, audits),
+        (2, 2),
+        "neither delivery failure may roll back or replay an admitted fork"
+    );
 }

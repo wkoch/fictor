@@ -8,7 +8,7 @@ pub use log::{LogFuture, LogLevel, LogRecord, LogSink};
 pub use transport::KernelServer;
 
 use crate::store::{Store, StoreError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -172,21 +172,20 @@ impl From<StoreError> for RpcError {
         }
     }
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// An admitted correlation identity. Numeric tokens stay opaque (ADR-043);
+/// converting them through Value/Number could round or reject a valid ID.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum RequestId {
+    String(String),
+    Number(Box<serde_json::value::RawValue>),
+    Null,
+}
+#[derive(Debug)]
 struct Request {
-    jsonrpc: String,
-    #[serde(default, deserialize_with = "present_id")]
-    id: Option<Value>,
+    id: Option<RequestId>,
     method: String,
-    #[serde(default = "empty_params")]
     params: Value,
-}
-fn present_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(d).map(Some)
-}
-fn empty_params() -> Value {
-    json!({})
 }
 fn params<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, RpcError> {
     serde_json::from_value(value).map_err(|_| RpcError::INVALID)
