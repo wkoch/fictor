@@ -1,5 +1,44 @@
 # Verificação da implementação
 
+## Instâncias duráveis e instalação administrativa — 2026-10-18
+
+Código validado: `5e573f1d917952c4a72808b55f6ff2292fc092f8`, diretamente na `main`.
+Toolbx `fictor-dev`, Fedora 44 sobre Bazzite `44.20261012.0` (Kinoite), Linux
+x86-64, kernel `7.2.9-ogc3.1.fc44.x86_64`, SELinux Enforcing. Mesma imagem e
+ferramentas do registro anterior: Rust/Cargo 1.99.0, Node 24.18.0 LTS, npm 11.16,
+uv 0.12.24, Python 3.14.8 e bubblewrap 0.12. Nenhuma instalação no host; somente
+dados falsos e servidores locais nos testes.
+
+| Verificação no Toolbx | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --offline --locked --all-targets -- -D warnings` | Passou, sem avisos. |
+| `cargo test --offline --locked --no-fail-fast` | **510 testes principais**, 40 alvos incluindo doc-tests; zero falhas, ignorados ou filtros nos resultados principais. |
+| `cargo build --offline --locked --release` | Passou. |
+| Seleção do job Fedora sem namespaces, reproduzida no Toolbx | **424 testes**, 30 alvos; zero falhas/ignorados e três filtros existentes. Não é execução da CI. |
+| Workflow YAML | Válido; job Ubuntu completo preservado e nenhuma exclusão nova. |
+| Documentação | 350 links locais e 32 referências exatas de testes válidos. |
+| Trail | Grafo estrutural atualizado: 2.656 nós/109 arquivos; sem conflitos de learnings. O comando `check` informa limite de 400 KiB de diff. |
+
+A soma bruta dos resumos do log completo dá 511 execuções: inclui uma execução
+adicional de helper em subprocesso, com 11 testes filtrados nessa invocação.
+A contagem principal acima usa o último resumo de cada alvo e não soma o helper
+duas vezes. Os três filtros da seleção Fedora são somente os já documentados:
+doctor com bwrap, alias bind de posse e unidade de magic links; a suíte completa
+Ubuntu e a suíte completa local mantêm todos obrigatórios.
+
+O conjunto cobre journal/barreira/pidfds, retenção segura de recursos, bootstrap
+antes do init, controles administrativos, revisão/nonce/hash, TTY/`--yes`, perda de
+resposta, deadlines no writer, caminhos omitidos persistidos e drenagem de versões.
+Os 19 testes de dependências passaram após inicializar explicitamente o lock da
+home descartável do resolvedor. O fixture Node do proxy foi corrigido para enviar
+sem half-close prematuro; a recusa HTTP 403 e sua auditoria continuam obrigatórias.
+Logs locais: `.fictor/logs/m05-instance-admin-{fmt,clippy,full-test,release,fedora-selection}.log`.
+
+Continuam pendentes a ARQ-031, ampliação das provas de interrupção real/perda de
+energia, consumidores de notificações dos marcos posteriores e gates COSMIC/CI.
+Este registro é diagnóstico no Bazzite/Toolbx, sem declarar release aceita.
+
 ## Revisão documental do ADR-045 — 2026-10-18
 
 ARQ-029 resolvida no contrato; não equivale a implementação aceita. Verificação

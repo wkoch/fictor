@@ -20,9 +20,14 @@ posse exclusiva do home e plano único de montagens com classificação de orige
 Aprovação agora fixa base e overrides; o journal de promoção e seu coordenador,
 o estado durável de crash loop e a listagem administrativa estão implementados.
 A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
-bootstrap antes do init continuam em desenvolvimento. As mutações pelo canal
-administrativo têm contrato no ADR-045 (ARQ-029 resolvida); handlers e testes
-permanecem pendentes.
+bootstrap antes do init têm implementação e testes dirigidos no Toolbx. Os handlers
+administrativos do ADR-045 e a CLI de instalação local também passaram nos testes
+dirigidos. A validação integrada passou com 510 testes principais no Toolbx, além de Clippy,
+formatação e build release. A promoção já está ligada à drenagem de instâncias;
+as provas de recuperação após interrupção real ainda serão ampliadas.
+A ARQ-031 pede ao Arquiteto a regra de ordenação das
+tentativas de promoção quando o relógio civil recua; essa parte conserva o contrato
+vigente até a decisão.
 Os ADRs 043/044 estão implementados parcialmente; o SDK ainda pertence ao M0.8.
 Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
@@ -33,13 +38,56 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Pipeline local ampliado; integração em andamento | Recebimento/recuperação, npm/uv com autoridades exatas, smoke, materialização imutável, aprovação com base e overrides, journal/coordenador de promoção, crash loop durável e listagem administrativa. Catálogo e admissão respeitam promoção pendente. Restam integração de boot, barreira/recuperação de instâncias, proteção pré-init do bootstrap, contrato de mutações administrativas e integração first-party. |
+| M0.5 | Fluxos locais integrados; provas de interrupção e gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. Restam ampliar provas de interrupção, resolver ARQ-031 e cumprir os gates de plataforma. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
 | M0.9 | Toolbx e guarda de migração preparados; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS e backup/recusa de downgrade disponíveis. Gerenciador de runtimes, login, rollback e unidade systemd de usuário pendentes. |
 | M0.10 | Não implementado | Aceitação completa e roteiro de autossuficiência no Fedora COSMIC Atomic. |
 | Fases 1–3 | Não iniciadas | Aguardam todos os critérios da Fase 0; corte v1.0 no roadmap. |
+
+## Instâncias duráveis e administração local (2026-10-18)
+
+O boot recupera os registros de instância antes de reconciliar promoções e
+recebimentos interrompidos. O supervisor grava `spawning` antes do fork, confirma
+launcher e PID 1 por pidfd e só libera o init após o registro `armed` e a auditoria.
+Encerramento e limpeza dependem da saída confirmada dos dois processos. Incerteza
+conserva registros, sockets e temporários; Drop não autoriza limpeza. Arquivos PID
+e temporários legados recebem diagnóstico agregado, sem ler seu conteúdo, enviar
+sinais ou inventar posse.
+
+Antes do primeiro exec, o launcher cria namespaces privados de usuário/montagem,
+confere as observações de origem e usa uma cópia privada do bootstrap do core.
+O callback posterior ao fork usa somente buffers preparados e syscalls; não aloca,
+abre arquivos por APIs de alto nível ou registra logs. A cópia é fixada na criação
+do comando. Bases e bibliotecas do sistema permanecem parte da TCB instalada:
+suas origens/topologia são verificadas, sem copiar toda a árvore `/usr`.
+
+O admin implementa os métodos fechados do ADR-045, com identidade verificada antes
+de transmitir segredos, parsing estrito e ausência de logs de frames/parâmetros.
+Operações admitidas pertencem ao core e continuam depois da desconexão. Recebimento
+e intenção de promoção são confirmados somente depois do commit FULL; o prazo
+absoluto de admissão chega ao writer, que verifica expiração antes da transação e
+antes do commit. `busy/none` não deixa uma mutação que possa executar depois.
+Comandos offline exigem banco existente no schema exato, sem init, migração,
+reparo de `sys` ou limpeza incidental de capturas.
+
+`ext install` exibe a revisão integral antes do consentimento, escapa controles de
+terminal e confirma pelo TTY controlador ou pelo `--yes` da invocação inicial.
+A revisão fixa catálogo, base, checks, pacotes, overrides e caminhos omitidos do
+smoke, incluindo o snapshot de `sandbox.home_ro_files`. Campos nulos obrigatórios
+são mantidos no wire. Retomada usa somente o ID, sem reler origem ou repetir
+mutações após resposta incerta. A rejeição pode usar a base apresentada conservada
+em memória; reinício exige nova revisão reconstruível.
+
+Publicação de promoção compartilha a admissão do supervisor/MCP. Antes da troca do
+lock, suspende chamadas novas; depois do commit, drena a chave antiga e permite a
+nova sob demanda. Chamadas admitidas mantêm um guard até terminar; a drenagem
+encerra ao zerar a contagem ou atingir 30 segundos. Falha de publicação mantém o
+bloqueio. Uma repetição humana explícita pode concluir a publicação da mesma base
+ativa, sem outro evento nem reativação de versão histórica. Status não declara
+sucesso durante publicação pendente. Os consumidores de notificações do harness
+e shell ainda dependem dos marcos posteriores.
 
 ## Posse exclusiva e contratos de transporte/montagens (2026-10-18)
 

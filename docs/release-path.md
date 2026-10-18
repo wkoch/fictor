@@ -21,17 +21,15 @@ diferentes e não enumeram cada item de implementação.
 
 ## Próxima sequência
 
-1. Implementar os contratos dos [ADRs 036–042](../spec/11-decisions.md): promoção
-   recuperável com aprovação persistida, barreira/recuperação de instâncias, crash
-   loop e listagem administrativa. Migrações/FULL, autoridades exatas, overrides
-   efetivos, posse exclusiva e leitura protegida dos controles já têm entregas no produto; falta
-   integrar os fluxos completos. ARQ-020–026 estão resolvidas no spec; o M0.5
-   permanece parcial.
+1. Fechar as provas de interrupção e recuperação do M0.5. Os fluxos dos
+   [ADRs 036–042](../spec/11-decisions.md) estão integrados: promoção, aprovação,
+   journal/barreira de instâncias, crash loop, listagem, controles protegidos e
+   autoridades exatas. ARQ-020–026 estão resolvidas; falta concluir sua aceitação.
 2. Concluir [ADR-043](../spec/11-decisions.md#adr-043--ids-limitados-e-respostas-correlacionadas-no-kernel-protocol-resolve-arq-027)
    (obrigações futuras do SDK; transporte do Kernel implementado) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
-   (proteção de bootstrap/bibliotecas antes do init; plano e origens já implementados).
+   (bootstrap protegido antes do init, com bases/bibliotecas na TCB instalada).
    ARQ-027/028 resolvidas; o gate dos critérios 57–65 continua pendente.
-3. Implementar ADR-045 (ARQ-029 resolvida), critérios 66–70; definir ARQ-030 antes de M0.9. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
+3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Resolver a ARQ-031 sobre ordem de promoções com relógio regressivo; definir ARQ-030 antes de M0.9. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
 
@@ -41,9 +39,9 @@ sem decompor e medir as entregas restantes.
 
 ## Evidência e release
 
-A base tem diagnóstico de **408 testes passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **510 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 408 critérios de produto aceitos.
+Esse resultado não representa 510 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates
