@@ -25,7 +25,9 @@ Nenhuma pendência arquitetural aberta em 2026-10-18. Resolução do spec não s
   `spec/03-kernel-protocol.md`; critérios 35–37 da Fase 0.
 - **Entrega ao implementador:** copiar/aplicar a migração especificada, adaptar
   leituras e transições de propostas, recebimento, auditoria, recuperação e testes.
-  O código desses itens permanece pendente em M0.5.
+  Recebimento, migração e recuperação foram implementados em M0.5; o diagnóstico
+  no Toolbx/Bazzite consta em `verification.md`. O gate no COSMIC Atomic continua
+  pendente; resolução arquitetural e testes locais não constituem release.
 
 
 ## Histórico resolvido

@@ -1,6 +1,54 @@
 # Verificação da implementação
 
-## Diagnóstico no Bazzite — 2026-10-18
+## Implementação do ADR-035 no Bazzite — 2026-10-18
+
+Código validado: `225e3e96a090916abdf0f2c2901e26fca695dbb6`.
+Execução dentro do Toolbx **`fictor-dev`, Fedora 44 x86-64**, sobre o computador
+do usuário com **Bazzite 44.20261012.0 (Kinoite), SELinux Enforcing**. Mesma imagem
+e versões de ferramentas do diagnóstico abaixo; caches restritos ao workspace.
+Nenhum pacote foi instalado no host ou globalmente no `$HOME`.
+
+| Verificação | Resultado |
+|---|---|
+| `cargo fmt --all -- --check` | Passou. |
+| `cargo clippy --all-targets --locked --offline -- -D warnings` | Passou, sem avisos. |
+| `cargo test --locked --offline --no-fail-fast` | **250 passaram, 0 falharam, 0 ignorados.** |
+| `cargo build --release --locked --offline` | Passou. |
+| `trail build` / `trail build --check` | Grafo estrutural atualizado e consistente. |
+| `git diff --check` | Passou. |
+
+A suíte completa inclui sandbox e supervisor reais. Os testes novos cobrem:
+
+- Persistência anterior a qualquer abertura da origem, identidade inicialmente
+  nula, vinculação imutável, checks e eventos atômicos, falhas de auditoria com
+  rollback e erros da CLI que informam ID sem expor conteúdo ou caminhos privados.
+- Limites, origem indisponível, symlinks, FIFO, nomes inválidos, manifest ausente,
+  YAML inválido, tags explícitas/diretivas e schema inválido. Texto semelhante a
+  tags em strings, comentários e blocos continua aceito.
+- Cancelamento do chamador, retenção dos bytes quando a transição terminal falha,
+  exclusão entre donos do instalador e recuperação idempotente das janelas de
+  interrupção. Reconciliação do banco precede a limpeza e bloqueia admissão se falhar.
+- Preservação de candidatas identificadas e estados terminais, diagnóstico de órfãos,
+  limpeza ancorada em descritores sem seguir links ou atravessar bind mounts,
+  nova tentativa após falha de limpeza e quarentena original inacessível no smoke.
+- Migração 0003 literal do spec, preservação dos sete estados legados e de nonces,
+  eventos, índices, FTS e restrições. Backup inclui commits no WAL; falha no backup
+  bloqueia a migração. Recusa de schema futuro preserva banco e WAL deixado por
+  subprocesso interrompido; retenção conserva o backup atual mesmo com relógio
+  regressivo ou timestamps futuros.
+
+Não houve rede externa nem chaves reais nos testes. Não há workspace TypeScript,
+shell ou extensões first-party nesta base, portanto não há suítes `vp` a executar.
+Logs locais: `.fictor/logs/m05-{fmt,clippy,test,release,trail-build,trail-check}.log`.
+O job Fedora passou a incluir `migrations` e `proposal_recovery`; a execução remota
+da CI permanece pendente.
+
+**Este é diagnóstico no Bazzite, sem satisfazer o gate de release no COSMIC Atomic.**
+M0.5 continua parcial: resolvers, promoção/ativação, sink de log, backoff e integração
+first-party permanecem pendentes. A recuperação dos recebimentos não encerra a
+limpeza geral de diretórios de instância no boot.
+
+## Diagnóstico inicial do ambiente no Bazzite — 2026-10-18
 
 Executado no computador do usuário: **Bazzite 44.20261012.0 (Kinoite), x86-64**,
 SELinux **Enforcing**, Podman rootless 5.8.7 e Toolbx 0.3. Todas as ferramentas,
@@ -109,16 +157,18 @@ contas de provider, credenciais reais ou internet. Uma falha de isolamento preci
 ser corrigida na implementação ou no ambiente suportado, preservando as proteções.
 
 O job Fedora executa `--lib` e as suítes `bootstrap`, `budget`, `kernel`,
-`local_checker`, `manifest`, `model_tls`, `models`, `proposals`, `proxy` e `store`.
+`local_checker`, `manifest`, `migrations`, `model_tls`, `models`, `proposal_recovery`,
+`proposals`, `proxy` e `store`.
 Ele exclui explicitamente somente o teste de bootstrap
-`doctor_reports_missing_runtime_without_modifying_config`, que chama o probe real
+`doctor_reports_development_runtime_status_without_modifying_config`, que chama o probe real
 de sandbox. As suítes `sandbox`, `sandbox_init` e `supervisor` também dependem de
 namespaces reais e ficam na execução completa do Ubuntu e do desktop. Nenhum teste
 é marcado como ignorado para contornar isolamento; o Ubuntu não tem skips.
 
 ## Testes por invariante
 
-São testes presentes no código; **sua execução em Linux ainda precisa ser registrada**.
+São testes presentes no código. O diagnóstico Linux no Toolbx/Bazzite está registrado
+acima; **a execução no COSMIC Atomic e na CI continua pendente**.
 
 | Invariante | Cobertura implementada | Restante para o gate |
 |---|---|---|
@@ -137,14 +187,15 @@ São testes presentes no código; **sua execução em Linux ainda precisa ser re
 ## Limites e próximos gates
 
 - `serve`, política/aprovações, shell e harness ainda não estão integrados.
-- M0.5 parcial: resolvers, promoção/ativação, hot swap, recuperação de propostas e
+- M0.5 parcial: resolvers, promoção/ativação, hot swap, limpeza de instâncias e
   backoff de crashes pendentes. Kernel `log` ainda precisa do sink do supervisor.
 - ARQ-001–018 foram resolvidas arquiteturalmente. Isso não representa conclusão
   das adaptações ou dos critérios de aceitação dos ADRs 025–031.
 - O encerramento do ADR-029 exige confirmar a saída do bwrap antes de liberar
   recursos; fork duplo, `setsid()` e morte do core com SIGKILL exigem prova no Linux.
-- A v0.1 também exige toolchains no sandbox, compactação, guarda de migração com
-  backup, login, rollback e roteiro de desenvolvimento de dentro do Fictor.
+- A v0.1 também exige gerenciador de runtimes, compactação, login, rollback e
+  roteiro de desenvolvimento de dentro do Fictor. A guarda de migração com backup
+  foi implementada como pré-requisito da migração 0003.
 - Esta entrega não constitui aprovação de release v0.1 nem v1.0.
 
 ## Verificação arquitetural do ADR-035 — 2026-10-18
@@ -165,6 +216,6 @@ do gate no Fedora COSMIC Atomic nem execução de CI.
 - Passaram 106 links/âncoras locais dos documentos revisados, numeração dos
   37 critérios da Fase 0 e `git diff --check`. As migrações 0001/0002 não mudaram.
 - Revisão arquitetural independente não encontrou bloqueios. ARQ-019 resolvida
-  pelo ADR-035; código do recebimento/recuperação e testes dos critérios 35–37
-  continuam pendentes para o implementador. Nenhuma suíte Rust ou teste de
-  aceitação foi executado nesta revisão de arquitetura.
+  pelo ADR-035; naquela revisão, código e testes dos critérios 35–37 ainda estavam
+  pendentes. Nenhuma suíte Rust ou teste de aceitação foi executado na revisão
+  de arquitetura. A implementação posterior está registrada no início deste documento.

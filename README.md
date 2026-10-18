@@ -89,6 +89,21 @@ pedidas e os caminhos omitidos no smoke. Cancelar o chamador não interrompe o w
 de verificação do core; isso não cobre morte ou reinício do processo.
 Não há promoção ou ativação por esse comando.
 
+Toda tentativa recebe um ID durável antes de abrir a origem. Recusas anteriores
+ao manifest válido ficam como `failed`, com identidade nula e motivo estável;
+a CLI informa o ID sem copiar conteúdo inválido ou caminhos privados no erro.
+Falha de persistência terminal é informada como transição não confirmada e
+conserva a cópia para recuperação.
+
+No `init` e antes de admitir o primeiro recebimento, tentativas interrompidas
+passam a `failed` com `recovery:interrupted`. A limpeza se limita à quarentena,
+sem seguir symlinks ou atravessar montagens. Candidatas identificadas que
+falharam permanecem disponíveis para revisão; estados terminais são preservados.
+
+Migrações fazem backup privado pela API SQLite e mantêm três cópias. O core
+recusa schema mais novo antes de abrir uma conexão SQLite gravável, preservando
+inclusive um WAL deixado por um core mais novo após crash.
+
 `init --first-party` será integrado ao pipeline de instalação em M0.5. Atualmente
 ele retorna um erro antes de alterar arquivos. `serve` ainda não está implementado.
 
@@ -110,7 +125,7 @@ A CI também inclui um container Fedora 44 para build e testes que não criam
 sandboxes reais. A versão corresponde à [release estável do COSMIC Atomic](https://fedoraproject.org/atomic-desktops/cosmic/download/)
 consultada em 2026-10-17. O gate de release exige todos os critérios de aceitação
 na máquina Fedora COSMIC Atomic do usuário, com data, versão do SO e commit
-registrados. Build, Clippy e 219 testes passaram no Toolbx Fedora 44 sobre Bazzite;
+registrados. Build, Clippy e 250 testes passaram no Toolbx Fedora 44 sobre Bazzite;
 esse diagnóstico não substitui o gate no COSMIC Atomic nem a execução da CI.
 
 Veja o [andamento](docs/implementation.md), a [verificação](docs/verification.md) e

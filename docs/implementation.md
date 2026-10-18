@@ -12,15 +12,15 @@ sobre Bazzite; o gate no COSMIC Atomic e a CI continuam pendentes. A
 
 | Marco | Estado | Entrega e restante |
 |---|---|---|
-| M0.1 | Base implementada | Crate único, CLI `init`/`doctor`/`secrets`, TOML, FICTOR_HOME privado, migrações 0001/0002 e sessão `sys`. `init --first-party` aguarda instalador. |
+| M0.1 | Base implementada | Crate único, CLI `init`/`doctor`/`secrets`, TOML, FICTOR_HOME privado, migrações 0001–0003 e sessão `sys`. `init --first-party` aguarda instalador. |
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Base implementada; instalador parcial | Manifest, supervisor/smoke, gateway MCP, Kernel Protocol, propostas auditadas com CAS/nonce e lock atômico. `ext check` mantém quarentena. Faltam resolvers, promoção/ativação, recuperação, backoff e integração first-party. |
+| M0.5 | Recebimento durável e recuperação implementados; instalador parcial | Manifest, supervisor/smoke, gateway MCP, Kernel Protocol, propostas auditadas com CAS/nonce e lock atômico. ADR-035 aplicado. `ext check` mantém quarentena. Faltam resolvers, promoção/ativação, backoff, sink de log e integração first-party. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
-| M0.9 | Ambiente de desenvolvimento preparado; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS disponível. Gerenciador de runtimes, guarda de migração/backup, login, rollback e unidade systemd de usuário pendentes. |
+| M0.9 | Toolbx e guarda de migração preparados; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS e backup/recusa de downgrade disponíveis. Gerenciador de runtimes, login, rollback e unidade systemd de usuário pendentes. |
 | M0.10 | Não implementado | Aceitação completa e roteiro de autossuficiência no Fedora COSMIC Atomic. |
 | Fases 1–3 | Não iniciadas | Aguardam todos os critérios da Fase 0; corte v1.0 no roadmap. |
 
@@ -127,8 +127,8 @@ reinício do serviço são ações do usuário, fora do sandbox.
   classificação padrão, sem exigir uma tool MCP com esse nome. Checks aprovados
   continuam em quarentena. Falhas identificadas preservam os checks; cancelar o
   chamador não cancela o worker do core. Falhas antes da identidade e recuperação
-  após morte do processo têm contrato no ADR-035 (ARQ-019 resolvida); migração
-  0003, adaptação do recebimento e recuperação ainda precisam ser implementadas.
+  após morte do processo seguem o ADR-035: tentativa durável antes da origem,
+  identidade vinculada após validar, falhas estáveis e limpeza após o commit.
 - Kernel `log` aguarda ligação ao sink do supervisor. Tools, hooks, UI, timers e
   aprovação aguardam seus marcos; nenhuma rota incompleta simula sucesso.
 
@@ -137,15 +137,48 @@ reinício do serviço são ações do usuário, fora do sandbox.
 1. Repetir build, Clippy e suíte completa no COSMIC Atomic e conferir CI Ubuntu/Fedora;
    os diagnósticos no Bazzite constam em [verification.md](verification.md).
 2. Completar M0.5, incluindo aplicação/testes dos ADRs 025–029 e dos requisitos Atomic;
-   resolvers, promoção, lock, ativação, recuperação e backoff.
+   resolvers, promoção, lock, ativação, sink de log e backoff. Recebimentos já têm
+   recuperação; limpeza de diretórios de instância no boot continua pendente.
 3. Integrar `init --first-party` ao mesmo pipeline. `ext check` não substitui instalação.
 4. Seguir M0.6–M0.10 e os **37 critérios da Fase 0**, incluindo autossuficiência,
    antes de iniciar a Fase 1.
 
 ARQ-001–018 estão resolvidas pelos ADRs 013–029. Resolução arquitetural não implica
 implementação nem release concluída. A ARQ-019 foi resolvida pelo ADR-035 em
-2026-10-18, com implementação pendente em M0.5; consulte
+2026-10-18, com recebimento e recuperação implementados em M0.5; consulte
 [architect-pending.md](architect-pending.md).
+
+## Recebimento durável — ADR-035
+
+- Uma tentativa é commitada com identidade nula antes de qualquer acesso à origem.
+  O writer revalida o manifest normalizado ao vincular a identidade na transição
+  `received → checking`; depois disso, a identidade é imutável. Falha, checks e
+  evento são gravados na mesma transação, com motivos finitos definidos pelo core.
+- O recebimento cria `.receipt-<ULID>` sem sobrescrever. A publicação da cópia
+  usa `renameat2(RENAME_NOREPLACE)` e fsync antes de vincular a identidade. Uma
+  falha só libera os bytes após confirmar a transação terminal; erro de persistência
+  informa o ID e conserva os bytes sem afirmar que a transição ocorreu.
+- Um `flock` exclusivo no diretório privado de quarentena impede que dois donos
+  recuperem ou instalem simultaneamente. O worker pertence ao core e conserva o
+  lease ao atravessar tarefas bloqueantes, mesmo após cancelar o chamador.
+- A recuperação primeiro encerra todas as tentativas interrompidas numa transação
+  do writer. Só então remove recibos reconhecidos, ancorada em descritores, com
+  `openat2` e `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`.
+  Falhas de limpeza geram diagnóstico e nova tentativa no próximo boot; falha de
+  reconciliação no banco impede a admissão. Candidatas identificadas e estados
+  terminais são preservados. A limpeza geral de instâncias continua pendente.
+- O preflight SQLite é somente leitura e recusa versões futuras antes de abrir
+  conexão gravável, inclusive quando há WAL de um core mais novo interrompido.
+  Migrações usam a feature `backup` da dependência existente `rusqlite`, para
+  incluir commits no WAL. A publicação privada é atômica e retém a cópia recém-criada
+  mais duas anteriores, mesmo com timestamps futuros ou relógio regressivo.
+  Falha no backup impede a migração. Isso é pré-requisito da migração 0003;
+  não encerra o gerenciador de runtimes ou o rollback de M0.9.
+- `unsafe-libyaml`, já transitiva e fixada no lockfile, é dependência direta para
+  examinar tokens antes da desserialização: `serde_yaml_ng` descarta certas tags
+  globais. Tags explícitas e diretivas são recusadas; texto semelhante em strings,
+  comentários e blocos permanece válido. O scanner tem RAII e entrada limitada
+  pelo mesmo teto de bytes do manifest. Nenhum novo pacote foi instalado no host.
 
 ## Ambiente e escolhas de desenvolvimento em 2026-10-18
 
