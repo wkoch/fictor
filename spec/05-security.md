@@ -294,7 +294,7 @@ Uma UI web em localhost é alvo de qualquer site aberto no navegador. As regras 
 | Regra | Detalhe |
 |---|---|
 | Host do shell | Só aceitar `Host: 127.0.0.1:<porta>`. Requisições com `Host: localhost:<porta>` recebem redirect para `127.0.0.1`. Outros hosts: 403 (defesa contra DNS rebinding). |
-| Login | `fictor serve` imprime `http://127.0.0.1:<porta>/login?t=<token>`. Token de uso único, 256 bits, válido por 10 minutos. |
+| Login | `fictor serve` interativo (stdout TTY) ou `fictor login` explícito imprime `http://127.0.0.1:<porta>/login?t=<token>`. Serviço não emite token no boot. Token de uso único, 256 bits, válido por 10 minutos monotônicos; regras de emissão/sigilo no [ADR-048](12-maintenance.md#login-e-atualização-do-executável). |
 | Cookie | `fictor_session`, aleatório, `HttpOnly`, `SameSite=Strict`, `Path=/`. Expira em 30 dias. |
 | WebSocket | Exige cookie válido e `Origin: http://127.0.0.1:<porta>`. Sem isso, 403. |
 | Mutações HTTP | `POST`/`PUT`/`DELETE` exigem cookie, `Origin` igual ao shell e cabeçalho `X-Fictor-CSRF` com o token CSRF da sessão. |

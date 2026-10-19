@@ -1,5 +1,20 @@
 # Verificação da implementação
 
+## Revisão documental dos ADRs 046/047 — 2026-10-18
+
+ADR-046 prepara cache no harness para M0.8; ADR-047 resolve ARQ-031 pela ordem do
+evento de preparação, sem alterar timestamps ou eventos persistidos. Revisão do
+contrato confrontou o receipt atômico e a retomada do writer no código atual;
+implementar o piso pelo maior ID persistido e a seleção validada ainda cabe ao dev.
+Promoções legadas sem journal continuam consultáveis sem operação inventada.
+
+Validação estática no Toolbx `fictor-dev` (Fedora 44 sobre Bazzite): 193 links/âncoras
+válidos nos documentos já editados, 75 critérios contíguos na Fase 0, total 94 no
+plano e `git diff --check` sem erros. Sem execução de suítes do produto nem alteração
+do relógio da máquina; testes com relógio falso dos critérios 74–75 e gate COSMIC
+permanecem pendentes. Arquivos de implementação não foram editados pelo arquiteto.
+
+
 ## SIGKILL, boot e publicação compartilhada — 2026-10-18
 
 Código validado: `08a6f06`, incluindo a correção `58e5640`, na `main`.

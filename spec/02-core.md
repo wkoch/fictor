@@ -231,17 +231,17 @@ O core baixa só dos hosts da fonte: `nodejs.org`; ou `api.github.com`, `github.
 
 ### Instalação e ativação
 
-1. Baixar para `runtime/.staging/<nome>-<versão>/` e conferir o checksum. Se falhar, descartar.
+1. Baixar para staging privado atribuído ao plano (`runtime/.staging/<plan_id>/`, subdiretório por item), conforme ADR-048, e conferir o checksum. Se falhar, descartar somente temporários desse plano.
 2. Extrair num sandbox sem rede com `fictor __extract`, gravando só em `runtime/.staging/`. São recusados symlinks que apontem para fora, caminhos absolutos e `..`. Formatos: `.tar.xz`, `.tar.gz` e `.zip`.
 3. Rodar `<bin> --version` no ambiente de verificação e o smoke de cada extensão ativa que usa o runtime, já com a versão candidata ([06-lifecycle.md](06-lifecycle.md#ambiente-de-verificação)).
 4. Aprovação humana, pela CLI ou pela UI confiável. A confirmação do `fictor init` vale para a primeira instalação.
 5. Mover para `runtime/<nome>-<versão>/` (somente leitura), gravar no lock (seção `runtimes`, [06-lifecycle.md](06-lifecycle.md#lock)) e trocar como no hot swap: instâncias novas usam a versão nova, e as antigas terminam o que estão fazendo.
-6. Manter as 3 últimas versões. `fictor runtime rollback <nome>` volta para a anterior.
+6. Manter no mínimo as 3 últimas versões, além dos pins de processos/operações e rollback do [ADR-048](12-maintenance.md#rollback-lotes-e-retenção). `fictor runtime rollback <nome>` seleciona a anterior pelo histórico confirmado, não por SemVer/data.
 
 Quando instalar:
 
 - `node`: no `fictor init`, porque as extensões padrão precisam dele.
-- `uv`: quando chega a primeira proposta com `runtime.kind: python`. O uv instala o Python na etapa de dependências, em `runtime/python/`, com rede só para os hosts de download do próprio uv.
+- `uv` e `python`: quando necessários pela primeira proposta Python, mediante plano explícito aprovado. Python é runtime fixado no lock; a etapa de dependências não descobre nem baixa intérprete. Seleção, fonte uv-python e bootstrap estão no [ADR-048](12-maintenance.md#runtimes-python-e-bootstrap).
 
 Integridade: no boot, o core confere o sha256 do executável principal de cada runtime ativo contra o lock; `fictor doctor` confere a árvore inteira. Divergência desativa o runtime e gera alerta no shell.
 
@@ -260,7 +260,7 @@ Integridade: no boot, o core confere o sha256 do executável principal de cada r
 `fictor update --core` existe só na CLI:
 
 1. Baixa a release do core de `core_source` e confere o `SHA256SUMS` da release.
-2. Grava o binário novo ao lado do executável atual, renomeia o atual para `fictor.prev` e põe o novo no lugar.
+2. Preserva uma cópia durável do executável atual em `fictor.prev` antes de substituir atomicamente o caminho principal, conforme [ADR-048](12-maintenance.md#login-e-atualização-do-executável).
 3. Você reinicia o serviço.
 
 Nenhum caminho da UI web ou de um sandbox chega a esse comando.
@@ -508,6 +508,10 @@ asset = "uv-x86_64-unknown-linux-gnu.tar.gz"
 checksum = "uv-x86_64-unknown-linux-gnu.tar.gz.sha256"
 bin = "uv-x86_64-unknown-linux-gnu/uv"
 
+[runtimes.python]  # M0.9; catálogo fixado à release uv, conforme ADR-048
+source = "uv-python"
+version = "stable"
+
 [update]
 check = "weekly"                 # weekly | off; só avisa
 core_source = "github:wkoch/fictor"
@@ -603,13 +607,13 @@ Contrato de erro de `config.get` em [03-kernel-protocol.md](03-kernel-protocol.m
 
 ## CLI
 
-Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve` e `ext list|rollback|enable|disable|reset-crashes`. A listagem é uma consulta coordenada de configuração, com roteamento online/offline definido abaixo; não abre o inicializador/migrador geral do Store. Toda mutação offline exige a [posse exclusiva do home](#posse-do-diretório-de-dados) e os mesmos guardas de migração. Rollback/enable/disable alteram o lock sob a seção crítica do instalador, após reconciliar promoções pendentes. `reset-crashes` escreve somente o SQLite pelo writer único, conforme [Reabilitação humana](#reabilitação-humana); não altera o lock. Core ativo ou reconciliação inconclusiva impede fallback offline.
+Binário único `fictor`. Comandos que alteram estado com o servidor rodando falam com ele via `run/admin.sock`. Sem servidor, só funcionam `init`, `doctor`, `secrets`, `serve`, `ext list|rollback|enable|disable|reset-crashes` e a rotina local `update --core` do ADR-048. A listagem é uma consulta coordenada de configuração, com roteamento online/offline definido abaixo; não abre o inicializador/migrador geral do Store. Toda mutação offline exige a [posse exclusiva do home](#posse-do-diretório-de-dados) e os mesmos guardas de migração. Rollback/enable/disable alteram o lock sob a seção crítica do instalador, após reconciliar promoções pendentes. `reset-crashes` escreve somente o SQLite pelo writer único, conforme [Reabilitação humana](#reabilitação-humana); não altera o lock. Core ativo ou reconciliação inconclusiva impede fallback offline.
 
 | Comando | Fase | Função |
 |---|---|---|
 | `fictor init` | 0 | Cria `FICTOR_HOME`, config, banco e sessão `sys`. Instala o Node LTS e as extensões padrão embutidas (origem `builtin`), com uma confirmação. |
 | `fictor doctor` | 0 | Verifica bubblewrap (versão mínima) e user namespaces, SELinux, integridade dos runtimes, keyring e portas. |
-| `fictor serve [--open] [--shell-dir <dir>]` | 0 | Sobe o core e imprime a URL de login com token único. `--shell-dir` serve assets do disco (desenvolvimento). |
+| `fictor serve [--open] [--shell-dir <dir>]` | 0 | Sobe o core; em stdout TTY imprime URL de login com token único. Serviço/headless usa `fictor login`, sem token no journal. `--shell-dir` serve assets do disco (desenvolvimento). |
 | `fictor secrets set\|list\|rm <nome>` | 0 | Gerencia segredos. `list` mostra só nomes. |
 | `fictor login` | 0 | Pede ao core em execução uma URL de login nova, com token de uso único. Útil quando o core roda como serviço systemd de usuário. |
 | `fictor ext list` | 0 | Configuração registrada: ID, chave selecionada, versão e habilitação; online/offline. Não consulta saúde de processos. |
@@ -765,7 +769,9 @@ snapshot coerente do writer/journal e libera os locks antes de responder. Result
 
 `reason` é somente o código estável do primeiro check bloqueante em `failed`, ou
 `null`; nunca stderr/erro bruto. `promotion` é a última tentativa da proposta,
-ordenada por `(created_at, operation_id)`, ou `null`; não contém snapshots privados
+ordenada pelo ID monotônico do evento de preparação, conforme a
+[ordem durável das tentativas](06-lifecycle.md#ordem-durável-das-tentativas) (ADR-047),
+ou `null`; não contém snapshots privados
 do lock. `review`, `review_hash` existem em `checked`/`approved`/`promoted`; nos outros
 estados são `null`. `nonce` só é exposto em `checked`. Não liberar review parcial.
 
@@ -903,5 +909,16 @@ contratos semânticos; não se cria servidor auxiliar para contornar a posse. Ho
 banco e lock devem existir e o schema deve ser o atual; sem init/migração implícitos.
 Reconciliação e barreiras de recursos antecedem mutações, conforme ADRs 036/038.
 Instalação local exige core ativo; ausência dele falha. Rollback, runtime/update e
-login pertencem ao M0.9 e não ganham handlers por este ADR: ARQ-030 registra a
-obrigação de definir seus contratos antes de implementar esse marco.
+login pertencem ao M0.9: o [ADR-048](12-maintenance.md) resolve ARQ-030 e define
+seus contratos, a migração futura e a integração com o journal existente. Não
+implementar seus handlers antes desse marco.
+
+
+### Administração do M0.9
+
+[12-maintenance.md](12-maintenance.md) é o contrato normativo para runtime.list,
+update.prepare/list/status/decision/apply e login.issue, a preparação/revisão de
+rollback e a rotina CLI update --core. Listagem e mutações existentes consultam
+ambos os journals depois da migração: prepared em qualquer um impede snapshot de
+lock confirmado, e dois prepared são corrupção. O timeout, os limites, a identidade
+e a proibição de retry/fallback do ADR-045 continuam valendo.

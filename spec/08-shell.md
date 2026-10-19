@@ -61,14 +61,15 @@ Mensagens JSON. Requisições do cliente têm `id`; o servidor responde `{type: 
 | `proposal.list` | `{state?}` | Propostas. |
 | `proposal.get` | `{proposal_id}` | Detalhe: checagens, diff, pacotes, relatório, `nonce`. |
 | `proposal.decide` | `{proposal_id, nonce, decision: "approve" \| "reject", overrides?}` | Decide proposta; `overrides` segue [o schema](schemas/overrides.schema.json) e o [contrato de aplicação](06-lifecycle.md#overrides-humanos). |
-| `ext.rollback` | `{ext_id, to?}` | Rollback. |
 | `ext.set_enabled` | `{ext_id, enabled}` | Liga ou desliga. |
 | `ext.reset_crashes` | `{ext_id, key?, session_id?}` | Reset humano auditado da recuperação; seleção e semântica de [02-core.md](02-core.md#reabilitação-humana). Não habilita nem executa a extensão. |
 | `ext.reset_state` | `{ext_id}` | Limpa kv, `${ext_data}` global e marca d'água (Fase 1). Exige confirmação no modal. |
-| `update.check` | — | Verifica atualizações de runtimes, extensões e core. Servidor responde `update.candidates`. |
-| `update.apply` | `{items: string[] \| "all_passing", nonce}` | Aplica os itens escolhidos, ou todos os que passaram nas checagens sem ampliar permissões. |
-| `update.rollback` | `{batch_id, nonce}` | Reverte um lote. |
-| `runtime.rollback` | `{name, nonce}` | Volta o runtime à versão anterior. |
+| `runtime.list` | `{}` | Lista runtimes pelo ADR-048. |
+| `update.prepare` | `{request}` | Prepara atualização/check/rollback, sem aprovar ou aplicar. |
+| `update.list` | `{before?, limit?}` | Lista planos. |
+| `update.status` | `{plan_id}` | Snapshot histórico da revisão e operação. |
+| `update.decision` | `{plan_id, nonce, review_hash, decision, items}` | Confirma seleção revisada ou rejeita. |
+| `update.apply` | `{plan_id}` | Admite somente plano aprovado; retorna operation_id após journal durável. |
 | `workspace.clear_flag` | `{workspace}` | Apaga a flag U do workspace. Exige confirmação no modal, que mostra a sessão de origem. |
 
 O `ext.list` deste WebSocket pertence ao gerenciador de extensões. É distinto do método homônimo do [canal administrativo da CLI](02-core.md#canal-administrativo-mínimo); seu formato não é substituído pelo snapshot de configuração do ADR-041. A UI continua mostrando esperas/bloqueios por chave e sessão conforme ADR-039, sem confundir esses dados com `enabled`.
@@ -86,7 +87,7 @@ O `ext.list` deste WebSocket pertence ao gerenciador de extensões. É distinto 
 | `app.response` | `{surface_id, request_id, result?, error?}` |
 | `app.notify` | `{surface_id, method, params}` |
 | `catalog.changed` | `{catalog}` |
-| `update.candidates` | `{runtimes: [...], extensions: [...], core?: {current, latest}, nonce}` |
+| `update.candidates` | `{plan_id}` — invalida a tela; consultar update.status. Não transporta nonce de autorização. |
 | `proposal.updated` | `{proposal_id, state}` |
 
 ## Layout
@@ -195,3 +196,13 @@ Web components Lit com prefixo `fx-`, tokens em propriedades CSS `--fx-*`, tema 
 `shell/ds/CATALOG.md` descreve tags e atributos em até ~1500 tokens. É usado pela skill de autoria e PODE entrar no system prompt.
 
 Acessibilidade em todos os componentes: navegação por teclado, foco visível, contraste AA, `prefers-reduced-motion`.
+
+
+### Manutenção do M0.9
+
+Os tipos de request, revisão, seleção, resultados e erros dos métodos update.* e
+runtime.list são os de [12-maintenance.md](12-maintenance.md), adaptados ao envelope
+WS ack/error. São exclusivos da UI confiável autenticada, nunca de app.request ou
+surface. Botões de rollback preparam plano, exibem revisão e pedem confirmação;
+não mutam somente com id/name/batch_id. Login.issue e update --core não existem no
+WS. Notificações de candidatos invalidam a tela; status é a fonte de estado.

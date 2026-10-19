@@ -339,6 +339,63 @@ Todas as alterações de lock (incluindo runtime, rollback, enable/disable e com
 4. Numa única transação, exigir journal `prepared` e proposta `approved`, mudar a proposta para `promoted`, gravar um único `ext.promoted` com `operation_id` e marcar o journal `committed`. Falha do commit mantém a extensão sem novas admissões e o journal recuperável; não alegar sucesso nem compensar o lock automaticamente.
 5. Atualizar o registro em memória, executar hot swap e notificações, e só então liberar as admissões. Limpar a quarentena e os temporários conhecidos depois do compromisso. Falha de limpeza não desfaz promoção. Reinício restaura o catálogo pelo lock reconciliado; notificações são invalidadores e podem se repetir, mas o evento durável não.
 
+#### Ordem durável das tentativas
+
+O ADR-047 define a ordem de criação pelo `id` do evento `ext.promotion_prepared`
+associado à intenção, nunca por `created_at`, `updated_at` ou relógio civil.
+`operation_id` identifica a tentativa, mas seu formato/ordem não substitui a ordem
+do evento, inclusive em dados legados. O evento de preparação e a intenção são
+persistidos na mesma transação, conforme o passo 1; não há tentativa admitida sem
+essa evidência. Os IDs de evento são ULIDs canônicos monotônicos do writer;
+compará-los em ordem binária crescente, independentemente de locale.
+
+Para consultar a última tentativa de uma proposta, ler proposta, intenções e seus
+eventos num único snapshot SQLite. Para cada intenção deve existir exatamente um
+evento `ext.promotion_prepared`, de actor `core` na sessão `sys`, cujo payload
+identifica os mesmos `operation_id`, `proposal_id`, `ext_id`, `key`, `before_hash`
+e `after_hash`. Validar o evento e os hashes/snapshots pelo contrato existente;
+resolver payload em blob quando aplicável. A última é aquela com maior ID do
+**evento de preparação**, não do evento de conclusão. Sem intenções nem eventos
+de preparação associados, devolver `promotion: null`, inclusive para proposta
+legada `promoted` anterior ao journal. Isso não inventa `operation_id` nem autoriza
+repromovê-la: a CLI pode informar a promoção legada já concluída, e uma nova chamada
+`promote` sem intenção confirmada retorna `invalid_state`. Eventos legados
+`ext.promoted` sem `operation_id` não são eventos órfãos de uma tentativa journalada.
+
+A mesma seleção validada serve a `ext.install.status` e à deduplicação/admissão de
+`ext.install.promote`; não manter duas regras de ordenação. Todas as tentativas
+anteriores da proposta devem estar `aborted`; somente a última pode estar
+`prepared` ou `committed`. `prepared` exige proposta `approved`; `committed` exige
+`promoted`; se todas estão `aborted`, a proposta permanece `approved`. Cada estado
+terminal deve ter a evidência de conclusão do ADR-036, posterior à sua preparação;
+a conclusão de uma tentativa anterior deve preceder a preparação da seguinte.
+Continuam valendo a unicidade global de `prepared` e a proibição de reabrir tentativa
+abortada ou criar nova tentativa depois do commit da mesma proposta.
+
+Evento ausente, duplicado, órfão, divergente ou sequência incompatível é corrupção,
+não critério para escolher uma tentativa alternativa. Não ocultar `prepared` ou
+`committed` por um `aborted` selecionado incorretamente. No admin, retornar
+`invalid_snapshot` sem nova mutação (`effect: none`); no caminho de recuperação,
+reter recursos e recusar admissões com `promotion:recovery_conflict`. Não corrigir
+por prioridade de estado, timestamps, ordem física/rowid ou heurística de ULID da
+operação. Reconciliação de intenções continua obrigatória antes de outra mutação,
+sem depender de qual proposta está sendo consultada.
+
+O writer conserva a monotonicidade dos IDs de evento inclusive após regressão do
+relógio e reinício: inicializar seu piso pelo maior ID de evento persistido, nunca
+pelo evento de maior timestamp. Novo ID deve ser estritamente maior que esse piso
+e que os IDs já emitidos nesta execução; overflow falha antes do commit. Lacunas
+por transação abortada são permitidas. `created_at`/`updated_at` e timestamps dos
+eventos continuam horários civis Unix ms observados; podem recuar e não são
+ajustados para ordenar o histórico. Esta regra não altera os relógios de backoff
+ou os contratos de crash recovery.
+
+Aplicar a mesma leitura aos journals legados do ADR-036: eles já exigiam o evento
+atômico de preparação. Não renumerar IDs, fazer UPDATE/DELETE em eventos, criar
+preparação retroativa ou migrar timestamps. Legado sem evidência íntegra falha
+explicitamente para intervenção humana. Não há novo campo de protocolo, tabela
+ou migração; índices auxiliares são detalhe interno se preservarem esta semântica.
+
 #### Reconciliação da promoção
 
 No boot, antes de despachar extensões ou admitir mutações do lock, e depois de recuperar os registros de instância conforme ADR-038, preservando recursos cuja limpeza não foi autorizada, ler cada intenção `prepared`:
@@ -400,7 +457,7 @@ Staging novo usa nomes derivados da intenção: `quarantine/.promotion-<operatio
 }
 ```
 
-- `runtimes` segue o mesmo modelo: `active` aponta a versão em uso, e as 3 últimas ficam em `versions`. `tree_hash` usa o algoritmo do hash de bundle aplicado ao diretório extraído. As versões do exemplo são ilustrativas.
+- `runtimes` segue o mesmo modelo: `active` aponta a chave em uso, e no mínimo as 3 últimas ficam em `versions`, além dos pins do ADR-048. Python usa chave com versão e build, conforme [contrato do M0.9](12-maintenance.md#runtimes-python-e-bootstrap). Novos registros incluem `tree_hash_kind: "runtime-v1"`; `tree_hash` segue a árvore tipada do [ADR-048](12-maintenance.md#runtimes-python-e-bootstrap), incluindo symlinks internos validados. Legado conserva o algoritmo anterior somente em árvores regulares. As versões do exemplo são ilustrativas.
 - `source` para origens remotas inclui `url`, `ref` pedido e `sha` resolvido (ou `package` e `version`).
 - `privileges` só é editável por humano. Valor conhecido: `structured_output_trust` ([05-security.md](05-security.md#leitor-em-quarentena-fase-3)).
 
@@ -564,3 +621,15 @@ As versões antigas ficam no store; `fictor gc` mantém as 5 mais recentes por e
 ### CLI local online da Fase 0
 
 O fluxo `ext install` usa [o contrato administrativo do ADR-045](02-core.md#mutações-administrativas-do-m05): receipt/checks, revisão completa com nonce/hash, decisão humana e pedido de promoção separados. A confirmação ocorre na CLI confiável, com retomada explícita por ID; não autoriza a CLI geral de propostas da Fase 1. Os estados, overrides, comparação de base e journal definidos acima continuam obrigatórios.
+
+
+### Manutenção conjunta no M0.9
+
+O [ADR-048](12-maintenance.md) acrescenta planos/journal de manutenção separados
+de promotion_intents, sem propostas artificiais para runtimes/rollback. A exclusão
+é conjunta; boot, listagens e mutações verificam ambos. O contrato de ordem durável
+do ADR-047 usa a associação explícita do plano e seu prepared_event_id para
+propostas de lote, sem exigir ext.promotion_prepared individual. Propostas ligadas
+a plano não alternam entre os dois caminhos de publicação. Rollback passa pela
+revisão e protocolo recuperável daquele documento, preservando enabled/dados/flags;
+anterior tem origem no último snapshot confirmado, nunca na ordenação de versões.

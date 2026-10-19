@@ -52,6 +52,7 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | [09-evals.md](09-evals.md) | Evals, gates de promoção, replay do histórico. |
 | [10-roadmap.md](10-roadmap.md) | Fases, marcos e critérios de aceitação. |
 | [11-decisions.md](11-decisions.md) | Registro de decisões (ADRs). |
+| [12-maintenance.md](12-maintenance.md) | Contratos do M0.9: planos, runtimes, atualização, rollback, login e journal recuperável (ADR-048). |
 | [schemas/extension.schema.json](schemas/extension.schema.json) | JSON Schema do manifest `fictor.yaml`. |
 | [schemas/0001_init.sql](schemas/0001_init.sql) | Migração inicial do SQLite. |
 | [schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql) | Migração 0002: orçamento do model proxy e flags de workspace e de extensão. |

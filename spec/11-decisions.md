@@ -421,3 +421,36 @@ Contrato normativo em [05-security.md](05-security.md#árvores-de-montagem-e-ori
 - **Instalação.** Receipt e checks são separados de consentimento e promoção. Revisão completa e hash canônico vinculam bytes, catálogo, base e overrides ao nonce; decisão humana persistida precede a intenção durável. O trabalho longo continua no core, observado por consultas curtas. Reutilizar propostas e journal existentes, sem tabela genérica de jobs. Retomada explícita por ID não relê origem nem aprova automaticamente.
 - **Efeitos.** Reset seleciona chave/sessão sob exclusão e remove apenas linhas serializadas pelo writer; enable não reseta crashes. Resposta perdida não desfaz commit nem permite retry automático. Promoção consulta a intenção existente; journal decide recuperação. Segredos entram somente pelo TTY sem eco, com frames excluídos de logs e backend configurado sem fallback.
 - **Escopo.** Sem mudança de schema persistido, Kernel Protocol ou fases. O contrato não antecipa runtime/update/login/rollback do M0.9; sua lacuna remanescente é rastreada em ARQ-030, antes de qualquer handler. Critérios 66–70 da Fase 0. Implementação e gate permanecem responsabilidade do desenvolvimento.
+
+
+## ADR-046 — Prompt caching no harness
+
+- **Data:** 2026-10-18.
+- **Contexto.** O spec já previa cache Anthropic e contadores de cache, mas colocava data/hora antes das instruções estáveis e não definia a normalização de tokens entre adapters. A análise de prompt caching foi aprovada pelo usuário para preparação do M0.8.
+- **Decisão.** Manter o core opaco às APIs (I9/I10). O harness separa prefixo estável e ambiente dinâmico, serializa deterministicamente e seleciona controles pelo contrato do adapter/modelo. O mínimo usa um breakpoint Anthropic de 5 minutos; Chat Completions genérico não recebe campos extras por default. Otimizações de histórico, TTL e afinidade permanecem evoluções do harness.
+- **Dados.** Esclarecer o formato já previsto: input_tokens é entrada total; contadores de cache são detalhamentos. Ausência não vira zero nem custo estimado. Não reescrever histórico, alterar schema SQL ou mover interpretação de usage para o core.
+- **Limites.** Cache não muda proveniência, permissões, captura, orçamento por chamada ou janela de contexto. Não é estado necessário à retomada. Sem pré-aquecimento implícito e sem remoção automática de opções para repetir uma requisição rejeitada.
+- **Entrega.** Contrato em [07-harness.md](07-harness.md#prompt-caching-m08), critérios 71–73 da Fase 0. Implementar somente no M0.8, após os marcos anteriores. ARQ-030/031 conservam seus estados e não são resolvidas por esta decisão.
+- **Fontes:** [OpenRouter — Prompt Caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching) e [Anthropic — Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), consultadas em 2026-10-18. Preços, limites e capacidades variam por provider/modelo; conferir as fontes ao implementar o adapter.
+
+
+## ADR-047 — Ordem durável das tentativas de promoção (resolve ARQ-031)
+
+- **Data:** 2026-10-18.
+- **Contexto.** O ADR-045 selecionava a última tentativa por `(created_at, operation_id)`. Regressão do relógio civil pode fazer uma tentativa abortada antiga ocultar uma nova preparada/confirmada, prejudicando status e deduplicação.
+- **Decisão.** Usar o ID monotônico do evento `ext.promotion_prepared` persistido atomicamente com a intenção. Validar a associação única e a sequência de estados no mesmo snapshot; compartilhar essa seleção entre status e admissão. `operation_id` continua identidade, sem presumir ordem cronológica de IDs legados. O writer conserva o piso de IDs a partir do maior evento persistido após reinício.
+- **Inconsistência.** Evento ausente/duplicado/divergente, tentativa posterior a commit ou prepared não final falham explicitamente; não escolher silenciosamente outra tentativa. Admin usa invalid_snapshot, recuperação usa promotion:recovery_conflict. Conservar recursos e histórico.
+- **Compatibilidade.** Timestamps continuam Unix ms observados, sem clamp ou reescrita. O legado válido já contém a evidência do ADR-036 e usa a mesma regra. Sem migração, novo campo wire ou alteração de I5. Substitui somente a ordenação do ADR-045; preserva o journal e a recuperação do ADR-036.
+- **Entrega.** [Ordem durável das tentativas](06-lifecycle.md#ordem-durável-das-tentativas), critérios 74–75 da Fase 0. Implementação e testes pelo dev; não é evidência de aceitação do M0.5.
+
+
+## ADR-048 — Administração e manutenção recuperável do M0.9 (resolve ARQ-030)
+
+- **Data:** 2026-10-18.
+- **Contexto.** Rollback, runtimes, lotes de atualização e login não tinham contratos administrativos fechados. Promotion_intents exige proposta e não representa uma troca conjunta de runtime/extensões ou rollback sem proposta.
+- **Decisão.** [12-maintenance.md](12-maintenance.md) define planos duráveis com revisão/nonce e seleção, um fluxo update.prepare/list/status/decision/apply, runtime.list e login.issue. CLI e UI confiável compartilham os serviços; extensões não recebem essas autoridades. Atualização geral só inclui entradas instaladas; instalações iniciais continuam explícitas.
+- **Durabilidade.** Nova migração aditiva no M0.9 criará maintenance_plans, maintenance_plan_proposals e maintenance_intents. Um prepared global entre os dois journals, uma troca do lock e um commit SQLite para lote, propostas e eventos. Recuperação compara snapshots completos. Não criar propostas de runtime/rollback ou intents individuais fictícias. Status de proposta ligada a plano reconhece o novo journal explicitamente.
+- **Rollback.** Anterior deriva da última transição confirmada com snapshot demonstrável, ordenada pelo evento preparado. Lote inverso compara itens afetados, preserva enabled/inventário e revalida todos os consumidores atuais. Não restaura dados ou efeitos externos. Três runtimes é mínimo, com pins adicionais para processos, operações e predecessores ofertados.
+- **Runtimes.** Python ganha entrada explícita no lock e fonte uv-python de catálogo fixado, seleção/hash/revisão antes da execução. uv não descobre/baixa intérprete implicitamente no spawn/dependências. Hash runtime-v1 cobre tipos, arquivos e symlinks internos validados; legado não é reinterpretado. Checks usam sandbox e combinação exata de runtimes; grupos de dependências são indivisíveis na decisão.
+- **Autenticação e executável.** Login é só admin local: token de uso único, monotônico, efêmero, sem logs; serve headless não emite token no boot. update --core permanece só CLI com confirmação TTY; preserva cópia anterior antes de substituir atomicamente o executável, sem handler web/admin nem restart automático.
+- **Compatibilidade.** Complementa ADRs 032/036/041/045/047. A ordem e admissão do ADR-047 reconhecem a associação de manutenção; históricos antigos não são reescritos. Banco migrado exige binário novo. Preserva I1–I11. Contrato pronto para M0.9, sem implementação antecipada; critérios 76–81.

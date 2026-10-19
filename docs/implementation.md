@@ -709,3 +709,30 @@ com revisão e retomada, e segredos pelo admin. Critérios 66–70 são trabalho
 a resolução não afirma handlers implementados ou testes aprovados. ARQ-030 registra
 a preparação de contratos do M0.9, incluindo durabilidade de rollback. Edições de
 arquitetura ficam sem stage/commit para integração exclusivamente pelo dev.
+
+
+## Preparação do harness para cache — ADR-046
+
+Contrato preparado para M0.8 em 2026-10-18: prefixo estável separado do ambiente,
+controles por adapter/modelo e normalização de usage sem dupla contagem. Critérios
+71–73 definidos; nenhum código de harness/core foi implementado nesta entrega.
+Otimizações avançadas ficam no harness/extensões. ARQ-031 foi posteriormente resolvida pelo ADR-047;
+ARQ-030 foi posteriormente resolvida pelo ADR-048, para implementação no M0.9. Integração e commits exclusivamente pelo dev.
+
+
+## Entrega arquitetural — ARQ-031 / ADR-047
+
+Resolvida em 2026-10-18 a ordem de tentativas sob regressão do relógio: usar o ID
+do evento de preparação e validar associação/sequência, incluindo legado, status
+e deduplicação. Critérios 74–75 definidos; nenhuma implementação alterada pelo
+arquiteto. O contrato do M0.8 (ADR-046) permanece preparado. ARQ-030 foi posteriormente resolvida pelo ADR-048, com implementação
+reservada ao M0.9, conforme a ordem do roadmap. Sem stage/commit nesta entrega.
+
+
+## Contrato pronto para M0.9 — ARQ-030 / ADR-048
+
+Em 2026-10-18, o arquiteto definiu spec/12-maintenance.md: planos duráveis,
+revisão/nonce/seleção, journal de lote, rollback, runtimes/Python, login e rotina
+CLI de atualização do executável. Critérios 76–81 definidos. A futura migração
+está descrita em Markdown; nenhum SQL executável ou código foi implementado.
+Integração, testes e commits cabem ao dev; respeitar a ordem dos marcos.

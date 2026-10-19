@@ -1,25 +1,29 @@
 # Pendências para o arquiteto
 
-ARQ-020–029 resolvidas pelos ADRs 036–045. ARQ-030 planejada para antes do M0.9;
-não bloqueia o M0.5. ARQ-031 aberta para a ordenação de tentativas de promoção.
+ARQ-020–029 resolvidas pelos ADRs 036–045. ARQ-030 resolvida pelo ADR-048,
+com implementação reservada ao M0.9. ARQ-031 resolvida pelo ADR-047.
 Resolução do spec não significa implementação concluída.
 
 ## ARQ-031 — Última tentativa de promoção após regressão do relógio civil
 
-- **Status: aberta; decidir antes de concluir a observação e a deduplicação da instalação online no M0.5.**
+- **Status: resolvida em 2026-10-18 — [ADR-047](../spec/11-decisions.md#adr-047--ordem-durável-das-tentativas-de-promoção-resolve-arq-031).**
 - **Referências:** `spec/02-core.md`, instalação local online, definição de `promotion` em `ext.install.status` (linhas 767–768); `spec/06-lifecycle.md`, promoção/repetição após `aborted`; `spec/schemas/0004_promotion_journal.sql`; `core/src/store/installations.rs`, `installation_snapshot`.
 - **Dúvida:** o status deve escolher a última tentativa por `(created_at, operation_id)`, mas o writer usa relógio civil em `created_at`. Após uma tentativa `aborted`, uma nova tentativa explícita criada com o relógio recuado pode ter ULID maior e timestamp menor. A consulta normativa escolhe a tentativa antiga; a admissão de promoção também usa esse snapshot para deduplicar `prepared`/`committed`. O ULID do writer é monotônico, inclusive após reinício a partir do último evento persistido, mas substituir a ordenação por ULID contraria o contrato explícito.
 - **Reprodução proposta:** criar e abortar uma promoção A; recuar o relógio civil; admitir B para a mesma proposta sem mudar a base; consultar enquanto B está `prepared` e depois de `committed`. Com `created_at(B) < created_at(A)`, a ordenação atual apresenta A. A análise foi feita no código; não foi alterado o relógio da máquina nem executado esse cenário.
 - **Necessário:** definir como a ordem de criação permanece autoritativa com regressão do relógio, incluindo tentativas legadas. Opções a decidir são ajustar a ordenação ou definir timestamps lógicos limitados pelo histórico e seu efeito no evento imutável da preparação. O clamp não é aplicado implicitamente: intenção e evento usam o mesmo `created_at`, e eventos documentam Unix ms. Também esclarecer como status e deduplicação tratam um `prepared`/`committed` mais novo que a tentativa escolhida pela tupla.
 - **Impacto:** a consulta pode informar `aborted` apesar de existir uma nova publicação e deixar de devolver prontamente o seu ID. Mantida a consulta definida pelo spec; nenhuma ordem alternativa, clamp de timestamp ou reescrita do histórico foi implementada sem ADR.
+- **Resolução:** ordem pelo ID monotônico do evento de preparação, com associação e sequência validadas; timestamps civis permanecem inalterados. Status e deduplicação usam a mesma seleção. Legado válido usa eventos já existentes; corrupção falha sem reconstrução heurística.
+- **Entrega:** implementar critérios 74–75 com relógio falso e reinício, incluindo B preparada/confirmada depois de A abortada; não alterar o relógio real. Resolução documental não significa implementação concluída.
 
 ## ARQ-030 — Contratos administrativos do M0.9 e durabilidade de rollback
 
-- **Status: planejada; decidir antes de iniciar M0.9. Não bloqueia M0.5.**
+- **Status: resolvida em 2026-10-18 — [ADR-048](../spec/11-decisions.md#adr-048--administração-e-manutenção-recuperável-do-m09-resolve-arq-030). Implementar somente no M0.9.**
 - **Referências:** `spec/02-core.md`, CLI/runtimes/update; `spec/06-lifecycle.md`, rollback; ADRs 036/045.
 - **Dúvida:** seleção de versão anterior e commit conjunto de rollback com `ext.rolled_back` não têm journal próprio; `promotion_intents` exige proposta e não deve receber proposta artificial. Runtime/update em lote e login também precisam métodos administrativos, autoridade e resultados definidos.
 - **Necessário:** ADR antes dos handlers do M0.9, definindo seleção/durabilidade/recuperação de rollback, lotes de update e runtimes, nonce/revisão e login de uso único. Manter `update --core` exclusivo da CLI e sem caminho por UI/extensão.
 - **Impacto:** não inventar esses handlers, reutilizar journal de proposta à força nem executar esses itens fora da ordem do roadmap. Resolver no início da preparação arquitetural do M0.9.
+- **Resolução:** [contrato M0.9](../spec/12-maintenance.md) fixa planos/revisão/nonce, seleção de anterior, journal conjunto do lote separado de propostas, rollback com CAS dos itens, Python explícito, pins, login local efêmero e substituição segura do executável exclusivamente pela CLI. Inclui schemas persistidos, envelopes, eventos, recuperação e legado.
+- **Entrega:** futura migração aditiva e handlers apenas no M0.9. Critérios 76–81; sem código, migração executável ou commit nesta resolução. Implementação e aceitação continuam pendentes.
 
 ## ARQ-029 — Contrato administrativo das mutações da Fase 0
 

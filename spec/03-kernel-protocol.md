@@ -453,6 +453,11 @@ Os campos de recuperação de `ext.crashed` valem para processos ativos a partir
 | `harness.continue` | `{text, ext_id}` — continuação pedida por hook `turn.end` |
 | `harness.error` | `{message, retryable}` |
 
+Semântica de `assistant.message.usage`: entrada total inclui cache; campos de cache
+são detalhamentos opcionais. A normalização por adapter e a compatibilidade com
+histórico estão em [Prompt caching](07-harness.md#prompt-caching-m08), ADR-046.
+O core não extrai nem interpreta esses contadores nas APIs de modelo.
+
 ### Gravados por outras extensões
 
 `x.<ext_id>.<nome>` com payload livre.
@@ -470,3 +475,15 @@ Os campos de recuperação de `ext.crashed` valem para processos ativos a partir
 | demais eventos do core | trusted | public |
 
 Eventos gravados por instâncias de sessão na própria sessão não acendem flags. Isso é seguro porque toda entrada de dados nesses processos já passou por um canal mediado que acendeu as flags da sessão ([05-security.md](05-security.md#fluxo-entre-sessões)), e as flags são cumulativas. Instâncias globais recebem dados de várias sessões, por isso o que elas gravam numa sessão acende flags e carrega a marca d'água. Na Fase 0 não há instâncias globais com processo ([04-extensions.md](04-extensions.md#combinações-válidas)).
+
+
+### Eventos de manutenção no M0.9
+
+O [ADR-048](12-maintenance.md#eventos-e-compatibilidade) define os eventos de planos,
+preparação/conclusão de manutenção e rollback de lote; estende ext.rolled_back e
+eventos de runtime com operation_id/from. O payload antigo continua aceito no
+histórico. No M0.9, runtime gerenciado ausente acrescenta o motivo estável
+`check:runtime_required` a ext.failed, antes de executar dependências; nova tentativa
+exige nova proposta após instalação humana do runtime. ext.promoted de proposta em lote aponta para maintenance_intents, pela
+associação explícita, sem intenção individual fictícia. Nenhum método update.*,
+runtime.list ou login.issue é adicionado ao Kernel Protocol por essa extensão.

@@ -8,14 +8,14 @@ ainda não estão disponíveis. Detalhes em [implementation.md](implementation.m
 
 | Release | Escopo obrigatório | Critérios ativos no roadmap | Trabalho principal restante |
 |---|---|---:|---|
-| v0.1 | Fase 0 completa | 70 | Fechar M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
+| v0.1 | Fase 0 completa | 81 | Fechar M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
 | v0.2 | Fase 1 completa | 10 | Autoextensão, promoção controlada, hooks, surfaces, hot swap e estado global mediado. |
 | v0.3 | Fase 2 completa | 4 | Evals, checkpoints/rewind, subagentes, árvore de sessões e demais entregas da fase. |
 | v1.0 | Núcleo da Fase 3 | 5 | Origens de terceiros, normalização, MCP remoto, auditoria, atualizações acompanhadas e Landlock/seccomp. |
-| **Total** | Fases 0–2 e núcleo da Fase 3 | **89** | Critérios normativos totais, com partes já implementadas ou testadas. |
+| **Total** | Fases 0–2 e núcleo da Fase 3 | **100** | Critérios normativos totais, com partes já implementadas ou testadas. |
 
 Fonte: [roadmap](../spec/10-roadmap.md). A Fase 1 nº 8 foi movida para a Fase 0
-nº 27 e não entra duas vezes. Os ADRs 036–045 ampliaram a Fase 0 de 37 para 70
+nº 27 e não entra duas vezes. Os ADRs 036–048 ampliaram a Fase 0 de 37 para 81
 critérios. A contagem não mede percentual concluído: os critérios têm tamanhos
 diferentes e não enumeram cada item de implementação.
 
@@ -47,7 +47,7 @@ próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
    (obrigações futuras do SDK; transporte do Kernel implementado) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
    (bootstrap protegido antes do init, com bases/bibliotecas na TCB instalada).
    ARQ-027/028 resolvidas; o gate dos critérios 57–65 continua pendente.
-3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Resolver a ARQ-031 sobre ordem de promoções com relógio regressivo; definir ARQ-030 antes de M0.9. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
+3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Resolver a ARQ-031 sobre ordem de promoções com relógio regressivo; implementar o contrato da ARQ-030 (ADR-048) somente no M0.9. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
 
