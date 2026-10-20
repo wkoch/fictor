@@ -107,6 +107,21 @@ impl Allowlist {
             .collect()
     }
 
+    /// Whether every permitted host belongs to the exact trusted-host list.
+    /// This uses the same ASCII case folding as the egress proxy. Configured
+    /// trusted entries are host names, not patterns or authorities: no port,
+    /// root-dot or alternative IP spelling is silently removed from them.
+    /// Ports on parsed allow rules do not change a host's trust. A finite exact
+    /// list cannot cover `*` or `*.domain`, even if it contains known children.
+    pub fn all_hosts_trusted(&self, trusted_domains: &[String]) -> bool {
+        self.rules.iter().all(|rule| match &rule.host {
+            HostPattern::Exact(host) => trusted_domains
+                .iter()
+                .any(|trusted| host.eq_ignore_ascii_case(trusted)),
+            HostPattern::Any | HostPattern::Subdomains(_) => false,
+        })
+    }
+
     /// `host` is the host alone, without URL syntax or a port. IPv6 literals may
     /// be unbracketed or bracketed. Mapped IPv4 and well-known NAT64 destinations
     /// are compared by their embedded IPv4 without changing the connection host.
@@ -372,6 +387,57 @@ mod tests {
 
     fn ip(address: &str) -> IpAddr {
         address.parse().unwrap()
+    }
+
+    #[test]
+    fn trust_coverage_uses_exact_hosts_and_ignores_allowed_ports() {
+        let trusted = [
+            "TRUSTED.EXAMPLE".into(),
+            "127.0.0.1".into(),
+            "2001:db8::1".into(),
+        ];
+        assert!(allow(&[]).all_hosts_trusted(&[]));
+        assert!(
+            allow(&[
+                "Trusted.Example",
+                "trusted.example:8443",
+                "127.0.0.1:80",
+                "[2001:db8::1]:443"
+            ])
+            .all_hosts_trusted(&trusted)
+        );
+        assert!(!allow(&["trusted.example", "untrusted.example"]).all_hosts_trusted(&trusted));
+        assert!(!allow(&["trusted.example.evil"]).all_hosts_trusted(&trusted));
+        assert!(!allow(&["sub.trusted.example"]).all_hosts_trusted(&trusted));
+    }
+
+    #[test]
+    fn finite_exact_trust_never_covers_wildcard_network_authority() {
+        let trusted = [
+            "example.com".into(),
+            "a.example.com".into(),
+            "b.example.com".into(),
+            "*.example.com".into(),
+            "*".into(),
+        ];
+        assert!(!allow(&["*"]).all_hosts_trusted(&trusted));
+        assert!(!allow(&["*.example.com"]).all_hosts_trusted(&trusted));
+        assert!(!allow(&["*.example.com:8443"]).all_hosts_trusted(&trusted));
+        assert!(allow(&["a.example.com", "b.example.com:8443"]).all_hosts_trusted(&trusted));
+    }
+
+    #[test]
+    fn trust_entries_preserve_the_existing_egress_host_comparison() {
+        for entry in [
+            "trusted.example:443",
+            "trusted.example.",
+            " trusted.example",
+            "*.example",
+        ] {
+            assert!(!allow(&["trusted.example"]).all_hosts_trusted(&[entry.into()]));
+        }
+        assert!(!allow(&["[2001:db8::1]:443"]).all_hosts_trusted(&["[2001:db8::1]".into()]));
+        assert!(!allow(&["[2001:db8::1]:443"]).all_hosts_trusted(&["2001:db8:0:0:0:0:0:1".into()]));
     }
 
     #[test]

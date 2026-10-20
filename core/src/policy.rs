@@ -5,6 +5,8 @@
 //! supplies `matching_rules` after matching the exposed name. Glob syntax is
 //! awaiting ARQ-032. An Allow result alone does not execute or audit a call.
 
+pub mod provenance;
+
 use crate::{
     config::{Decision as RuleDecision, Mode},
     installer::manifest::{Effect, Sensitivity},

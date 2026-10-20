@@ -22,7 +22,7 @@ o estado durável de crash loop e a listagem administrativa estão implementados
 A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
 bootstrap antes do init têm implementação e testes dirigidos no Toolbx. Os handlers
 administrativos do ADR-045 e a CLI de instalação local também passaram nos testes
-dirigidos. A validação integrada passou com 531 testes principais no Toolbx, além de Clippy,
+dirigidos. A validação integrada passou com 556 testes principais no Toolbx, além de Clippy,
 formatação e build release. A promoção já está ligada à drenagem de instâncias;
 há provas de SIGKILL real e dois boots idempotentes para instâncias e promoções.
 O ADR-047 resolveu a ARQ-031 e está implementado: status, deduplicação e recuperação
@@ -41,7 +41,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
 | M0.5 | Implementação local concluída; gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. SIGKILL, boot real e ordenação durável do ADR-047 testados. Falta aceitação no alvo/CI. |
-| M0.6 | Primitivas de política e workspace implementadas | Precedência pura e marcação U auditada; matcher, aprovações/grants e execução de tools dependem dos contratos em ARQ-032–034. |
+| M0.6 | Primitivas de política, workspace e proveniência implementadas | Precedência pura, marcação U auditada e classificação de resultados; matcher, aprovações/grants e execução de tools dependem dos contratos em ARQ-032–034. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
 | M0.9 | Toolbx e guarda de migração preparados; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS e backup/recusa de downgrade disponíveis. Gerenciador de runtimes, login, rollback e unidade systemd de usuário pendentes. |
@@ -761,3 +761,14 @@ aguardam ARQ-033; limpeza de flags e identidade após movimentação/aliases agu
 ARQ-034. A chave atual é por caminho, sem migração inferida de marcas históricas.
 Passaram nove testes de política e seis de workspace, formatação e Clippy de todos
 os alvos no Toolbx Fedora 44 sobre Bazzite, conforme [verificação](verification.md).
+
+`policy::provenance::tool_result` deriva trust/sensitivity da classificação efetiva
+aprovada, da confiança/flag do workspace e de toda a autoridade de rede. A allowlist
+prova cobertura somente por hosts confiáveis exatos, com a comparação do egress;
+wildcards não são cobertos por uma lista finita. Revalidar NAT64 evita usar uma
+autoridade aceita sob outra configuração. Overrides de saída não removem esses
+pisos; permissões de rede removidas por override deixam de contaminar. O helper
+preserva sensibilidade, não herda U do destinatário e recusa escopo global.
+Sete testes de proveniência, 17 da allowlist, suíte completa com 556 testes,
+Clippy/formatação e release passaram no Toolbx. A classificação ainda aguarda o
+dispatcher completo de `tools.call` e não concede aprovação ou execução.

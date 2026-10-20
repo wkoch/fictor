@@ -5,7 +5,7 @@ O **M0.5 tem implementação local concluída, com gates pendentes**, ainda ante
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
-O M0.6 começou com a precedência pura de política e a marcação U de workspace;
+O M0.6 começou com precedência de política, marcação U de workspace e proveniência;
 integração e aprovações aguardam os contratos registrados em ARQ-032–034.
 
 | Release | Escopo obrigatório | Critérios ativos no roadmap | Trabalho principal restante |
@@ -58,9 +58,9 @@ as outras três etapas da tabela. Ainda não há data confiável em dias; as fai
 
 ## Evidência e release
 
-A base tem diagnóstico de **531 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **556 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 531 critérios de produto aceitos.
+Esse resultado não representa 556 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates

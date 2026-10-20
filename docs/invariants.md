@@ -6,8 +6,8 @@ continuam em [README do spec](../spec/README.md#invariantes),
 Esta matriz seleciona testes existentes e delimita o que suas asserções cobrem;
 não substitui o spec nem declara uma invariante inteira comprovada por um teste.
 
-O [diagnóstico registrado](verification.md#ordem-durável-das-promoções--2026-10-20)
-teve **531 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
+O [diagnóstico registrado](verification.md#proveniência-do-m06--2026-10-20)
+teve **556 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
 44.20261012.0 x86-64**, com dados falsos e serviços locais. O código validado está
 identificado naquele registro. **A execução no Fedora COSMIC Atomic do usuário
 e os jobs remotos de CI continuam pendentes.** Esta matriz referencia a execução
@@ -38,7 +38,8 @@ e [missing_duplicate_or_divergent_preparations_refuse_admin_and_recovery_without
 Status e admissão compartilham a seleção; corrupção conserva eventos, propostas e recursos.
 
 O início do M0.6 acrescenta testes dirigidos de precedência da política e marcação
-U de workspaces, incluindo rollback da auditoria. São primitivas sem integração
+U de workspaces, incluindo rollback da auditoria, e proveniência por classificação
+aprovada/autoridade de rede/workspace. São primitivas sem integração
 com `tools.call`; as lacunas funcionais de I3/I8/I11 e ARQ-032–034 permanecem.
 
 O [ADR-039](../spec/11-decisions.md#adr-039--recuperação-lazy-e-bloqueio-durável-de-crash-loop-resolve-arq-023)

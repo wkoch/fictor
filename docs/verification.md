@@ -1,5 +1,32 @@
 # Verificação da implementação
 
+## Proveniência do M0.6 — 2026-10-20
+
+Incremento sobre `49eac18`, no Toolbx `fictor-dev`, Fedora 44 sobre Bazzite
+`44.20261012.0` (Kinoite), Linux x86-64 e SELinux Enforcing. Ferramentas do registro
+do ADR-047 abaixo; sem instalações no host, dados reais ou rede externa nos testes.
+
+| Verificação no Toolbx | Resultado |
+|---|---|
+| Formatação e Clippy de todos os alvos com `-D warnings` | Passaram. |
+| Sete testes de proveniência e 17 da allowlist | Passaram; três casos novos de cobertura de hosts confiáveis. |
+| Suíte completa `cargo test --locked --offline` | **556 testes principais**, 42 alvos incluindo doc-tests; zero falhas, ignorados ou filtros principais. |
+| `cargo build --release --locked --offline` | Passou. |
+
+Contagem pelo último resumo de cada alvo, sem duplicar o helper em subprocesso.
+Logs: `.fictor/logs/m06-{provenance-fmt,provenance-clippy,provenance-tests,trust-coverage-tests,full,release}.log`.
+
+A classificação usa somente manifest/catálogo/overrides aprovados. Permissão de
+rede fora da lista exata de hosts confiáveis força U em todas as tools; wildcard
+não ganha confiança por uma lista finita de filhos. Portas não alteram confiança
+e a comparação conserva a semântica de hosts do egress. A rede é revalidada com o
+NAT64 fornecido. Workspace afeta apenas `output_trust: workspace`; sensibilidade
+é preservada e U prévio do destinatário não reclassifica uma saída trusted.
+Instâncias globais são recusadas até a marca d'água da Fase 1.
+
+Revisão independente não encontrou bloqueadores. São funções sem execução de
+tools; ARQ-032–034 e gates COSMIC/CI continuam pendentes.
+
 ## Primitivas de política e workspace — 2026-10-20
 
 Incremento do M0.6 sobre `7f8a8b4`, no mesmo Toolbx Fedora 44/Bazzite do registro
