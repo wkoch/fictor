@@ -36,7 +36,7 @@ impl BlobStore {
         Self { root, _owner: None }
     }
 
-    pub(super) fn owned(root: PathBuf, owner: std::sync::Arc<crate::ownership::HomeLease>) -> Self {
+    pub(crate) fn owned(root: PathBuf, owner: std::sync::Arc<crate::ownership::HomeLease>) -> Self {
         Self {
             root,
             _owner: Some(owner),

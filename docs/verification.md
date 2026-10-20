@@ -1,5 +1,38 @@
 # Verificação da implementação
 
+## Ordem durável das promoções — 2026-10-20
+
+Implementação do ADR-047 sobre `fe74cb9`, diretamente na `main`. Execução no
+Toolbx `fictor-dev`, Fedora 44 sobre Bazzite `44.20261012.0` (Kinoite), Linux
+x86-64, SELinux Enforcing; mesmas ferramentas do registro de instâncias abaixo.
+Nenhuma instalação no host; dados falsos, endpoints locais e relógios injetados.
+
+| Verificação no Toolbx | Resultado |
+|---|---|
+| Formatação e Clippy de todos os alvos com `-D warnings` | Passaram. |
+| Suíte completa `cargo test --locked --offline` | **531 testes principais**, 42 alvos incluindo doc-tests; zero falhas, ignorados ou filtros principais. |
+| `cargo build --release --locked --offline` | Passou. |
+| Seleção Fedora reproduzida no Toolbx | **444 testes**, 32 alvos; zero falhas/ignorados e os mesmos três filtros. |
+| Workflow YAML | Válido; job Ubuntu completo preservado; `promotion_order` incluído no Fedora sem exclusão nova. |
+
+A contagem principal usa o último resumo de cada alvo e exclui o resumo adicional
+do helper em subprocesso. Logs: `.fictor/logs/adr047-{fmt,clippy,full,release,fedora-selection}.log`.
+
+- Sete testes de integração verificam relógios iguais/regressivos antes e depois
+  de reinício, status e deduplicação da mesma operação, associação ao evento de
+  preparação, ordem legada e intervalos sobrepostos na mesma/outra proposta.
+- Eventos ausentes, duplicados, órfãos, divergentes e terminais fora de ordem
+  recusam status/admissão como `invalid_snapshot` sem efeitos. A recuperação
+  reporta `promotion:recovery_conflict` e conserva recursos e histórico.
+- Unidades verificam referências inline e em blobs, referências extras inválidas,
+  maior ID persistido divergente de seq/tempo civil e overflow antes do commit.
+  Timestamps observados e eventos antigos não são corrigidos nem reescritos.
+- Uma promoção legada sem intenção continua consultável. A CLI `--resume` informa
+  sua conclusão sem novo consentimento/promoção; `promote` recusa `invalid_state`.
+
+O M0.5 está implementado e validado localmente. Este diagnóstico não substitui a
+aceitação no Fedora COSMIC Atomic nem a execução da CI remota, que continuam pendentes.
+
 ## Revisão documental dos ADRs 046/047 — 2026-10-18
 
 ADR-046 prepara cache no harness para M0.8; ADR-047 resolve ARQ-031 pela ordem do

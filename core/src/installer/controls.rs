@@ -354,6 +354,7 @@ fn store_mutation(error: StoreError) -> AdminMutationError {
 }
 fn reconciliation(error: ActivationError) -> AdminMutationError {
     AdminMutationError::none(match error {
+        ActivationError::InvalidSnapshot => MutationReason::InvalidSnapshot,
         ActivationError::Busy => MutationReason::Busy,
         ActivationError::RecoveryConflict => MutationReason::RecoveryRequired,
         ActivationError::Integrity => MutationReason::IntegrityFailed,

@@ -201,6 +201,14 @@ pub async fn install(
                 operation = Some(ack.operation_id);
                 retry_aborted = false;
             }
+            ProposalState::Promoted
+                if resuming && operation.is_none() && status.promotion.is_none() =>
+            {
+                output(&format!(
+                    "Proposta legada já promovida: {id}. Sem operação de promoção registrada.\n"
+                ))?;
+                return Ok(());
+            }
             ProposalState::Promoted => return Err(invalid_response(Some(&id))),
         }
     }

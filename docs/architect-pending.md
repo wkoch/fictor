@@ -14,6 +14,7 @@ Resolução do spec não significa implementação concluída.
 - **Impacto:** a consulta pode informar `aborted` apesar de existir uma nova publicação e deixar de devolver prontamente o seu ID. Mantida a consulta definida pelo spec; nenhuma ordem alternativa, clamp de timestamp ou reescrita do histórico foi implementada sem ADR.
 - **Resolução:** ordem pelo ID monotônico do evento de preparação, com associação e sequência validadas; timestamps civis permanecem inalterados. Status e deduplicação usam a mesma seleção. Legado válido usa eventos já existentes; corrupção falha sem reconstrução heurística.
 - **Entrega:** implementar critérios 74–75 com relógio falso e reinício, incluindo B preparada/confirmada depois de A abortada; não alterar o relógio real. Resolução documental não significa implementação concluída.
+- **Implementação em 2026-10-20:** seleção compartilhada por evento de preparação, validação global do journal e piso do writer pelo maior ID binário persistido. Passaram sete testes de integração de ordenação, testes unitários de blobs/piso/overflow e a suíte completa com 531 testes no Toolbx Fedora 44 sobre Bazzite. Relógio real, eventos antigos e schema preservados; gates COSMIC/CI pendentes.
 
 ## ARQ-030 — Contratos administrativos do M0.9 e durabilidade de rollback
 

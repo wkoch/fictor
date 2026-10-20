@@ -17,6 +17,8 @@ use std::{sync::Arc, time::Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivationError {
+    #[error("promotion:invalid_state")]
+    InvalidState,
     #[error("promotion:publication_incomplete")]
     Publication,
     #[error("promotion:busy")]
@@ -31,6 +33,8 @@ pub enum ActivationError {
     Integrity,
     #[error("promotion:recovery_conflict")]
     RecoveryConflict,
+    #[error("promotion:recovery_conflict")]
+    InvalidSnapshot,
     #[error("promotion:aborted")]
     Aborted,
     #[error("promotion:persistence")]
@@ -43,6 +47,7 @@ pub enum ActivationError {
 impl From<StoreError> for ActivationError {
     fn from(error: StoreError) -> Self {
         match &error {
+            StoreError::Invalid("promotion:invalid_snapshot") => Self::InvalidSnapshot,
             StoreError::Invalid("administrative admission expired") => Self::Busy,
             StoreError::Invalid("promotion:stale_base") => Self::StaleBase,
             StoreError::Invalid("promotion:already_active") => Self::AlreadyActive,
@@ -225,9 +230,15 @@ impl PromotionCoordinator {
             coordinator
                 .reconcile_locked()
                 .await
-                .map_err(|_| ActivationError::RecoveryConflict)?;
+                .map_err(|error| match error {
+                    ActivationError::InvalidSnapshot => error,
+                    _ => ActivationError::RecoveryConflict,
+                })?;
             coordinator.verify_owner()?;
             let proposal = coordinator.store.proposal(proposal_id.clone()).await?;
+            if proposal.state != ProposalState::Approved {
+                return Err(ActivationError::InvalidState);
+            }
             let before = Lock::read_snapshot(coordinator.store.owner().home())
                 .map_err(|_| ActivationError::Io)?;
             let previous = before

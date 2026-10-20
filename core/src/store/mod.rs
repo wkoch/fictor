@@ -37,16 +37,39 @@ use tokio::sync::{mpsc, oneshot};
 use migrations::open_writer;
 type Job = Box<dyn FnOnce(&mut Writer) + Send>;
 
+/// Civil timestamps are observed data; they never determine journal order.
+pub trait StoreClock: Send + Sync {
+    fn now_ms(&self) -> Result<i64, StoreError>;
+}
+struct SystemStoreClock;
+impl StoreClock for SystemStoreClock {
+    fn now_ms(&self) -> Result<i64, StoreError> {
+        now_ms()
+    }
+}
+
 struct Writer {
     db: Connection,
     ids: ulid::Generator,
     last_id: Option<ulid::Ulid>,
     blobs: blobs::BlobStore,
+    clock: Arc<dyn StoreClock>,
 }
 
 impl Writer {
+    fn now_ms(&self) -> Result<i64, StoreError> {
+        self.clock.now_ms()
+    }
+
     fn next_id(&mut self) -> Result<String, StoreError> {
-        let generated = self.ids.generate().map_err(|_| StoreError::IdOverflow)?;
+        let millis = u64::try_from(self.now_ms()?).map_err(|_| StoreError::Clock)?;
+        let datetime = UNIX_EPOCH
+            .checked_add(Duration::from_millis(millis))
+            .ok_or(StoreError::Clock)?;
+        let generated = self
+            .ids
+            .generate_from_datetime(datetime)
+            .map_err(|_| StoreError::IdOverflow)?;
         let id = match self.last_id {
             Some(last) if generated <= last => {
                 last.increment().map_err(|_| StoreError::IdOverflow)?
@@ -119,7 +142,21 @@ impl Store {
     pub async fn open_with_lease(
         owner: Arc<crate::ownership::HomeLease>,
     ) -> Result<Self, StoreError> {
-        Self::open_mode(owner, false).await
+        Self::open_mode(owner, false, Arc::new(SystemStoreClock)).await
+    }
+
+    pub async fn open_with_clock(
+        home: &Path,
+        clock: Arc<dyn StoreClock>,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_lease_and_clock(crate::ownership::HomeLease::acquire(home)?, clock).await
+    }
+
+    pub async fn open_with_lease_and_clock(
+        owner: Arc<crate::ownership::HomeLease>,
+        clock: Arc<dyn StoreClock>,
+    ) -> Result<Self, StoreError> {
+        Self::open_mode(owner, false, clock).await
     }
 
     /// Offline mutations never create a database, run a migration, repair sys,
@@ -127,12 +164,13 @@ impl Store {
     pub async fn open_existing_with_lease(
         owner: Arc<crate::ownership::HomeLease>,
     ) -> Result<Self, StoreError> {
-        Self::open_mode(owner, true).await
+        Self::open_mode(owner, true, Arc::new(SystemStoreClock)).await
     }
 
     async fn open_mode(
         owner: Arc<crate::ownership::HomeLease>,
         existing_only: bool,
+        clock: Arc<dyn StoreClock>,
     ) -> Result<Self, StoreError> {
         let writer_lease = owner.claim_writer()?;
         let home = owner.home();
@@ -156,14 +194,21 @@ impl Store {
                     writer_blobs.cleanup_captures()?;
                 }
                 let last: Option<String> = db
-                    .query_row("SELECT id FROM events ORDER BY seq DESC LIMIT 1", [], |r| {
-                        r.get(0)
-                    })
+                    .query_row(
+                        "SELECT id FROM events ORDER BY id COLLATE BINARY DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 let last_id = last
                     .map(|id| {
-                        id.parse()
-                            .map_err(|_| StoreError::Invalid("ULID persistido inválido"))
+                        let parsed: ulid::Ulid = id
+                            .parse()
+                            .map_err(|_| StoreError::Invalid("ULID persistido inválido"))?;
+                        if parsed.to_string() != id {
+                            return Err(StoreError::Invalid("ULID persistido inválido"));
+                        }
+                        Ok(parsed)
                     })
                     .transpose()?;
                 let mut readers = Vec::new();
@@ -182,6 +227,7 @@ impl Store {
                         ids: ulid::Generator::new(),
                         last_id,
                         blobs: writer_blobs,
+                        clock,
                     },
                     Readers {
                         connections: readers,
@@ -306,6 +352,98 @@ pub fn now_ms() -> Result<i64, StoreError> {
         .map_err(|_| StoreError::Clock)?
         .as_millis();
     i64::try_from(millis).map_err(|_| StoreError::Clock)
+}
+
+#[cfg(test)]
+mod id_floor_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct FixedClock;
+    impl StoreClock for FixedClock {
+        fn now_ms(&self) -> Result<i64, StoreError> {
+            Ok(0)
+        }
+    }
+
+    async fn seed(ids: Vec<String>) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(home.path()).await.unwrap();
+        store.write(move |db| {
+            for (index, id) in ids.into_iter().enumerate() {
+                db.execute("INSERT INTO events(id,session_id,kind,actor,payload,trust,sensitivity,created_at) VALUES (?1,'sys','test.floor','core','{}','trusted','private',?2)", rusqlite::params![id, index as i64])?;
+            }
+            Ok(())
+        }).await.unwrap();
+        store.shutdown().await.unwrap();
+        home
+    }
+
+    #[tokio::test]
+    async fn restart_floor_uses_largest_event_id_even_when_seq_and_civil_time_disagree() {
+        let maximum = ulid::Ulid::from_parts(500_000, 0).to_string();
+        let home = seed(vec![
+            maximum.clone(),
+            ulid::Ulid::from_parts(1, 0).to_string(),
+        ])
+        .await;
+        let store = Store::open_with_clock(home.path(), Arc::new(FixedClock))
+            .await
+            .unwrap();
+        let proposal = store
+            .begin_attempt(NewProposal {
+                source: serde_json::json!({"kind":"local"}),
+                tainted: false,
+            })
+            .await
+            .unwrap();
+        assert!(proposal.id > maximum);
+        let ids = store
+            .write(|db| {
+                Ok(db
+                    .prepare("SELECT id FROM events WHERE kind='ext.proposed'")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0] > proposal.id);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_persisted_id_floor_refuses_receipt_and_audit_before_commit() {
+        let home = seed(vec![ulid::Ulid::from(u128::MAX).to_string()]).await;
+        let store = Store::open_with_clock(home.path(), Arc::new(FixedClock))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .begin_attempt(NewProposal {
+                    source: serde_json::json!({"kind":"local"}),
+                    tainted: false
+                })
+                .await,
+            Err(StoreError::IdOverflow)
+        ));
+        let counts = store
+            .write(|db| {
+                Ok((
+                    db.query_row("SELECT count(*) FROM proposals", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    db.query_row("SELECT count(*) FROM events", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 1));
+        store.shutdown().await.unwrap();
+    }
 }
 
 #[cfg(test)]

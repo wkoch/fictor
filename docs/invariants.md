@@ -1,13 +1,13 @@
 # Rastreabilidade das invariantes
 
-Revisão em 2026-10-18, durante o **M0.5 ainda parcial**. As regras normativas
+Revisão em 2026-10-20, após a **implementação local do M0.5, com gates pendentes**. As regras normativas
 continuam em [README do spec](../spec/README.md#invariantes),
 [arquitetura](../spec/01-architecture.md) e [segurança](../spec/05-security.md).
 Esta matriz seleciona testes existentes e delimita o que suas asserções cobrem;
 não substitui o spec nem declara uma invariante inteira comprovada por um teste.
 
-O [diagnóstico registrado](verification.md#sigkill-boot-e-publicação-compartilhada--2026-10-18)
-teve **520 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
+O [diagnóstico registrado](verification.md#ordem-durável-das-promoções--2026-10-20)
+teve **531 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
 44.20261012.0 x86-64**, com dados falsos e serviços locais. O código validado está
 identificado naquele registro. **A execução no Fedora COSMIC Atomic do usuário
 e os jobs remotos de CI continuam pendentes.** Esta matriz referencia a execução
@@ -31,6 +31,11 @@ de sucesso porque uma rota indisponível recusa a operação.
 | **I9 — core sem formatos de API de modelo ou conceitos do harness** | **Parcial.** Proxy encaminha corpos opacos; configuração de extensão é uma tabela opaca selecionada pelo identificador da extensão. | [streams_opaque_bytes_and_injects_only_core_credentials](../core/tests/models.rs#L174); [extension_config_reload_is_bound_to_the_authenticated_extension_table](../core/tests/bootstrap.rs#L476). | Os testes demonstram transparência nesses caminhos, não ausência universal de acoplamento semântico. Adapters e montagem de contexto ficam para a extensão harness em M0.8. Fan-out de hooks com pontos opacos ainda é Fase 1; revisão arquitetural continua necessária. |
 | **I10 — mudanças do core somente pelos motivos autorizados** | **Pendente como evidência automatizada.** É uma regra de governança da base de confiança, aplicada por revisão do escopo e do diff conforme [AGENTS.md](../AGENTS.md) e roadmap. | Nenhum teste funcional existente comprova a motivação de uma mudança no core. Não se atribui um teste de sandbox ou de protocolo a essa conclusão. | Atestar cada mudança exige revisão humana. A lacuna permanece explícita para o [gate 3 de release](../spec/10-roadmap.md#gate-de-cada-release); esta matriz não o declara concluído. |
 | **I11 — entradas de sessão mediadas e flags U/P propagadas** | **Parcial.** Montagens implícitas do HOME são negadas a harness e clientes `tools`; eventos respeitam linhagens; duas instâncias reais da mesma extensão mantêm KV e `${ext_data}` separados por sessão; egress contabiliza U antes de entregar bytes externos. | [implicit_home_files_are_unreadable_to_harness_and_tools_clients](../core/tests/supervisor.rs#L1880); [config_regular_controls_reload_only_the_authenticated_table_and_refuse_links](../core/tests/kernel_read_limits.rs#L374); [same_extension_sessions_keep_kernel_kv_and_data_private_after_the_other_session_writes](../core/tests/supervisor.rs#L2175); [forwards_http_without_proxy_credentials_or_hop_headers_and_taints_before_delivery](../core/tests/proxy.rs#L158). | O cenário do critério 16 foi exercitado no Toolbx/Bazzite; falta o fluxo completo `tools.call` com classificação e flags (M0.6), além de harness e aceitação no alvo de release. Processos globais estão recusados na Fase 0; marca d'água e hooks são Fase 1. A leitura por descritor, UID/modo/nlink, snapshots e erros seguros dos controles do [ADR-042](../spec/11-decisions.md#adr-042--origem-protegida-dos-arquivos-de-controle-resolve-arq-026) já tem testes; a prova de binds/submounts e a atestação anterior ao workload passaram no Toolbx. O plano único e a classificação fechada de origens do ADR-044 (ARQ-028) têm matrizes de testes; a proteção do bootstrap antes de executar init tem testes dirigidos; o gate dos critérios 61–65 no alvo de release permanece pendente. |
+
+O ADR-047 acrescenta evidência de I5/I7/I8 com relógio falso e reinício:
+[regressing_and_equal_civil_times_preserve_latest_status_and_deduplication_after_restart](../core/tests/promotion_order.rs#L400)
+e [missing_duplicate_or_divergent_preparations_refuse_admin_and_recovery_without_cleanup](../core/tests/promotion_order.rs#L587).
+Status e admissão compartilham a seleção; corrupção conserva eventos, propostas e recursos.
 
 O [ADR-039](../spec/11-decisions.md#adr-039--recuperação-lazy-e-bloqueio-durável-de-crash-loop-resolve-arq-023)
 tem backoff, bloqueio e reset humano interno testados com relógio controlado e

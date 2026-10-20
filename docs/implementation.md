@@ -1,6 +1,6 @@
 # Andamento da implementação
 
-Atualizado em 2026-10-18. Fase ativa: **0**. Plataforma única: **Linux x86-64**.
+Atualizado em 2026-10-20. Fase ativa: **0**. Plataforma única: **Linux x86-64**.
 Alvo de validação: **Fedora COSMIC Atomic**. Prioridade: **v0.1 autossuficiente**
 ([ADRs 030/031](../spec/11-decisions.md), [roadmap](../spec/10-roadmap.md)).
 
@@ -22,12 +22,14 @@ o estado durável de crash loop e a listagem administrativa estão implementados
 A integração de boot, a barreira durável/recuperação de instâncias e a proteção do
 bootstrap antes do init têm implementação e testes dirigidos no Toolbx. Os handlers
 administrativos do ADR-045 e a CLI de instalação local também passaram nos testes
-dirigidos. A validação integrada passou com 520 testes principais no Toolbx, além de Clippy,
+dirigidos. A validação integrada passou com 531 testes principais no Toolbx, além de Clippy,
 formatação e build release. A promoção já está ligada à drenagem de instâncias;
 há provas de SIGKILL real e dois boots idempotentes para instâncias e promoções.
-A ARQ-031 pede ao Arquiteto a regra de ordenação das
-tentativas de promoção quando o relógio civil recua; essa parte conserva o contrato
-vigente até a decisão.
+O ADR-047 resolveu a ARQ-031 e está implementado: status, deduplicação e recuperação
+usam o ID do evento de preparação validado, inclusive com relógio regressivo.
+Histórico inconsistente falha sem efeitos; timestamps e eventos antigos são preservados.
+O M0.5 tem a implementação local concluída e o trabalho de código segue para M0.6,
+na mesma Fase 0; os gates de release no COSMIC Atomic e na CI continuam pendentes.
 Os ADRs 043/044 estão implementados parcialmente; o SDK ainda pertence ao M0.8.
 Os registros anteriores abaixo descrevem os
 snapshots em que foram produzidos, sem substituir este estado atual.
@@ -38,7 +40,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.2 | Base implementada | Writer único SQLite, pool somente leitura, eventos ULID, flags cumulativas, FTS5, forks/linhagens, blobs SHA-256 e KV. |
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
-| M0.5 | Fluxos locais integrados; ARQ-031 e gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. SIGKILL e boot real testados. Restam ARQ-031 e aceitação no alvo/CI. |
+| M0.5 | Implementação local concluída; gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. SIGKILL, boot real e ordenação durável do ADR-047 testados. Falta aceitação no alvo/CI. |
 | M0.6 | Não implementado | Política, aprovações e grants. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |

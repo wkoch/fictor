@@ -2,14 +2,14 @@
 //! Filesystem durability and the shared installer gate are the coordinator's
 //! responsibility. These commands are trusted core APIs, never wire inputs.
 use super::{
-    Event, Proposal, ProposalState, Sensitivity, Store, StoreError, Trust, events, now_ms,
-    proposals, sessions,
+    Event, Proposal, ProposalState, Sensitivity, Store, StoreError, Trust, blobs::BlobStore,
+    events, proposals, sessions,
 };
 use crate::installer::lock::{Lock, LockedVersion, approval_at_ms};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fmt, time::Instant};
+use std::{collections::BTreeMap, fmt, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromotionState {
@@ -94,12 +94,12 @@ impl Store {
             proposals::check_admission_deadline(deadline)?;
             let operation_id = writer.next_id()?;
             let event_id = writer.next_id()?;
-            let timestamp = now_ms()?;
+            let timestamp = writer.now_ms()?;
             let tx = writer.db.transaction()?;
-            if read_promotion_intents(&tx)?.is_some() { return Err(conflict()); }
+            if read_promotion_intents(&tx, &writer.blobs)?.is_some() { return Err(conflict()); }
             let proposal = proposals::get(&tx, &input.proposal_id)?;
             if proposal.state != ProposalState::Approved { return Err(integrity()); }
-            let (ext_id, key) = validate_snapshots(&tx, &proposal, input.before_lock.as_deref(), &input.after_lock)?;
+            let (ext_id, key) = validate_snapshots(&tx, &writer.blobs, &proposal, input.before_lock.as_deref(), &input.after_lock)?;
             let intent = PromotionIntent {
                 operation_id, proposal_id: input.proposal_id, ext_id, key,
                 before_hash: input.before_lock.as_deref().map(hash), before_lock: input.before_lock,
@@ -116,13 +116,27 @@ impl Store {
     }
 
     pub async fn pending_promotion(&self) -> Result<Option<PromotionIntent>, StoreError> {
-        self.read(read_promotion_intents).await
+        let blobs = self.blobs.clone();
+        self.read(move |db| {
+            let tx = db.unchecked_transaction()?;
+            let pending = read_promotion_intents(&tx, &blobs)?;
+            tx.commit()?;
+            Ok(pending)
+        })
+        .await
     }
     pub async fn promotion_intent(
         &self,
         operation_id: String,
     ) -> Result<PromotionIntent, StoreError> {
-        self.read(move |db| load(db, &operation_id)).await
+        let blobs = self.blobs.clone();
+        self.read(move |db| {
+            let tx = db.unchecked_transaction()?;
+            let intent = load(&tx, &blobs, &operation_id)?;
+            tx.commit()?;
+            Ok(intent)
+        })
+        .await
     }
 
     /// Only after the coordinator proved after_lock and the published bundle
@@ -149,15 +163,16 @@ impl Store {
     ) -> Result<PromotionIntent, StoreError> {
         self.with_writer(move |writer| {
             let event_id = writer.next_id()?;
-            let timestamp = now_ms()?;
+            let timestamp = writer.now_ms()?;
             let tx = writer.db.transaction()?;
-            let mut intent = load(&tx, &operation_id)?;
+            let journal = read_journal(&tx, &writer.blobs)?;
+            let mut intent = load_row(&tx, &writer.blobs, &operation_id)?;
             let target = if reason.is_some() { PromotionState::Aborted } else { PromotionState::Committed };
             if intent.state != PromotionState::Prepared {
                 if intent.state == target { tx.commit()?; return Ok(intent); }
                 return Err(conflict());
             }
-            if read_promotion_intents(&tx)?.as_ref().map(|pending| pending.operation_id.as_str()) != Some(operation_id.as_str()) {
+            if journal.pending.as_deref() != Some(operation_id.as_str()) {
                 return Err(conflict());
             }
             if target == PromotionState::Committed
@@ -187,31 +202,265 @@ fn hash(text: &str) -> String {
     format!("sha256:{hex}")
 }
 
-/// Streaming validation for the read-only administrative snapshot as well as
-/// recovery. Validate historical rows too, retaining only one row's snapshots.
+/// ADR-047: both recovery and administrative selection validate the complete
+/// journal in their caller's SQLite snapshot. Only event IDs order attempts;
+/// private lock snapshots are decoded one at a time, never retained in this map.
 pub(crate) fn read_promotion_intents(
     db: &Connection,
+    blobs: &BlobStore,
 ) -> Result<Option<PromotionIntent>, StoreError> {
-    let mut statement = db.prepare("SELECT operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at FROM promotion_intents ORDER BY created_at,operation_id")?;
+    let journal = read_journal(db, blobs)?;
+    journal
+        .pending
+        .map(|id| load_row(db, blobs, &id))
+        .transpose()
+}
+
+pub(super) fn latest_promotion(
+    db: &Connection,
+    blobs: &BlobStore,
+    proposal_id: &str,
+) -> Result<Option<PromotionIntent>, StoreError> {
+    let journal = read_journal(db, blobs)?;
+    journal
+        .latest
+        .get(proposal_id)
+        .map(|id| load_row(db, blobs, id))
+        .transpose()
+}
+
+pub(super) fn load(
+    db: &Connection,
+    blobs: &BlobStore,
+    id: &str,
+) -> Result<PromotionIntent, StoreError> {
+    read_journal(db, blobs)?;
+    load_row(db, blobs, id)
+}
+
+struct JournalSelection {
+    pending: Option<String>,
+    latest: BTreeMap<String, String>,
+}
+
+struct AttemptEvidence {
+    proposal_id: String,
+    state: PromotionState,
+    ext_id: String,
+    key: String,
+    before_hash: Option<String>,
+    after_hash: String,
+    created_at: i64,
+    updated_at: i64,
+    prepared: Option<String>,
+    terminal: Option<String>,
+}
+
+fn read_journal(db: &Connection, blobs: &BlobStore) -> Result<JournalSelection, StoreError> {
+    read_journal_inner(db, blobs).map_err(|_| StoreError::Invalid("promotion:invalid_snapshot"))
+}
+
+fn read_journal_inner(db: &Connection, blobs: &BlobStore) -> Result<JournalSelection, StoreError> {
+    let mut attempts = BTreeMap::new();
+    let mut statement = db.prepare("SELECT operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at FROM promotion_intents")?;
     let mut rows = statement.query([])?;
-    let mut pending = None;
     while let Some(row) = rows.next()? {
-        let intent = decode(db, row)?;
-        if intent.state == PromotionState::Prepared {
-            if pending.is_some() {
+        let intent = decode(db, blobs, row)?;
+        attempts.insert(
+            intent.operation_id,
+            AttemptEvidence {
+                proposal_id: intent.proposal_id,
+                state: intent.state,
+                ext_id: intent.ext_id,
+                key: intent.key,
+                before_hash: intent.before_hash,
+                after_hash: intent.after_hash,
+                created_at: intent.created_at,
+                updated_at: intent.updated_at,
+                prepared: None,
+                terminal: None,
+            },
+        );
+    }
+    // Do not filter with json_extract: it hides blob-backed payloads and orphan
+    // events. Every journal event must name one known operation exactly once.
+    let mut statement = db.prepare("SELECT id,kind,payload,blob_refs,created_at,actor,session_id,source,trust,sensitivity FROM events WHERE kind IN ('ext.promotion_prepared','ext.promoted','ext.promotion_aborted') ORDER BY id COLLATE BINARY")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let event_kind: String = row.get(1)?;
+        let value = audit_payload(blobs, &row.get::<_, String>(2)?, &row.get::<_, String>(3)?)?;
+        if !value.is_object() {
+            return Err(conflict());
+        }
+        if event_kind == kind(PromotionState::Committed) && value.get("operation_id").is_none() {
+            // ADR-036 predates the journal: a legacy promoted event does not
+            // manufacture an operation or become an orphan of a newer one.
+            continue;
+        }
+        let operation = value
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(conflict)?;
+        let attempt = attempts.get_mut(operation).ok_or_else(conflict)?;
+        if !canonical_id(&id)
+            || row.get::<_, String>(5)? != "core"
+            || row.get::<_, String>(6)? != "sys"
+            || row.get::<_, String>(7)? != "core"
+            || row.get::<_, String>(8)? != "trusted"
+            || row.get::<_, String>(9)? != "public"
+        {
+            return Err(conflict());
+        }
+        let timestamp: i64 = row.get(4)?;
+        let mut expected = json!({"operation_id":operation,"proposal_id":attempt.proposal_id,"ext_id":attempt.ext_id,"key":attempt.key});
+        if event_kind == kind(PromotionState::Prepared) {
+            expected["before_hash"] = json!(attempt.before_hash);
+            expected["after_hash"] = json!(attempt.after_hash);
+            if attempt.prepared.replace(id).is_some()
+                || timestamp != attempt.created_at
+                || value != expected
+            {
                 return Err(conflict());
             }
-            pending = Some(intent);
+        } else {
+            if attempt.state == PromotionState::Prepared || event_kind != kind(attempt.state) {
+                return Err(conflict());
+            }
+            if attempt.state == PromotionState::Aborted {
+                let reason = value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .ok_or_else(conflict)?;
+                if ![
+                    "promotion:interrupted",
+                    "promotion:integrity",
+                    "promotion:io",
+                ]
+                .contains(&reason)
+                {
+                    return Err(conflict());
+                }
+                expected["reason"] = json!(reason);
+            }
+            if attempt.terminal.replace(id).is_some()
+                || timestamp != attempt.updated_at
+                || value != expected
+            {
+                return Err(conflict());
+            }
         }
     }
-    Ok(pending)
+    // Canonical ULIDs have the same byte and numeric order. Build order from
+    // the preparation event only, independently of operation IDs and timestamps.
+    let mut ordered = Vec::with_capacity(attempts.len());
+    for (operation, attempt) in &attempts {
+        let prepared = attempt.prepared.as_ref().ok_or_else(conflict)?;
+        if attempt.state == PromotionState::Prepared {
+            if attempt.terminal.is_some() {
+                return Err(conflict());
+            }
+        } else if attempt
+            .terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal <= prepared)
+        {
+            return Err(conflict());
+        }
+        ordered.push((prepared, operation, attempt));
+    }
+    ordered.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    // The global prepared exclusion applies throughout history, including
+    // attempts on different proposals. A later preparation cannot coexist
+    // with an earlier attempt whose terminal event has not happened yet.
+    for pair in ordered.windows(2) {
+        if pair[0]
+            .2
+            .terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal >= pair[1].0)
+        {
+            return Err(conflict());
+        }
+    }
+    let mut pending = None;
+    let mut latest: BTreeMap<String, String> = BTreeMap::new();
+    for (prepared, operation, attempt) in ordered {
+        if let Some(previous) = latest.get(&attempt.proposal_id) {
+            let previous = attempts.get(previous).ok_or_else(conflict)?;
+            if previous.state != PromotionState::Aborted
+                || previous
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|terminal| terminal >= prepared)
+            {
+                return Err(conflict());
+            }
+        }
+        if attempt.state == PromotionState::Prepared && pending.replace(operation.clone()).is_some()
+        {
+            return Err(conflict());
+        }
+        latest.insert(attempt.proposal_id.clone(), operation.clone());
+    }
+    for (proposal_id, operation) in &latest {
+        let proposal = proposals::get(db, proposal_id)?;
+        let attempt = attempts.get(operation).ok_or_else(conflict)?;
+        let required = if attempt.state == PromotionState::Committed {
+            ProposalState::Promoted
+        } else {
+            ProposalState::Approved
+        };
+        if proposal.state != required {
+            return Err(conflict());
+        }
+    }
+    Ok(JournalSelection { pending, latest })
 }
-pub(super) fn load(db: &Connection, id: &str) -> Result<PromotionIntent, StoreError> {
+
+fn canonical_id(id: &str) -> bool {
+    ulid::Ulid::from_string(id).is_ok_and(|parsed| parsed.to_string() == id)
+}
+
+fn audit_payload(blobs: &BlobStore, text: &str, references: &str) -> Result<Value, StoreError> {
+    let value = crate::strict_json::parse(text.as_bytes()).map_err(|_| conflict())?;
+    let references: Vec<String> = serde_json::from_value(
+        crate::strict_json::parse(references.as_bytes()).map_err(|_| conflict())?,
+    )
+    .map_err(|_| conflict())?;
+    // References are part of every event, including inline payloads and extra
+    // references accompanying a payload blob. Validate all of them before any
+    // legacy exemption or operation lookup can accept this evidence.
+    for reference in &references {
+        blobs.verify(reference).map_err(|_| conflict())?;
+    }
+    let Some(reference) = value.get("$blob") else {
+        return Ok(value);
+    };
+    let hash = reference.as_str().ok_or_else(conflict)?;
+    if value.as_object().is_none_or(|object| object.len() != 1)
+        || !references.iter().any(|reference| reference == hash)
+    {
+        return Err(conflict());
+    }
+    let bytes = blobs.get(hash).map_err(|_| conflict())?;
+    let value = crate::strict_json::parse(&bytes).map_err(|_| conflict())?;
+    if value.get("$blob").is_some() {
+        return Err(conflict());
+    }
+    Ok(value)
+}
+
+fn load_row(db: &Connection, blobs: &BlobStore, id: &str) -> Result<PromotionIntent, StoreError> {
     let mut statement = db.prepare("SELECT operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at FROM promotion_intents WHERE operation_id=?1")?;
     let mut rows = statement.query([id])?;
-    decode(db, rows.next()?.ok_or(StoreError::NotFound)?)
+    decode(db, blobs, rows.next()?.ok_or(StoreError::NotFound)?)
 }
-fn decode(db: &Connection, row: &rusqlite::Row<'_>) -> Result<PromotionIntent, StoreError> {
+fn decode(
+    db: &Connection,
+    blobs: &BlobStore,
+    row: &rusqlite::Row<'_>,
+) -> Result<PromotionIntent, StoreError> {
     let operation_id: String = row.get(0)?;
     let proposal_id: String = row.get(1)?;
     let before_lock: Option<String> = row.get(2)?;
@@ -248,8 +497,9 @@ fn decode(db: &Connection, row: &rusqlite::Row<'_>) -> Result<PromotionIntent, S
     } {
         return Err(conflict());
     }
-    let (ext_id, key) = validate_snapshots(db, &proposal, before_lock.as_deref(), &after_lock)
-        .map_err(|_| conflict())?;
+    let (ext_id, key) =
+        validate_snapshots(db, blobs, &proposal, before_lock.as_deref(), &after_lock)
+            .map_err(|_| conflict())?;
     let intent = PromotionIntent {
         operation_id,
         proposal_id,
@@ -263,12 +513,12 @@ fn decode(db: &Connection, row: &rusqlite::Row<'_>) -> Result<PromotionIntent, S
         created_at,
         updated_at,
     };
-    validate_audit(db, &intent)?;
     Ok(intent)
 }
 
 fn validate_snapshots(
     db: &Connection,
+    blobs: &BlobStore,
     proposal: &Proposal,
     before: Option<&str>,
     after: &str,
@@ -284,7 +534,7 @@ fn validate_snapshots(
         return Err(integrity());
     }
     let approved_at =
-        approval_at_ms(approval_timestamp(db, &proposal.id)?).map_err(|_| integrity())?;
+        approval_at_ms(approval_timestamp(db, blobs, &proposal.id)?).map_err(|_| integrity())?;
     let ext_id = proposal.ext_id.as_ref().ok_or_else(integrity)?;
     let version = proposal.version.as_ref().ok_or_else(integrity)?;
     let bundle_hash = proposal.hash.as_ref().ok_or_else(integrity)?;
@@ -370,14 +620,23 @@ fn validate_snapshots(
     }
     Ok((ext_id.clone(), key))
 }
-fn approval_timestamp(db: &Connection, proposal_id: &str) -> Result<i64, StoreError> {
-    let mut statement = db.prepare("SELECT created_at FROM events WHERE kind='ext.approved' AND actor='user' AND session_id='sys' AND json_extract(payload,'$.proposal_id')=?1")?;
-    let mut rows = statement.query([proposal_id])?;
-    let timestamp = rows.next()?.ok_or_else(integrity)?.get(0)?;
-    if rows.next()?.is_some() {
-        return Err(integrity());
+fn approval_timestamp(
+    db: &Connection,
+    blobs: &BlobStore,
+    proposal_id: &str,
+) -> Result<i64, StoreError> {
+    let mut statement = db.prepare("SELECT payload,blob_refs,created_at FROM events WHERE kind='ext.approved' AND actor='user' AND session_id='sys'")?;
+    let mut rows = statement.query([])?;
+    let mut timestamp = None;
+    while let Some(row) = rows.next()? {
+        let value = audit_payload(blobs, &row.get::<_, String>(0)?, &row.get::<_, String>(1)?)?;
+        if value.get("proposal_id").and_then(Value::as_str) == Some(proposal_id)
+            && timestamp.replace(row.get(2)?).is_some()
+        {
+            return Err(integrity());
+        }
     }
-    Ok(timestamp)
+    timestamp.ok_or_else(integrity)
 }
 fn payload(
     intent: &PromotionIntent,
@@ -436,58 +695,6 @@ fn audit(
     )?;
     Ok(())
 }
-fn validate_audit(db: &Connection, intent: &PromotionIntent) -> Result<(), StoreError> {
-    let mut statement = db.prepare("SELECT kind,payload,created_at,actor,session_id,source,trust,sensitivity FROM events WHERE json_extract(payload,'$.operation_id')=?1 AND kind IN ('ext.promotion_prepared','ext.promoted','ext.promotion_aborted')")?;
-    let mut rows = statement.query([&intent.operation_id])?;
-    let mut prepared = false;
-    let mut terminal = false;
-    while let Some(row) = rows.next()? {
-        let event_kind: String = row.get(0)?;
-        let text: String = row.get(1)?;
-        let value = crate::strict_json::parse(text.as_bytes()).map_err(|_| conflict())?;
-        let timestamp: i64 = row.get(2)?;
-        if row.get::<_, String>(3)? != "core"
-            || row.get::<_, String>(4)? != "sys"
-            || row.get::<_, String>(5)? != "core"
-            || row.get::<_, String>(6)? != "trusted"
-            || row.get::<_, String>(7)? != "public"
-        {
-            return Err(conflict());
-        }
-        if event_kind == kind(PromotionState::Prepared) {
-            if prepared
-                || value != payload(intent, PromotionState::Prepared, None)
-                || timestamp != intent.created_at
-            {
-                return Err(conflict());
-            }
-            prepared = true;
-        } else {
-            let reason = match value.get("reason").and_then(Value::as_str) {
-                Some("promotion:interrupted") => Some(PromotionAbortReason::Interrupted),
-                Some("promotion:integrity") => Some(PromotionAbortReason::Integrity),
-                Some("promotion:io") => Some(PromotionAbortReason::Io),
-                None => None,
-                _ => return Err(conflict()),
-            };
-            if terminal
-                || intent.state == PromotionState::Prepared
-                || event_kind != kind(intent.state)
-                || (intent.state == PromotionState::Aborted) != reason.is_some()
-                || value != payload(intent, intent.state, reason)
-                || timestamp != intent.updated_at
-            {
-                return Err(conflict());
-            }
-            terminal = true;
-        }
-    }
-    if !prepared || terminal != (intent.state != PromotionState::Prepared) {
-        return Err(conflict());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod admission_tests {
     use super::*;
@@ -499,6 +706,44 @@ mod admission_tests {
         },
     };
     use std::{future::Future, task::Poll, time::Duration};
+
+    #[test]
+    fn audit_payload_validates_inline_and_extra_blob_references() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(root.path().to_owned());
+        let value = json!({"operation_id":"fixture"});
+        let reference = blobs.put(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let extra = blobs.put(b"extra audited content").unwrap();
+        let missing = format!("sha256:{}", "0".repeat(64));
+        let inline = value.to_string();
+        assert_eq!(audit_payload(&blobs, &inline, "[]").unwrap(), value);
+        assert_eq!(
+            audit_payload(&blobs, &inline, &json!([extra]).to_string()).unwrap(),
+            value
+        );
+        for references in [
+            json!({"unexpected":"object"}),
+            json!([null]),
+            json!(["invalid-hash"]),
+            json!([missing]),
+        ] {
+            assert!(audit_payload(&blobs, &inline, &references.to_string()).is_err());
+        }
+        let wrapped = json!({"$blob":reference}).to_string();
+        assert_eq!(
+            audit_payload(&blobs, &wrapped, &json!([reference, extra]).to_string()).unwrap(),
+            value
+        );
+        assert!(
+            audit_payload(
+                &blobs,
+                &wrapped,
+                &json!([reference, "invalid-hash"]).to_string()
+            )
+            .is_err()
+        );
+        assert!(audit_payload(&blobs, &wrapped, &json!([reference, missing]).to_string()).is_err());
+    }
 
     async fn candidate(store: &Store) -> NewPromotionIntent {
         let lock = Lock::default();
@@ -608,6 +853,113 @@ mod admission_tests {
             before_lock: Some(lock.encode_snapshot().unwrap()),
             after_lock: after.encode_snapshot().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn blob_backed_preparation_and_legacy_events_share_global_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        crate::home::prepare(&home).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let input = candidate(&store).await;
+        let intent = store.with_writer(move |writer| {
+            let operation_id = writer.next_id()?;
+            let event_id = writer.next_id()?;
+            let timestamp = writer.now_ms()?;
+            let tx = writer.db.transaction()?;
+            let proposal = proposals::get(&tx, &input.proposal_id)?;
+            let (ext_id, key) = validate_snapshots(&tx, &writer.blobs, &proposal, input.before_lock.as_deref(), &input.after_lock)?;
+            let intent = PromotionIntent {
+                operation_id, proposal_id: input.proposal_id, ext_id, key,
+                before_hash: input.before_lock.as_deref().map(hash), before_lock: input.before_lock,
+                after_hash: hash(&input.after_lock), after_lock: input.after_lock,
+                state: PromotionState::Prepared, created_at: timestamp, updated_at: timestamp,
+            };
+            tx.execute("INSERT INTO promotion_intents(operation_id,proposal_id,before_lock,before_hash,after_lock,after_hash,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'prepared',?7,?7)",
+                params![intent.operation_id, intent.proposal_id, intent.before_lock, intent.before_hash, intent.after_lock, intent.after_hash, timestamp])?;
+            let reference = writer.blobs.put(&serde_json::to_vec(&payload(&intent, PromotionState::Prepared, None))?)?;
+            let session = sessions::get(&tx, "sys")?;
+            let event = Event {
+                id: event_id, parent_id: session.head_id, session_id: "sys".into(),
+                kind: kind(PromotionState::Prepared).into(), actor: "core".into(),
+                payload: json!({"$blob":reference}), blob_refs: vec![reference],
+                trust: Trust::Trusted, sensitivity: Sensitivity::Public, source: "core".into(),
+                flags: session.flags, text: None, created_at: timestamp,
+            };
+            events::insert(&tx, &event)?;
+            tx.execute("UPDATE sessions SET head_id=?1,updated_at=?2 WHERE id='sys'", params![event.id, timestamp])?;
+            tx.commit()?;
+            Ok(intent)
+        }).await.unwrap();
+        assert_eq!(
+            store
+                .pending_promotion()
+                .await
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            intent.operation_id
+        );
+        store
+            .commit_promotion(intent.operation_id.clone())
+            .await
+            .unwrap();
+        // Older promotion events have no journal operation and remain valid.
+        store
+            .append(super::super::AppendEvent {
+                session_id: "sys".into(),
+                parent_id: None,
+                kind: "ext.promoted".into(),
+                actor: "core".into(),
+                payload: json!({"proposal_id":"legacy","ext_id":"legacy"}),
+                blob_refs: vec![],
+                provenance: super::super::Provenance::core(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .installation_snapshot(intent.proposal_id.clone())
+                .await
+                .unwrap()
+                .promotion
+                .unwrap()
+                .operation_id,
+            intent.operation_id
+        );
+        // An orphan hidden behind a verified blob must not escape the global
+        // scan or be mistaken for an absent attempt on another proposal.
+        let reference = store
+            .put_blob(
+                serde_json::to_vec(&json!({
+                "operation_id":ulid::Ulid::generate().to_string(), "proposal_id":intent.proposal_id,
+                        "ext_id":intent.ext_id, "key":intent.key,
+                        "before_hash":intent.before_hash, "after_hash":intent.after_hash,
+                    }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .append(super::super::AppendEvent {
+                session_id: "sys".into(),
+                parent_id: None,
+                kind: "ext.promotion_prepared".into(),
+                actor: "core".into(),
+                payload: json!({"$blob":reference}),
+                blob_refs: vec![reference],
+                provenance: super::super::Provenance::core(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.pending_promotion().await,
+            Err(StoreError::Invalid("promotion:invalid_snapshot"))
+        ));
+        assert!(matches!(
+            store.promotion_intent(intent.operation_id).await,
+            Err(StoreError::Invalid("promotion:invalid_snapshot"))
+        ));
     }
 
     #[tokio::test]

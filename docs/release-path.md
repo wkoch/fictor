@@ -1,14 +1,14 @@
 # Caminho até a v1.0
 
-Atualizado em 2026-10-18, após as entregas dos contratos do M0.5 na `main`
-e a aplicação parcial dos ADRs 043/044. O projeto está no **M0.5 parcial**, ainda antes do agente funcional
+Atualizado em 2026-10-20, após a implementação e validação local do ADR-047 na `main`.
+O **M0.5 tem implementação local concluída, com gates pendentes**, ainda antes do agente funcional
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
 
 | Release | Escopo obrigatório | Critérios ativos no roadmap | Trabalho principal restante |
 |---|---|---:|---|
-| v0.1 | Fase 0 completa | 81 | Fechar M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
+| v0.1 | Fase 0 completa | 81 | Gates do M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
 | v0.2 | Fase 1 completa | 10 | Autoextensão, promoção controlada, hooks, surfaces, hot swap e estado global mediado. |
 | v0.3 | Fase 2 completa | 4 | Evals, checkpoints/rewind, subagentes, árvore de sessões e demais entregas da fase. |
 | v1.0 | Núcleo da Fase 3 | 5 | Origens de terceiros, normalização, MCP remoto, auditoria, atualizações acompanhadas e Landlock/seccomp. |
@@ -33,13 +33,13 @@ A base de confiança está avançada e o M0.5 tem fluxos locais integrados. Até
 ainda faltam política/aprovações, servidor/shell, SDK/harness/tools, runtimes,
 atualizações/rollback e aceitação de autossuficiência. Até a v1.0 somam-se
 autoextensão/surfaces/hooks, evals/checkpoints/subagentes e terceiros/auditoria/
-Landlock/seccomp. A contagem de 89 critérios contém itens de tamanhos diferentes;
+Landlock/seccomp. A contagem de 100 critérios contém itens de tamanhos diferentes;
 essas faixas são julgamento de engenharia. Uma data exige medir a cadência nas
 próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
 
 ## Próxima sequência
 
-1. Resolver ARQ-031 e concluir a aceitação do M0.5. SIGKILL e boot real já têm provas para instâncias e promoção. Os fluxos dos
+1. Concluir os gates de aceitação do M0.5. ARQ-031 está resolvida e o ADR-047 implementado/testado com relógio falso e reinício. SIGKILL e boot real já têm provas para instâncias e promoção. Os fluxos dos
    [ADRs 036–042](../spec/11-decisions.md) estão integrados: promoção, aprovação,
    journal/barreira de instâncias, crash loop, listagem, controles protegidos e
    autoridades exatas. ARQ-020–026 estão resolvidas; falta concluir sua aceitação.
@@ -47,7 +47,7 @@ próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
    (obrigações futuras do SDK; transporte do Kernel implementado) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
    (bootstrap protegido antes do init, com bases/bibliotecas na TCB instalada).
    ARQ-027/028 resolvidas; o gate dos critérios 57–65 continua pendente.
-3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Resolver a ARQ-031 sobre ordem de promoções com relógio regressivo; implementar o contrato da ARQ-030 (ADR-048) somente no M0.9. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
+3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Implementar o contrato da ARQ-030 (ADR-048) somente no M0.9. O próximo marco de código é M0.6. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
 
@@ -56,9 +56,9 @@ as outras três etapas da tabela. Ainda não há data confiável em dias; as fai
 
 ## Evidência e release
 
-A base tem diagnóstico de **520 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **531 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 520 critérios de produto aceitos.
+Esse resultado não representa 531 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates

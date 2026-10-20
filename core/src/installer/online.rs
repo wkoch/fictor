@@ -334,7 +334,7 @@ impl InstallService {
         self.coordinator
             .reconcile_locked()
             .await
-            .map_err(|_| Error::none(Reason::RecoveryRequired))?;
+            .map_err(reconciliation_error)?;
         drop(section);
         self.checker
             .prepare_local_before(Path::new(path), deadline)
@@ -526,7 +526,7 @@ impl InstallService {
         self.coordinator
             .reconcile_locked()
             .await
-            .map_err(|_| Error::none(Reason::RecoveryRequired))?;
+            .map_err(reconciliation_error)?;
         let snapshot = self
             .store
             .installation_snapshot(id.clone())
@@ -775,6 +775,7 @@ fn failure_reason(proposal: &Proposal) -> Option<String> {
 }
 fn read_error(error: StoreError) -> Error {
     match error {
+        StoreError::Invalid("promotion:invalid_snapshot") => Error::none(Reason::InvalidSnapshot),
         StoreError::NotFound => Error::none(Reason::NotFound),
         StoreError::Invalid("invalid local installation state") => {
             Error::none(Reason::InvalidState)
@@ -784,6 +785,7 @@ fn read_error(error: StoreError) -> Error {
 }
 fn write_error(error: StoreError) -> Error {
     match error {
+        StoreError::Invalid("promotion:invalid_snapshot") => Error::none(Reason::InvalidSnapshot),
         StoreError::Invalid("administrative admission expired") => Error::none(Reason::Busy),
         StoreError::NotFound => Error::none(Reason::NotFound),
         StoreError::Invalid("invalid proposal decision") => Error::none(Reason::InvalidNonce),
@@ -795,10 +797,12 @@ fn write_error(error: StoreError) -> Error {
 }
 fn activation_error(error: ActivationError) -> Error {
     match error {
+        ActivationError::InvalidSnapshot => Error::none(Reason::InvalidSnapshot),
         ActivationError::Publication => Error::committed(Reason::IoError),
         ActivationError::Busy => Error::none(Reason::Busy),
         ActivationError::StaleBase => Error::none(Reason::StaleBase),
         ActivationError::AlreadyActive
+        | ActivationError::InvalidState
         | ActivationError::KeyConflict
         | ActivationError::Aborted => Error::none(Reason::InvalidState),
         ActivationError::Integrity => integrity(),
@@ -806,6 +810,13 @@ fn activation_error(error: ActivationError) -> Error {
         ActivationError::Persistence(error) => write_error(error),
         _ => Error::unknown(Reason::IoError),
     }
+}
+fn reconciliation_error(error: ActivationError) -> Error {
+    Error::none(if matches!(error, ActivationError::InvalidSnapshot) {
+        Reason::InvalidSnapshot
+    } else {
+        Reason::RecoveryRequired
+    })
 }
 fn local_error(error: LocalError) -> Error {
     match error {

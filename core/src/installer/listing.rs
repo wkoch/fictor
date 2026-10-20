@@ -147,7 +147,7 @@ pub(crate) fn preflight_owned(
 ) -> Result<(), ListingError> {
     read_lock(&owner, allow_prepared).map(|_| ())
 }
-fn read_lock(owner: &HomeLease, allow_prepared: bool) -> Result<Lock, ListingError> {
+fn read_lock(owner: &Arc<HomeLease>, allow_prepared: bool) -> Result<Lock, ListingError> {
     owner.verify().map_err(|_| ListingError::InvalidSnapshot)?;
     let home = owner.anchored_path().join(".");
     // SQLite's NOFOLLOW rejects /proc/self/fd directory aliases too. Use the
@@ -194,7 +194,8 @@ fn read_lock(owner: &HomeLease, allow_prepared: bool) -> Result<Lock, ListingErr
         return Err(ListingError::InvalidSnapshot);
     }
     // The store owns journal decoding and invariants; a query does not reconcile.
-    if crate::store::read_promotion_intents(&transaction)
+    let blobs = crate::store::blobs::BlobStore::owned(owner.home().join("blobs"), owner.clone());
+    if crate::store::read_promotion_intents(&transaction, &blobs)
         .map_err(|_| ListingError::InvalidSnapshot)?
         .is_some()
         && !allow_prepared
