@@ -1,5 +1,20 @@
 # Verificação da implementação
 
+## Reabertura das fixtures de IDs — 2026-10-20
+
+A primeira seleção Fedora após adicionar a resolução de tools encontrou
+`Ownership(Busy)` ao reabrir o Store no teste de overflow do piso de IDs.
+O teste agora aguarda por até cinco segundos a aquisição real do `HomeLease`,
+repetindo somente `Busy` e falhando em timeout ou qualquer outro erro. Não libera
+o lock à força nem repete a escrita testada. FDs CLOEXEC herdados temporariamente
+por subprocessos paralelos podem prolongar a posse até o exec.
+
+As asserções de IDs estritamente crescentes, `IdOverflow` e ausência de efeitos
+permanecem iguais. Produção, gates e exclusões não mudaram. Passaram formatação,
+Clippy e os **206 testes da biblioteca**, sem falhas/ignorados/filtros, no Toolbx
+Fedora 44/Bazzite. Logs: `.fictor/logs/m06-final-{fmt,clippy,lib}.log`.
+A primeira falha permanece em `.fictor/logs/m06-fedora-selection.log`.
+
 ## Proveniência do M0.6 — 2026-10-20
 
 Incremento sobre `49eac18`, no Toolbx `fictor-dev`, Fedora 44 sobre Bazzite

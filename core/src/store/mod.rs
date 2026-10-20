@@ -381,6 +381,27 @@ mod id_floor_tests {
         home
     }
 
+    async fn reopen(home: &Path) -> Store {
+        // A parallel test's child can retain CLOEXEC lease FDs between fork
+        // and exec. Wait for actual release; never bypass the ownership lock.
+        let owner = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::ownership::HomeLease::acquire(home) {
+                    Ok(owner) => break owner,
+                    Err(crate::ownership::OwnershipError::Busy) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        Store::open_with_lease_and_clock(owner, Arc::new(FixedClock))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn restart_floor_uses_largest_event_id_even_when_seq_and_civil_time_disagree() {
         let maximum = ulid::Ulid::from_parts(500_000, 0).to_string();
@@ -389,9 +410,7 @@ mod id_floor_tests {
             ulid::Ulid::from_parts(1, 0).to_string(),
         ])
         .await;
-        let store = Store::open_with_clock(home.path(), Arc::new(FixedClock))
-            .await
-            .unwrap();
+        let store = reopen(home.path()).await;
         let proposal = store
             .begin_attempt(NewProposal {
                 source: serde_json::json!({"kind":"local"}),
@@ -417,9 +436,7 @@ mod id_floor_tests {
     #[tokio::test]
     async fn exhausted_persisted_id_floor_refuses_receipt_and_audit_before_commit() {
         let home = seed(vec![ulid::Ulid::from(u128::MAX).to_string()]).await;
-        let store = Store::open_with_clock(home.path(), Arc::new(FixedClock))
-            .await
-            .unwrap();
+        let store = reopen(home.path()).await;
         assert!(matches!(
             store
                 .begin_attempt(NewProposal {
