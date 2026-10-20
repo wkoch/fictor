@@ -12,6 +12,7 @@ pub mod installer;
 pub mod instance_recovery;
 pub mod kernel;
 pub mod ownership;
+pub mod policy;
 pub mod proxy;
 pub mod sandbox;
 pub mod secrets;

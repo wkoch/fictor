@@ -2,7 +2,34 @@
 
 ARQ-020–029 resolvidas pelos ADRs 036–045. ARQ-030 resolvida pelo ADR-048,
 com implementação reservada ao M0.9. ARQ-031 resolvida pelo ADR-047.
-Resolução do spec não significa implementação concluída.
+Resolução do spec não significa implementação concluída. ARQ-032–034 registram
+lacunas dos contratos do M0.6; somente as partes afetadas aguardam ADR.
+
+## ARQ-034 — Limpeza humana de flags em workspaces sobrepostos
+
+- **Status: pendente em 2026-10-20.**
+- **Referências:** [flag de workspace](../spec/05-security.md#flag-de-workspace), `workspace.clear_flag` em `spec/08-shell.md`, `workspace_flags` em `spec/schemas/0002_flow_budget.sql`.
+- **Dúvida:** workspaces ancestrais/descendentes compartilham U na leitura, mas a limpeza recebe um único caminho. Não está definido se limpa somente a linha exata, descendentes, ancestrais ou todas as linhas sobrepostas. Limpar um filho removendo a flag do ancestral pode descontaminar irmãos que o usuário não revisou; remover só a linha exata pode conservar U herdado de outro caminho.
+- **Necessário:** definir o conjunto de linhas afetadas, o que a revisão/confirmação humana deve mostrar, a auditoria e o resultado quando restar U herdado. Esclarecer também mudanças de caminho/aliases entre marcação e limpeza.
+- **Limite de identidade:** a chave normativa é o caminho canônico. Marcar `/a`, renomear para `/b` e criar `/a → /b` não transfere a linha histórica para `/b`; a sessão antiga recusa o retarget, mas uma consulta pelo novo caminho não recupera a associação. Definir se movimentação/bind aliases devem conservar U e qual identidade/evidência permite isso. A consulta atual por componentes não afirma equivalência de binds, hardlinks ou árvores renomeadas; migração dessas marcas aguarda ADR.
+- **Impacto:** limpeza humana e seus handlers aguardam ADR. Consulta por componentes de caminhos canônicos e marcação U antes da execução podem avançar separadamente; não há propagação de P ao workspace.
+
+## ARQ-033 — Decisões e vínculo durável das aprovações do M0.6
+
+- **Status: pendente em 2026-10-20.**
+- **Referências:** [aprovações](../spec/05-security.md#aprovações), [aprovação customizada](../spec/03-kernel-protocol.md#aprovação-customizada), `approval.decide`/`approval.request` em `spec/08-shell.md`, tabelas `approvals`/`grants` em `spec/schemas/0001_init.sql`.
+- **Dúvida de protocolo/persistência:** `approval.request` retorna uma escolha entre 2–4 opções, mas a decisão do shell só admite `allow`/`deny` e a notificação não contém `body_md`/`options`. O schema não define onde persistir a escolha; `request` é somente descrito como JSON exibido ao usuário.
+- **Dúvida de autoridade:** falta definir o vínculo persistido de uma aprovação de tool à versão/catálogo/classificação/argumentos revisados e a revalidação quando modo, flags ou extensão mudam durante a espera. Uma aprovação anterior não deve executar outra chamada nem dispensar uma nova restrição, em especial Rule of Two. Também é necessário definir a recuperação de pedidos pendentes após reinício, sem reconstruir uma chamada executável por heurística.
+- **Necessário:** contrato dos snapshots persistidos, decisão customizada e notificações, consumo de nonce/escopo, cancelamento/recuperação e revalidação de contexto; migração aditiva se necessária. Não usar `message` ou `scope` para armazenar uma escolha por convenção inventada.
+- **Impacto:** serviço durável de aprovações/grants e integração executável de `tools.call` aguardam ADR. A função pura de precedência e as primitivas independentes de workspace continuam possíveis, sem ativar execução de tools.
+
+## ARQ-032 — Casamento das regras e fallback de leitura em modo plan
+
+- **Status: pendente em 2026-10-20.**
+- **Referências:** [decisão](../spec/05-security.md#decisão), `[[policy.rules]]` em `spec/02-core.md`, `Policy`/`Rule` em `core/src/config.rs`.
+- **Dúvida:** o contrato diz “glob” e exemplifica nome exato e prefixo com `*`, sem definir gramática, escapes, `?`, classes, normalização/case ou padrão inválido. Escolher outra semântica pode mudar quais regras `deny`/`ask`/`allow` se aplicam. O passo 3 recusa efeitos não-read em `plan`, mas o fallback do passo 8 só enumera `default` e `auto`; falta definir `plan + read` sem regra/grant.
+- **Necessário:** fixar a semântica/validação dos padrões e o fallback de leitura em `plan`, com casos de aceitação de precedência e padrões inválidos.
+- **Impacto:** matcher e integração de política aguardam ADR. A engine pura pode avaliar decisões de regras já casadas pelo adaptador confiável do core, aplicar a precedência normativa e indicar explicitamente o fallback ainda indefinido. Nenhum protocolo ou execução é habilitado por esse incremento.
 
 ## ARQ-031 — Última tentativa de promoção após regressão do relógio civil
 

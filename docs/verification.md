@@ -1,5 +1,28 @@
 # Verificação da implementação
 
+## Primitivas de política e workspace — 2026-10-20
+
+Incremento do M0.6 sobre `7f8a8b4`, no mesmo Toolbx Fedora 44/Bazzite do registro
+abaixo, com dados falsos e sem rede externa. Passaram os nove testes de
+`policy::tests` e os seis de `store::workspaces::tests`, sem falhas ou ignorados
+entre os testes selecionados; os demais testes da biblioteca foram filtrados
+nessas duas invocações dirigidas. Formatação e Clippy de todos os alvos passaram.
+
+Logs: `.fictor/logs/m06-policy-tests.log`, `.fictor/logs/m06-workspace-tests.log`
+e `.fictor/logs/m06-foundations-{fmt,clippy}.log`.
+
+- Política: matriz de efeitos/U/P/classificação/grants/modos, precedência de
+  deny/plan/Rule of Two, grant literal, ask antes de allow e conversão em eval.
+  `plan + read` sem regra/grant conserva o erro explícito da lacuna ARQ-032.
+- Workspace: pai/filho, separação de prefixos e irmãos, symlinks canonicalizados,
+  reabertura, origem inválida/de outra sessão/anterior a U, deduplicação exata,
+  proveniência independente de raízes sobrepostas e rollback de marca/auditoria
+  e head de `sys` quando a inserção do evento falha.
+
+Revisão independente não encontrou bloqueadores nas partes implementadas. As
+ARQ-032–034 limitam matcher, aprovações, limpeza e movimentação de marcas; nenhuma
+execução de tool foi habilitada. O gate COSMIC/CI continua pendente.
+
 ## Ordem durável das promoções — 2026-10-20
 
 Implementação do ADR-047 sobre `fe74cb9`, diretamente na `main`. Execução no

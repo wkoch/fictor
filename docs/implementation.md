@@ -41,7 +41,7 @@ snapshots em que foram produzidos, sem substituir este estado atual.
 | M0.3 | Backend Linux; diagnóstico real no Bazzite passou | Bubblewrap e `__sandbox-init`, rede por ponte, ambiente limpo e namespace de PID. Gate no COSMIC Atomic pendente. |
 | M0.4 | Base implementada | Egress autenticado, allowlist IPv6/NAT64, model proxy TLS com captura/auditoria, orçamento durável e keyring/file explícito. |
 | M0.5 | Implementação local concluída; gates pendentes | Recebimento/recuperação, npm/uv, smoke, store imutável, revisão com base/overrides, promoção/publicação/drenagem, crash loop, journal/barreira de instâncias, bootstrap protegido e administração online/offline. SIGKILL, boot real e ordenação durável do ADR-047 testados. Falta aceitação no alvo/CI. |
-| M0.6 | Não implementado | Política, aprovações e grants. |
+| M0.6 | Primitivas de política e workspace implementadas | Precedência pura e marcação U auditada; matcher, aprovações/grants e execução de tools dependem dos contratos em ARQ-032–034. |
 | M0.7 | Não implementado | Servidor web e shell. |
 | M0.8 | Não implementado | SDK, harness com compactação, fs-tools e shell-net. |
 | M0.9 | Toolbx e guarda de migração preparados; runtime de uso pendente | Toolbx Fedora 44/Node 24 LTS e backup/recusa de downgrade disponíveis. Gerenciador de runtimes, login, rollback e unidade systemd de usuário pendentes. |
@@ -738,3 +738,26 @@ revisão/nonce/seleção, journal de lote, rollback, runtimes/Python, login e ro
 CLI de atualização do executável. Critérios 76–81 definidos. A futura migração
 está descrita em Markdown; nenhum SQL executável ou código foi implementado.
 Integração, testes e commits cabem ao dev; respeitar a ordem dos marcos.
+
+## Primitivas do M0.6 — política e workspace
+
+Após a entrega local do M0.5 em `7f8a8b4`, o trabalho segue no M0.6, ainda na
+Fase 0. `policy::decide` aplica a precedência normativa às classificações aprovadas,
+flags atuais, grants de nomes expostos exatos e decisões de regras já casadas
+pelo adaptador confiável. Rule of Two vem antes de grants/auto e só permite escopo
+`once`; pedidos de humano em eval são negados. Matcher e fallback de leitura em
+`plan` aguardam ARQ-032; esse fallback retorna erro tipado, sem decisão inventada.
+
+O Store consulta U por sobreposição de componentes de caminhos canônicos e grava
+uma marca exata junto de `workspace.flagged`/head de `sys` na mesma transação do
+writer. A origem precisa ser um `tool.call` real do core, da mesma sessão já com U.
+Repetir a marca exata não duplica auditoria; uma raiz filha conserva sua própria
+proveniência mesmo quando o pai já está marcado. P não é propagado ao workspace.
+O chamador confiável ainda deve comprovar admissão, efeito não-read e escrita em
+`${workspace}` antes de usar essa primitiva; a execução vem depois do commit.
+
+Essas APIs não estão ligadas ao dispatcher. Aprovações/grants e contexto revisado
+aguardam ARQ-033; limpeza de flags e identidade após movimentação/aliases aguardam
+ARQ-034. A chave atual é por caminho, sem migração inferida de marcas históricas.
+Passaram nove testes de política e seis de workspace, formatação e Clippy de todos
+os alvos no Toolbx Fedora 44 sobre Bazzite, conforme [verificação](verification.md).

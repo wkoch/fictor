@@ -5,6 +5,8 @@ O **M0.5 tem implementação local concluída, com gates pendentes**, ainda ante
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
+O M0.6 começou com a precedência pura de política e a marcação U de workspace;
+integração e aprovações aguardam os contratos registrados em ARQ-032–034.
 
 | Release | Escopo obrigatório | Critérios ativos no roadmap | Trabalho principal restante |
 |---|---|---:|---|
@@ -47,7 +49,7 @@ próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
    (obrigações futuras do SDK; transporte do Kernel implementado) e [ADR-044](../spec/11-decisions.md#adr-044--destinos-internos-e-origens-de-montagens-do-sandbox-resolve-arq-028)
    (bootstrap protegido antes do init, com bases/bibliotecas na TCB instalada).
    ARQ-027/028 resolvidas; o gate dos critérios 57–65 continua pendente.
-3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Implementar o contrato da ARQ-030 (ADR-048) somente no M0.9. O próximo marco de código é M0.6. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
+3. Concluir a aceitação do ADR-045, critérios 66–70: handlers, CLI e publicação já têm testes. Implementar o contrato da ARQ-030 (ADR-048) somente no M0.9. O marco de código atual é M0.6, com primitivas e testes dirigidos; as partes afetadas por ARQ-032–034 aguardam ADR. Seguir M0.6–M0.10: política e aprovações; servidor e shell; SDK/harness/tools;
    instalação autossuficiente; testes ponta a ponta e roteiro no COSMIC Atomic.
 4. Após aceitar a Fase 0, entregar as Fases 1–2 e o núcleo da Fase 3, nessa ordem.
 

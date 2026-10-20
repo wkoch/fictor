@@ -37,6 +37,10 @@ O ADR-047 acrescenta evidência de I5/I7/I8 com relógio falso e reinício:
 e [missing_duplicate_or_divergent_preparations_refuse_admin_and_recovery_without_cleanup](../core/tests/promotion_order.rs#L587).
 Status e admissão compartilham a seleção; corrupção conserva eventos, propostas e recursos.
 
+O início do M0.6 acrescenta testes dirigidos de precedência da política e marcação
+U de workspaces, incluindo rollback da auditoria. São primitivas sem integração
+com `tools.call`; as lacunas funcionais de I3/I8/I11 e ARQ-032–034 permanecem.
+
 O [ADR-039](../spec/11-decisions.md#adr-039--recuperação-lazy-e-bloqueio-durável-de-crash-loop-resolve-arq-023)
 tem backoff, bloqueio e reset humano interno testados com relógio controlado e
 processos reais; os handlers de reset e a CLI de mutação online têm testes dirigidos do ADR-045 (ARQ-029 resolvida). O

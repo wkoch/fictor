@@ -17,6 +17,7 @@ pub use proposals::{
     ProposalState, ProposalUpdate, ResolvedPackage, ReviewBase,
 };
 mod sessions;
+mod workspaces;
 pub use budget::{BudgetExceeded, local_day};
 pub use events::{
     AppendEvent, Event, EventPath, EventQuery, Flags, Provenance, Sensitivity, Trust,
