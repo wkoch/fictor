@@ -1,13 +1,13 @@
 # Rastreabilidade das invariantes
 
-Revisão em 2026-10-20, após a **implementação local do M0.5, com gates pendentes**. As regras normativas
+Revisão em 2026-10-20, durante o **M0.6 parcial, com gates do M0.5 pendentes**. As regras normativas
 continuam em [README do spec](../spec/README.md#invariantes),
 [arquitetura](../spec/01-architecture.md) e [segurança](../spec/05-security.md).
 Esta matriz seleciona testes existentes e delimita o que suas asserções cobrem;
 não substitui o spec nem declara uma invariante inteira comprovada por um teste.
 
-O [diagnóstico registrado](verification.md#proveniência-do-m06--2026-10-20)
-teve **556 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
+O [diagnóstico registrado](verification.md#resolução-de-tools-e-verificação-integrada--2026-10-20)
+teve **563 testes principais passando no Toolbx `fictor-dev`, Fedora 44, sobre Bazzite
 44.20261012.0 x86-64**, com dados falsos e serviços locais. O código validado está
 identificado naquele registro. **A execução no Fedora COSMIC Atomic do usuário
 e os jobs remotos de CI continuam pendentes.** Esta matriz referencia a execução
@@ -41,6 +41,13 @@ O início do M0.6 acrescenta testes dirigidos de precedência da política e mar
 U de workspaces, incluindo rollback da auditoria, e proveniência por classificação
 aprovada/autoridade de rede/workspace. São primitivas sem integração
 com `tools.call`; as lacunas funcionais de I3/I8/I11 e ARQ-032–034 permanecem.
+
+A resolução offline acrescenta evidência parcial para I3:
+[exact_names_split_only_the_first_separator_and_never_become_paths](../core/src/gateway/resolution.rs#L261)
+e [approved_overrides_and_offline_input_schema_are_the_only_classification_sources](../core/src/gateway/resolution.rs#L383).
+Eles verificam identidade, catálogo/classificação e argumentos sem iniciar processo
+ou alterar o store. O snapshot não concede autorização, não recalcula o hash do
+bundle e ainda depende de vínculo à admissão/contexto definidos pela ARQ-033.
 
 O [ADR-039](../spec/11-decisions.md#adr-039--recuperação-lazy-e-bloqueio-durável-de-crash-loop-resolve-arq-023)
 tem backoff, bloqueio e reset humano interno testados com relógio controlado e

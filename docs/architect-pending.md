@@ -4,6 +4,7 @@ ARQ-020–029 resolvidas pelos ADRs 036–045. ARQ-030 resolvida pelo ADR-048,
 com implementação reservada ao M0.9. ARQ-031 resolvida pelo ADR-047.
 Resolução do spec não significa implementação concluída. ARQ-032–034 registram
 lacunas dos contratos do M0.6; somente as partes afetadas aguardam ADR.
+O [ADR-049](../spec/11-decisions.md#adr-049--melhorias-de-agentes-por-camada-e-preservação-de-autoridade) registra as melhorias aceitas dos estudos de agentes; não encerra estas três pendências nem autoriza inferir seus contratos. IFC fino, efeitos transacionais e replay de produto têm pré-condições explícitas em [13-agent-evolution.md](../spec/13-agent-evolution.md).
 
 ## ARQ-034 — Limpeza humana de flags em workspaces sobrepostos
 
@@ -13,6 +14,7 @@ lacunas dos contratos do M0.6; somente as partes afetadas aguardam ADR.
 - **Necessário:** definir o conjunto de linhas afetadas, o que a revisão/confirmação humana deve mostrar, a auditoria e o resultado quando restar U herdado. Esclarecer também mudanças de caminho/aliases entre marcação e limpeza.
 - **Limite de identidade:** a chave normativa é o caminho canônico. Marcar `/a`, renomear para `/b` e criar `/a → /b` não transfere a linha histórica para `/b`; a sessão antiga recusa o retarget, mas uma consulta pelo novo caminho não recupera a associação. Definir se movimentação/bind aliases devem conservar U e qual identidade/evidência permite isso. A consulta atual por componentes não afirma equivalência de binds, hardlinks ou árvores renomeadas; migração dessas marcas aguarda ADR.
 - **Impacto:** limpeza humana e seus handlers aguardam ADR. Consulta por componentes de caminhos canônicos e marcação U antes da execução podem avançar separadamente; não há propagação de P ao workspace.
+- **Incremento independente:** consulta/marcação exata, auditoria atômica, deduplicação e seis testes foram implementados em `49eac18`. A primitiva mantém marcas próprias em raízes sobrepostas; não implementa limpeza nem migração de identidade.
 
 ## ARQ-033 — Decisões e vínculo durável das aprovações do M0.6
 
@@ -22,6 +24,7 @@ lacunas dos contratos do M0.6; somente as partes afetadas aguardam ADR.
 - **Dúvida de autoridade:** falta definir o vínculo persistido de uma aprovação de tool à versão/catálogo/classificação/argumentos revisados e a revalidação quando modo, flags ou extensão mudam durante a espera. Uma aprovação anterior não deve executar outra chamada nem dispensar uma nova restrição, em especial Rule of Two. Também é necessário definir a recuperação de pedidos pendentes após reinício, sem reconstruir uma chamada executável por heurística.
 - **Necessário:** contrato dos snapshots persistidos, decisão customizada e notificações, consumo de nonce/escopo, cancelamento/recuperação e revalidação de contexto; migração aditiva se necessária. Não usar `message` ou `scope` para armazenar uma escolha por convenção inventada.
 - **Impacto:** serviço durável de aprovações/grants e integração executável de `tools.call` aguardam ADR. A função pura de precedência e as primitivas independentes de workspace continuam possíveis, sem ativar execução de tools.
+- **Incrementos independentes:** precedência, workspace e proveniência estão implementados. A resolução nominal/schema offline produz snapshot imutável com argumentos próprios, sem conceder autorização; ainda precisa ser vinculada ao contexto admitido por este contrato.
 
 ## ARQ-032 — Casamento das regras e fallback de leitura em modo plan
 
@@ -30,6 +33,7 @@ lacunas dos contratos do M0.6; somente as partes afetadas aguardam ADR.
 - **Dúvida:** o contrato diz “glob” e exemplifica nome exato e prefixo com `*`, sem definir gramática, escapes, `?`, classes, normalização/case ou padrão inválido. Escolher outra semântica pode mudar quais regras `deny`/`ask`/`allow` se aplicam. O passo 3 recusa efeitos não-read em `plan`, mas o fallback do passo 8 só enumera `default` e `auto`; falta definir `plan + read` sem regra/grant.
 - **Necessário:** fixar a semântica/validação dos padrões e o fallback de leitura em `plan`, com casos de aceitação de precedência e padrões inválidos.
 - **Impacto:** matcher e integração de política aguardam ADR. A engine pura pode avaliar decisões de regras já casadas pelo adaptador confiável do core, aplicar a precedência normativa e indicar explicitamente o fallback ainda indefinido. Nenhum protocolo ou execução é habilitado por esse incremento.
+- **Incremento independente:** engine pura e nove testes implementados em `49eac18`; fallback indefinido retorna `PolicyError::UndefinedPlanRead`. A API recebe decisões já casadas pelo adaptador confiável e não inventa semântica de glob.
 
 ## ARQ-031 — Última tentativa de promoção após regressão do relógio civil
 

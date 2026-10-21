@@ -3,6 +3,7 @@
 //! Tools are pinned using RFC 8785; annotations never authorize execution.
 pub(crate) mod admission;
 pub mod registry;
+pub mod resolution;
 mod transport;
 use crate::store::{AppendEvent, Provenance, Store};
 use rmcp::{

@@ -5,19 +5,19 @@ O **M0.5 tem implementação local concluída, com gates pendentes**, ainda ante
 e autossuficiente da v0.1. O código já tem store, sandbox, proxies, segredos e
 partes do supervisor, Kernel Protocol e instalador; conversa e interface web
 ainda não estão disponíveis. Detalhes em [implementation.md](implementation.md).
-O M0.6 começou com precedência de política, marcação U de workspace e proveniência;
+O M0.6 começou com precedência de política, marcação U, proveniência e resolução de tools;
 integração e aprovações aguardam os contratos registrados em ARQ-032–034.
 
 | Release | Escopo obrigatório | Critérios ativos no roadmap | Trabalho principal restante |
 |---|---|---:|---|
-| v0.1 | Fase 0 completa | 81 | Gates do M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
+| v0.1 | Fase 0 completa | 88 | Gates do M0.5; política/aprovações; servidor e shell; SDK, harness e tools; runtimes, atualização e rollback; aceitação e autossuficiência. |
 | v0.2 | Fase 1 completa | 10 | Autoextensão, promoção controlada, hooks, surfaces, hot swap e estado global mediado. |
-| v0.3 | Fase 2 completa | 4 | Evals, checkpoints/rewind, subagentes, árvore de sessões e demais entregas da fase. |
+| v0.3 | Fase 2 completa | 6 | Evals, checkpoints/rewind, subagentes, árvore de sessões e demais entregas da fase. |
 | v1.0 | Núcleo da Fase 3 | 5 | Origens de terceiros, normalização, MCP remoto, auditoria, atualizações acompanhadas e Landlock/seccomp. |
-| **Total** | Fases 0–2 e núcleo da Fase 3 | **100** | Critérios normativos totais, com partes já implementadas ou testadas. |
+| **Total** | Fases 0–2 e núcleo da Fase 3 | **109** | Critérios normativos totais, com partes já implementadas ou testadas. |
 
 Fonte: [roadmap](../spec/10-roadmap.md). A Fase 1 nº 8 foi movida para a Fase 0
-nº 27 e não entra duas vezes. Os ADRs 036–048 ampliaram a Fase 0 de 37 para 81
+nº 27 e não entra duas vezes. Os ADRs 036–050 ampliaram a Fase 0 de 37 para 88
 critérios. A contagem não mede percentual concluído: os critérios têm tamanhos
 diferentes e não enumeram cada item de implementação.
 
@@ -35,7 +35,7 @@ A base de confiança está avançada e o M0.5 tem fluxos locais integrados. Até
 ainda faltam política/aprovações, servidor/shell, SDK/harness/tools, runtimes,
 atualizações/rollback e aceitação de autossuficiência. Até a v1.0 somam-se
 autoextensão/surfaces/hooks, evals/checkpoints/subagentes e terceiros/auditoria/
-Landlock/seccomp. A contagem de 100 critérios contém itens de tamanhos diferentes;
+Landlock/seccomp. A contagem de 109 critérios contém itens de tamanhos diferentes;
 essas faixas são julgamento de engenharia. Uma data exige medir a cadência nas
 próximas entregas e considerar os gates COSMIC/CI e decisões arquiteturais.
 
@@ -58,9 +58,9 @@ as outras três etapas da tabela. Ainda não há data confiável em dias; as fai
 
 ## Evidência e release
 
-A base tem diagnóstico de **556 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
+A base tem diagnóstico de **563 testes principais passando no Toolbx Fedora 44 sobre Bazzite**,
 com dados falsos e endpoints locais; consulte [verification.md](verification.md).
-Esse resultado não representa 556 critérios de produto aceitos.
+Esse resultado não representa 563 critérios de produto aceitos.
 
 Cada release ainda exige aceitação no Fedora COSMIC Atomic do usuário, CI
 Ubuntu/Fedora, testes associados a I1–I11 e revisão dos riscos residuais. Os gates

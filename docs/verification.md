@@ -1,5 +1,43 @@
 # Verificação da implementação
 
+## Resolução de tools e verificação integrada — 2026-10-20
+
+Incremento de resolução sobre `b8a0c97`, na `main`. Toolbx `fictor-dev`, Fedora 44
+sobre Bazzite `44.20261012.0` (Kinoite), Linux x86-64 e SELinux Enforcing; mesmas
+ferramentas dos registros abaixo. Sem instalação no host, dados reais ou rede
+externa nos testes.
+
+| Verificação no Toolbx | Resultado |
+|---|---|
+| Sete testes dirigidos de `gateway::resolution::tests` | Passaram. |
+| Formatação e Clippy de todos os alvos com `-D warnings` | Passaram. |
+| Biblioteca completa após sincronizar a fixture de reabertura | **206 testes**, zero falhas/ignorados/filtros. |
+| Suíte completa `cargo test --locked --offline` | **563 testes principais**, 42 alvos incluindo doc-tests; zero falhas, ignorados ou filtros principais. |
+| Seleção Fedora reproduzida no Toolbx | **476 testes**, 32 alvos; zero falhas/ignorados e os mesmos três filtros. |
+| `cargo build --release --locked --offline` | Passou com o estado final. |
+
+Contagem pelo último resumo de cada alvo, sem duplicar o helper em subprocesso.
+Logs finais: `.fictor/logs/m06-final-{fmt,clippy,lib,full,fedora-selection,release}.log`;
+dirigido: `.fictor/logs/m06-resolution-tests.log`. A primeira falha transitória da
+seleção foi preservada e a correção da fixture está descrita no registro seguinte.
+Os filtros Fedora continuam sendo doctor/bwrap, alias bind de posse e unidade
+de magic links. Todos continuam obrigatórios na suíte completa; nenhum foi adicionado.
+
+Os testes verificam nomes exatos, separador e nomes confundíveis, hooks, extensões
+desativadas/ausentes, lock obrigatório, overrides, schema offline, argumentos
+inválidos, pin forjado, identidade/modos/links do manifest, NAT64 e estabilidade
+do snapshot após mudanças de estado. Executável canário e snapshot de arquivos
+confirmam que a resolução não inicia processo nem escreve na árvore testada.
+
+O snapshot possui argumentos validados e classificação/versão/NAT64 próprios,
+sem Debug/Serialize. Confia na imutabilidade do store estabelecida pela promoção;
+não recalcula o hash integral em cada consulta. A execução futura precisa vincular
+o mesmo snapshot à versão, pin e contexto admitidos (ARQ-033), sem usar apenas o
+nome como autoridade. Revisão independente não encontrou bloqueadores.
+
+M0.6 continua parcial: ARQ-032–034 limitam a integração. COSMIC Atomic e CI remota
+continuam pendentes; reproduzir a seleção Fedora no Toolbx não fecha esses gates.
+
 ## Reabertura das fixtures de IDs — 2026-10-20
 
 A primeira seleção Fedora após adicionar a resolução de tools encontrou
