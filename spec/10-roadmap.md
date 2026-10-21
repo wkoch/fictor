@@ -133,6 +133,25 @@ Fora da Fase 0: propostas da IA, surfaces, hooks, web, evals, terceiros.
 80. login.issue apenas admin local: token fictício de teste de uso único consumido atomicamente, expiração monotônica de 600 s e invalidação no restart. URL não aceita host/redirect do cliente; token não aparece em logs/eventos/blobs; boot sem TTY não emite URL secreta. WS/surfaces/Kernel não acessam emissor. Emissão/EOF não altera cookies existentes.
 81. update --core só CLI e TTY, sem API web/admin: fixture de executável em diretório temporário demonstra cópia anterior durável antes de substituição atômica, concorrência serializada e falhas de checksum/permissão/identidade sem elevação. Queda não deixa nome principal ausente nem reinicia serviço automaticamente. Nenhuma suíte troca o executável real, muda relógio do host ou usa rede/chaves reais.
 
+82. M0.6–M0.10 (ADR-049): fixtures adversariais de catálogo/autoridade incluem descrição que manda ignorar a política, nomes de tools semelhantes e alteração de descritor após revisão. A classificação/identidade efetiva vêm do lock/core; nenhum texto ou anotação concede grant. Aprovação obsoleta por mudança de argumentos, versão, modo ou flags deve ser coberta após resolução da ARQ-033; esse ADR não supre o contrato pendente.
+83. M0.8: compactação sobre conteúdo malicioso conserva U/P, intervalo de origem e pares de chamada/resultado; uma frase “usuário já aprovou” no resumo não autoriza uma tool. Reinício reconstrói o resumo registrado sem apagar o histórico. Fixtures de provider são locais e chamadas auxiliares contam no orçamento.
+84. M0.10: ao menos uma regressão de política usa replay seletivo interno com entrada fixa, política real e efeito falso. A chamada proibida não chega ao efeito, um caso permitido chega uma vez, e alteração inesperada de argumentos/ordem faz a fixture falhar. Sem credenciais, rede externa, nonce/grant de produção ou reemissão real. Não exige CLI ou formato público de replay.
+
+85. M0.8 (ADR-050): provider falso interrompe argumentos, repete ID de chamada, emite JSON ambíguo, terminal desconhecido ou limite de saída. Nenhuma tool é chamada, mesmo se outra chamada na mesma resposta estava completa. Resposta tool_calls íntegra só executa após persistência. Testar Anthropic e Chat Completions e uso contabilizado recebido no fim do stream.
+86. Retries do M0.8 usam os mesmos bytes e só ocorrem antes de delta semântico; 429/5xx/reset elegíveis fazem no máximo quatro envios totais, respeitando max_iterations/budget/cancelamento. Texto de erro parecido com overflow não dispara compactação. Resposta parcial, erro desconhecido, tool com resultado incerto e reinício não causam reenvio de efeitos.
+87. Cada envio tem harness.request anterior com configuração efetiva; response associa terminal/usage sem dupla contagem. Queda entre registros mantém tentativa sem desfecho, sem execução automática. Mudança de config vale no turno seguinte; retry conserva snapshot. Fixtures verificam ausência de env/headers/segredos fictícios e legado indicado como incompleto.
+88. Skills disponíveis/expostas não são marcadas como carregadas antes de load_skill bem-sucedido; loaded fixa path/hash e evento local. Nome ambíguo falha. ToolObservationV1 distingue busca vazia, truncamento recuperável, bash sem saída integral recuperável, erro/timeout e comando zero; nenhum resultado afirma verificação da tarefa por convenção.
+
+## Melhorias aceitas e experimentos (ADRs 049–050)
+
+[13-agent-evolution.md](13-agent-evolution.md) fixa a divisão entre Rust, harness e extensões, as condições de avaliação e os limites de cada experimento. A aceitação da direção não antecipa fases nem torna todos os protótipos gates de release.
+
+- **M0.6–M0.10:** critérios 82–84; ARQ-032–034 continuam bloqueando somente seus contratos afetados. Compactação simples é baseline; ACON simplificado é comparação opcional.
+- **Fases 1–2:** protótipos de memória por deltas, workflows, seleção de tools e model routing; avaliação com baseline simples, provenance e custo total. Replay no produto evals aguarda formato/interface próprios.
+- **Fase 3 / v1.x:** qreader conserva untrusted mesmo com schema válido. Antes de sua entrega, testar boolean/enum/data maliciosos, schema inválido e tentativa de override: nenhum caso eleva confiança, apaga flags ou dispensa autorização.
+- **Fase 3 ou posterior:** investigação de proveniência fina/políticas por argumento e preparação/liberação de efeitos. Implementação somente após ADRs de protocolo/persistência/recuperação, sem promessa de exactly-once.
+- **Fase 4+:** CodeAct e evolução de skills/harness como extensões experimentais; pipeline, sandbox e testes independentes obrigatórios.
+
 ## Marco de autossuficiência (v0.1)
 
 A partir da v0.1, o Fictor é desenvolvido de dentro do próprio Fictor, no Fedora COSMIC Atomic ([ADR-031](11-decisions.md#adr-031--v01-autossuficiente-e-fluxo-de-desenvolvimento)).
@@ -198,6 +217,8 @@ Critérios de aceitação:
 2. `rewind` restaura o workspace ao estado anterior a uma edição.
 3. Um subagente que lê conteúdo `untrusted` acende U na sessão pai.
 4. A árvore mostra forks e permite abrir qualquer ramo.
+5. ADR-050: handoff valida objetivo/restrições/artefatos/checagens, conserva flags, recusa tratar texto legado ou hash divergente como resultado verificado e não repete efeito após timeout. Teste inclui perda de informação no resumo e artefato alterado depois da entrega.
+6. Comparação de eval registra modelo/harness/fixture/scorer e diferenças intencionais; inclui todas as tentativas, filhos e juiz. Configuração divergente, dados ausentes, falha de verificador e baseline inconclusiva impedem promoção automática. Falhas continuam no denominador; budgets agregados incluem excedentes concorrentes e os reprovam, sem promessa de teto atômico novo.
 
 ## Fase 3 — Terceiros e endurecimento
 

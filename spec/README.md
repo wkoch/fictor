@@ -49,10 +49,12 @@ Estas regras não podem ser relaxadas para fazer um teste passar ou para simplif
 | [06-lifecycle.md](06-lifecycle.md) | Pipeline de extensões: proposta, quarentena, checagens, auditoria, promoção, atualização, rollback. |
 | [07-harness.md](07-harness.md) | Harness padrão (loop do agente) e extensões first-party. |
 | [08-shell.md](08-shell.md) | UI web: autenticação, protocolo WebSocket, layout, renderização, host de MCP Apps, design system. |
-| [09-evals.md](09-evals.md) | Evals, gates de promoção, replay do histórico. |
+| [09-evals.md](09-evals.md) | Evals, gates de promoção e distinção entre reexecução e replay seletivo. |
 | [10-roadmap.md](10-roadmap.md) | Fases, marcos e critérios de aceitação. |
 | [11-decisions.md](11-decisions.md) | Registro de decisões (ADRs). |
 | [12-maintenance.md](12-maintenance.md) | Contratos do M0.9: planos, runtimes, atualização, rollback, login e journal recuperável (ADR-048). |
+| [13-agent-evolution.md](13-agent-evolution.md) | Melhorias aceitas dos estudos de agentes, limites de segurança, experimentos por fase e contratos futuros (ADR-049). |
+| [14-harness-reliability.md](14-harness-reliability.md) | Contratos M0.8 de adapters, tentativas, skills e tools; handoffs/evals da Fase 2; avaliação independente na Fase 4+ (ADR-050). |
 | [schemas/extension.schema.json](schemas/extension.schema.json) | JSON Schema do manifest `fictor.yaml`. |
 | [schemas/0001_init.sql](schemas/0001_init.sql) | Migração inicial do SQLite. |
 | [schemas/0002_flow_budget.sql](schemas/0002_flow_budget.sql) | Migração 0002: orçamento do model proxy e flags de workspace e de extensão. |

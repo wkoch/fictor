@@ -109,10 +109,10 @@ Todos chamam `<url do provider>/<path>` vindo de `config.get({section: "provider
 | `api` | Path default | Notas |
 |---|---|---|
 | `anthropic` | `/v1/messages` | Streaming SSE; tool use; `thinking` se `thinking_budget > 0`; cache conforme [Prompt caching](#prompt-caching-m08); cabeçalho `anthropic-version`. |
-| `openai-chat` | `/v1/chat/completions` | Streaming com `stream_options.include_usage`; tools como `functions`; `reasoning_content` em deltas (DeepSeek) vira `reasoning`. Cobre OpenAI, DeepSeek, Moonshot/Kimi, OpenRouter, Groq, Ollama. |
+| `openai-chat` | `/v1/chat/completions` | Streaming com `stream_options.include_usage`; tools via `tools`/`tool_calls`; `reasoning_content` em deltas (DeepSeek) vira `reasoning`. Cobre OpenAI, DeepSeek, Moonshot/Kimi, OpenRouter, Groq, Ollama. |
 | `openai-responses` | `/v1/responses` | Fase 2. |
 
-O adapter normaliza para `HMessage` e extrai `usage` para `assistant.message`.
+O adapter normaliza para `HMessage` e extrai `usage` para `assistant.message`. Antes de admitir qualquer chamada, aplica [terminais, erros e retries](14-harness-reliability.md#terminais-e-admissão-de-chamadas-m08) do ADR-050. Registro de tentativas/configuração e skills segue [14-harness-reliability.md](14-harness-reliability.md).
 
 ### Prompt caching (M0.8)
 
@@ -198,10 +198,13 @@ turno(evento):
   repetir até max_iterations:
     ctx    = montar_contexto()
     modelo = sinal model de hooks.invoke("model.route", collect) ou modelo da sessão
+    persistir snapshot e harness.request (também para retries/compactação)
     resposta = chamar o modelo em streaming
          a cada 100 ms: deltas → hooks.invoke("stream.chunk") se houver assinantes → ui.emit("assistant.delta")
-    gravar assistant.message
-    se não há tool_calls: sair do repetir
+    gravar assistant.message e harness.response conforme ADR-050
+    se terminal é error/cancelled/output_limit: encerrar sem tools nem continuação
+    se terminal é complete: sair do repetir
+    # somente terminal tool_calls íntegro e validado chega à execução
     para cada chamada (em paralelo se todas forem effect=read; senão em ordem):
       b = hooks.invoke("tool.before", pipeline, {call})
       se sinal deny: gravar harness.tool_skipped; continuar
@@ -225,7 +228,7 @@ Tools executadas dentro do harness. Regra: elas só gravam no event log ou chama
 | `load_skill` | 0 | `{name}` | Lê o `SKILL.md` (caminho de `catalog.list`) e devolve o corpo. |
 | `todo_write` | 0 | `{items: {text, status}[]}` | Substitui a lista de tarefas. O shell mostra a última. |
 | `propose_extension` | 1 | `{dir, note?}` | Lê o diretório (relativo ao workspace; ignora os mesmos diretórios do recebimento, ver [06-lifecycle.md](06-lifecycle.md#1-recebimento)), chama `ext.propose` e acompanha `ext.proposal_status` por até 120 s. Devolve o estado final ou "aguardando aprovação", com os motivos de falha das checagens para o modelo corrigir. |
-| `delegate` | 2 | `{prompt, title?, model?}` | Chama `sessions.delegate` e devolve o texto final do subagente. |
+| `delegate` | 2 | `{prompt, title?, model?, constraints?, expected_artifacts?, checks?}` | Perfil [HandoffV1](14-harness-reliability.md#entrega-entre-subagentes-fase-2); usa os envelopes existentes de `sessions.delegate/complete`. |
 
 ### Compactação (v0.1)
 
@@ -234,19 +237,23 @@ Tools executadas dentro do harness. Regra: elas só gravam no event log ou chama
 3. Senão, chamar o modelo com um prompt de resumo (decisões, arquivos tocados, estado das tarefas, pendências).
 4. Gravar `harness.compaction {summary, covers_until_event_id}`.
 
+O resumo entra como dado derivado, nunca como instrução humana nem prova de aprovação. O intervalo coberto permanece no event log e acessível por `events.path`; compactar não apaga U/P, fontes ou decisões do core. Preservar pares de chamadas/resultados na montagem. Resumo que afirma consentimento não permite pular `tools.call` ou sua política.
+
+No M0.8, manter a compactação simples como baseline. A comparação opcional com compressão de observações e histórico separadamente segue [ADR-049](13-agent-evolution.md#contexto-e-memória-m08-extensões-na-fase-1): contabilizar chamadas auxiliares, qualidade e perda de cache, sem alterar o formato persistido acima ou tornar o experimento gate da v0.1. Memória, recuperação de tools e roteamento por hooks respeitam as fases de [13-agent-evolution.md](13-agent-evolution.md).
+
 ### Subagentes (Fase 2)
 
 `sessions.delegate`:
 
 1. O core cria uma sessão filha (`kind = delegated`, `parent_session_id`, `fork_event_id` = head do pai, mesmo workspace e modo).
 2. Sobe um harness para ela e entrega o `prompt` como `session.input` (`ext.input` com actor `ext:harness`).
-3. O harness da sessão delegada chama `sessions.complete({text})` ao fim do turno.
+3. O harness da sessão delegada chama `sessions.complete({session_id, text})` ao fim do turno; o harness padrão serializa [HandoffResultV1](14-harness-reliability.md#entrega-entre-subagentes-fase-2) em text. Relato concluído não equivale a artefato verificado.
 4. O core propaga as flags: se a filha tiver U ou P, acende as mesmas flags no pai (`session.tainted` com motivo `delegate:<id>`).
 5. Retorna `{session_id, text, trust}` com `trust = untrusted` se a filha tiver U. Timeout: 30 min.
 
 ### Erros, retries e cancelamento
 
-- 429 e 5xx do provider, e falhas de rede: até 3 tentativas com espera de 2 s, 4 s e 8 s. Resposta 429 com `fictor_budget_exceeded` não é repetida.
+- Retries: no máximo 3 adicionais (2 s, 4 s, 8 s), só para rate_limit/provider_unavailable/transport antes de qualquer delta semântico, conforme [ADR-050](14-harness-reliability.md#falhas-e-retries-m08). Parcial, budget, cancelamento, limites e erro desconhecido não são repetidos automaticamente. Todos os envios contam em max_iterations; erro não dispara continuação de turno.
 - Erro definitivo: gravar `harness.error` e emitir `status`.
 - `session.cancel`: abortar o streaming, gravar `assistant.message` parcial com `stop_reason: "cancelled"`, esvaziar a fila. O core cancela as tools e aprovações pendentes.
 
@@ -286,6 +293,8 @@ tools:
 | `grep` | `{pattern, path?, glob?, case_insensitive?, context?, max_results?}` | Usa `rg` se existir no PATH do sandbox; senão, implementação interna. |
 | `bash` | `{command, timeout_ms?}` | `/bin/bash -c` com cwd no workspace. Default 120 s. Saída combinada, truncada em 30 000 caracteres (início e fim). Sem rede. |
 
+Todas as tools first-party acima produzem [ToolObservationV1](14-harness-reliability.md#resultados-de-ferramentas-first-party-m08), incluindo truncamento/recuperação e status de execução. Sucesso da tool não é prova de conclusão da tarefa.
+
 Caminhos são relativos ao workspace ou absolutos dentro dele. Fora disso, erro (o sandbox também impede).
 
 Variáveis de projeto: antes de cada comando, `bash` e `bash_network` aplicam `<workspace>/.fictor/env`, com linhas `NOME=valor`. Valores que começam com `./` ou `.fictor/` viram caminhos absolutos dentro do workspace. Nomes reservados ([04-extensions.md](04-extensions.md#variáveis-de-ambiente-reservadas)) são ignorados, com aviso no resultado. Uso típico: `CARGO_HOME=.fictor/cargo` e `npm_config_cache=.fictor/npm`, para que `bash_network` baixe dependências e `bash` as use offline. O arquivo não dá nenhum privilégio novo, porque os comandos já rodam no sandbox da extensão.
@@ -307,7 +316,7 @@ tools:
   bash_network: { effect: external, sensitivity: private, output_trust: untrusted, timeout_ms: 600000 }
 ```
 
-Mesmo contrato de `bash`. No modo `default` toda chamada pede aprovação, e a Rule of Two se aplica.
+Mesmo contrato de `bash`, inclusive [ToolObservationV1](14-harness-reliability.md#resultados-de-ferramentas-first-party-m08). No modo `default` toda chamada pede aprovação, e a Rule of Two se aplica.
 
 ### `web` (Fase 1)
 

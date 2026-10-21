@@ -222,7 +222,7 @@ kv.list   params: { prefix?: string; limit?: number } result: { items: { key: st
 params: { session_id: string }
 result: { tools: ToolDef[] }
 
-// tools.call — escopo tools. call_id único na sessão (o harness usa o id do provider).
+// tools.call — escopo tools. call_id único na sessão (o harness usa o id do provider, validado pelo ADR-050).
 // Bloqueia enquanto houver aprovação pendente.
 params: { session_id: string; name: string; arguments: object; call_id: string }
 result: {
@@ -452,6 +452,11 @@ Os campos de recuperação de `ext.crashed` valem para processos ativos a partir
 | `harness.compaction` | `{summary, covers_until_event_id}` |
 | `harness.continue` | `{text, ext_id}` — continuação pedida por hook `turn.end` |
 | `harness.error` | `{message, retryable}` |
+| `harness.request` | SnapshotV1 em blob e correlação de tentativa, [ADR-050](14-harness-reliability.md#registro-por-tentativa-m08) |
+| `harness.response` | Terminal, falha e usage por tentativa, [ADR-050](14-harness-reliability.md#registro-por-tentativa-m08) |
+| `harness.skill_loaded` | Identidade/conteúdo carregado e evento local de origem, [ADR-050](14-harness-reliability.md#registro-por-tentativa-m08) |
+
+Os novos eventos do ADR-050 usam o namespace já reservado ao harness; não alteram a API de events.append nem autorizam chamadas. Consumidores conservam legado sem ficha. A semântica de stop_reason do harness padrão e a proibição de executar chamadas parciais estão em [14-harness-reliability.md](14-harness-reliability.md). Na Fase 2, o JSON HandoffV1 dentro de prompt/text é perfil do harness, opaco para sessions.delegate/complete.
 
 Semântica de `assistant.message.usage`: entrada total inclui cache; campos de cache
 são detalhamentos opcionais. A normalização por adapter e a compatibilidade com

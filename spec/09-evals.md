@@ -11,6 +11,8 @@ Objetivo: impedir que uma extensão nova (em especial harness e hooks de context
 
 As execuções são re-execuções a partir da entrada, não replays determinísticos das respostas antigas.
 
+Replay seletivo é uma evolução aceita pelo ADR-049: fixa fronteiras gravadas e reexecuta a que está sob teste. Fixtures internos de regressão podem ser usados desde a Fase 0, conforme [requisitos de isolamento e divergência](13-agent-evolution.md#replay-seletivo). A integração ao produto evals é posterior ao contrato de formato, captura e interface; não altera implicitamente `case.yaml`, a CLI ou as tabelas deste arquivo. Replay não substitui trials de qualidade com novas execuções.
+
 ## Onde ficam os casos
 
 | Local | Origem |
@@ -80,7 +82,9 @@ Chamada de modelo (configurada em `[evals] judge_model`) com a rubrica, a entrad
 
 ## Métricas
 
-Por caso e versão: pass^k, taxa de trials aprovadas, média de chamadas ao modelo, média de duração, tokens (somados de `usage` em `assistant.message`).
+Por caso e versão: pass^k, taxa de trials aprovadas, média de chamadas ao modelo, média de duração e tokens. Aplicar [MetricsV1 e comparação justa](14-harness-reliability.md#avaliação-comparável-fase-2): incluir auxiliares, retries, juiz e descendentes; usage por tentativa sem somar novamente assistant.message. Ausência de medição não é zero.
+
+O runner registra e verifica fixture/scorer/configuração efetiva; diferenças não declaradas ou medição incompleta tornam a comparação inconclusiva para promoção automática. O gate abaixo conserva os limiares e usa a contagem total definida no ADR-050. Bloqueio de política e falha funcional são dimensões distintas; nenhuma falha desaparece do denominador.
 
 ## Gate de promoção
 
@@ -100,7 +104,9 @@ Ação no shell sobre uma sessão:
 2. `fixture` = snapshot do workspace no início da sessão (exige a extensão `checkpoints`) ou um diretório indicado pelo usuário.
 3. Checagens: o usuário escolhe entre as sugeridas (testes do projeto, arquivos alterados) e uma rubrica que o modelo rascunha e o usuário edita.
 
-## Armazenamento (migração 0003)
+## Armazenamento (Fase 2)
+
+O número definitivo da migração será o próximo livre ao implementar esta fase; 0003 já pertence aos receipts da Fase 0. MetricsV1 usa a coluna JSON abaixo, sem tabela nova. Histórico sem schema/metrics completos é legado incompleto, nunca atualizado para simular medição retroativa.
 
 ```sql
 CREATE TABLE eval_runs (
@@ -123,7 +129,7 @@ CREATE TABLE eval_results (
   session_id TEXT REFERENCES sessions(id),
   passed     INTEGER NOT NULL,
   checks     TEXT NOT NULL,           -- JSON por checagem
-  metrics    TEXT NOT NULL,           -- JSON: model_calls, duration_ms, tokens
+  metrics    TEXT NOT NULL,           -- JSON MetricsV1 (ADR-050); legado permanece legível
   PRIMARY KEY (run_id, case_id, version, trial)
 );
 ```

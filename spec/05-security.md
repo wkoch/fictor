@@ -237,6 +237,10 @@ Fecha o caminho "sessão contaminada envia dados a uma extensão global com esta
 - A marca só apaga com "limpar estado" (UI confiável ou `fictor ext reset <id>`). Isso apaga o kv da extensão, o `${ext_data}` global e a marca, reinicia as instâncias e grava `ext.state_reset`.
 - Consequência intencional: uma extensão global de memória chamada por sessão contaminada passa a contaminar quem a lê.
 
+### Transformações e autoridade
+
+Desde a Fase 0, resumo, extração, schema válido ou avaliação positiva de modelo não apagam U/P nem concedem autorização. Texto que afirma uma aprovação não substitui o estado do core. Na Fase 1, memória e hooks conservam também a marca d’água global. Metadados MCP e assinaturas de pacote não comprovam benignidade. As evoluções de proveniência e política por argumento seguem [13-agent-evolution.md](13-agent-evolution.md), sem substituir as flags conservadoras antes de novo contrato completo.
+
 ## Decisão
 
 Toda chamada a `tools.call`, vinda do harness ou de uma surface, passa por esta função usando a classificação efetiva aprovada. Chamadas de surfaces exigem também `ui_callable: true` efetivo e tool da própria extensão. A ordem é normativa:
@@ -324,13 +328,9 @@ Nenhum filtro remove prompt injection de forma confiável. A defesa é estrutura
 
 ### Leitor em quarentena (Fase 3)
 
-Extensão first-party `qreader` com a tool `extract({source, schema})`. Ela faz uma chamada de modelo sem tools, pedindo que o conteúdo externo seja extraído para o schema dado. O core considera o resultado `trusted` somente se todas as condições valerem:
+Extensão first-party `qreader` com a tool `extract({source, schema})`. Ela faz uma chamada de modelo sem tools, pedindo extração de dados externos. Sua classificação efetiva DEVE permanecer `output_trust: untrusted`, sem override que a eleve. O schema admite apenas `boolean`, `number`, `integer`, `string` com `enum` ou `string` com `format: date`/`date-time`, com no máximo 100 campos. A extensão valida tipos, valores e formatos; resultado inválido falha, sem fallback para texto livre.
 
-1. o lock marca a extensão com o privilégio `structured_output_trust` (concedido só por humano);
-2. o schema contém apenas `boolean`, `number`, `integer`, `string` com `enum` ou `string` com `format: date`/`date-time`, com no máximo 100 campos;
-3. o resultado valida contra o schema.
-
-Senão, o resultado é `untrusted`. Valores fechados não carregam instruções; textos livres carregam.
+Formato limitado reduz a superfície de influência, mas não comprova veracidade: um booleano falso pode dirigir uma ação perigosa. O resultado é sempre `untrusted`, conserva a sensibilidade privada quando aplicável pelas regras de fluxo, não apaga U/P e não autoriza efeitos. Texto livre não faz parte deste perfil. Não existe desclassificação por validação de schema (ADR-049).
 
 ## Riscos residuais
 
